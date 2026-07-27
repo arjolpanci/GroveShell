@@ -1,15 +1,32 @@
 //! `groveshell-ui`: first-iteration shell UI. Per `docs/PROJECT_PLAN.md`
-//! §10.1/§10.2, creates a single top bar (Activities affordance only —
-//! clock, workspace indicator, and system indicators are later scope) and
-//! a GNOME-style Activities overview: clicking Activities zooms the whole
-//! desktop out to ~60% into the middle of the overview, using live DWM
-//! thumbnails (`DwmRegisterThumbnail`) of the real open windows — not a
-//! static list — so the overview is a true, animated representation of the
-//! current desktop. Clicking a thumbnail reverses the animation back to
-//! that window's real position and focuses it. The bar reserves its strip
-//! of the work area via the AppBar API (`SHAppBarMessage`), the same
-//! mechanism the Windows taskbar uses, so maximized windows and desktop
-//! icon layout respect it instead of being covered.
+//! §10.1/§10.2, creates a single top bar with three regions — Activities
+//! (left), a clock (center), and a Quick Settings affordance (right) — plus
+//! three flyouts:
+//!
+//! - **Activities overview**: clicking Activities zooms the whole desktop
+//!   out to ~60% into the middle of the overview, using live DWM thumbnails
+//!   (`DwmRegisterThumbnail`) of the real open windows. Clicking a
+//!   thumbnail reverses the animation back to that window's real position
+//!   and focuses it.
+//! - **Calendar + notifications**: clicking the clock opens a Windows-11-style
+//!   flyout centered below it — a real month calendar (today highlighted)
+//!   stacked over a notifications section. The notifications section is a
+//!   static "No new notifications" placeholder: reading the real
+//!   notification feed requires `UserNotificationListener`, which needs a
+//!   packaged app identity and explicit user consent that this unpackaged
+//!   process doesn't have. Not faked beyond that empty-state text.
+//! - **Quick Settings**: clicking the right side opens a flyout below it
+//!   with real, working volume control (`IAudioEndpointVolume` — up/down/
+//!   mute) and a read-only battery/AC status line. There's no icon tray:
+//!   hosting other apps' notification-area icons would mean impersonating
+//!   Explorer's own tray window, which is out of scope until Phase 7
+//!   (Explorer replacement) per `docs/PROJECT_PLAN.md` §7 and ADR-002.
+//!
+//! Only one flyout is ever open at a time; opening any of the three closes
+//! the other two. The bar reserves its strip of the work area via the
+//! AppBar API (`SHAppBarMessage`), the same mechanism the Windows taskbar
+//! uses, so maximized windows and desktop icon layout respect it instead of
+//! being covered.
 //!
 //! Deliberately out of scope for this slice: multiple workspaces (there is
 //! only ever "the current desktop" right now), hot corners, hotkeys, and
@@ -31,9 +48,15 @@ mod imp {
     };
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateSolidBrush, DrawTextW, EndPaint, InvalidateRect, SetBkMode,
-        SetTextColor, DT_CENTER, DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
+        SetTextColor, DRAW_TEXT_FORMAT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HDC, PAINTSTRUCT,
+        TRANSPARENT,
     };
+    use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
+    use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
+    use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+    use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
     use windows::Win32::UI::Shell::{
         SHAppBarMessage, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
@@ -41,19 +64,41 @@ mod imp {
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     /// Half of the original 32px guess — the Windows taskbar itself is
-    /// ~40px, but this shell is meant to feel closer to GNOME's slim bar.
-    const BAR_HEIGHT: i32 = 16;
-    /// Hit-test region for the painted (not a native control — there isn't
-    /// enough vertical room in a 16px bar for one) "Activities" label.
+    /// ~40px, but this shell is meant to feel closer to GNOME's slim bar;
+    /// 50% taller than the first cut (16px) to fit the clock and quick
+    /// settings labels comfortably.
+    const BAR_HEIGHT: i32 = 24;
+    /// Hit-test region for the painted (not native controls — there isn't
+    /// enough vertical room in the bar for real button chrome) bar labels.
     const ACTIVITIES_LABEL_X: i32 = 8;
     const ACTIVITIES_LABEL_WIDTH: i32 = 72;
+    const CLOCK_LABEL_WIDTH: i32 = 130;
+    const QS_LABEL_WIDTH: i32 = 170;
+    const QS_LABEL_MARGIN: i32 = 8;
 
     /// How much of its original size the whole desktop shrinks to in the
-    /// overview — GNOME-style "zoom out", not a per-window grid layout.
+    /// Activities overview — GNOME-style "zoom out", not a per-window grid
+    /// layout.
     const OVERVIEW_SCALE: f64 = 0.6;
     const ANIM_DURATION: Duration = Duration::from_millis(250);
     const ANIM_TIMER_ID: usize = 1;
     const ANIM_TIMER_INTERVAL_MS: u32 = 16;
+    /// Refreshes the bar's clock text once a second.
+    const CLOCK_TIMER_ID: usize = 2;
+
+    const CAL_WIDTH: i32 = 320;
+    const CAL_CALENDAR_HEIGHT: i32 = 300;
+    const CAL_NOTIF_HEIGHT: i32 = 140;
+    const CAL_HEIGHT: i32 = CAL_CALENDAR_HEIGHT + CAL_NOTIF_HEIGHT;
+    const CAL_PADDING: i32 = 12;
+    const CAL_CELL_HEIGHT: i32 = 34;
+
+    const QS_WIDTH: i32 = 280;
+    const QS_HEIGHT: i32 = 170;
+    const QS_PADDING: i32 = 16;
+    const QS_VOL_DOWN: i32 = 2001;
+    const QS_VOL_UP: i32 = 2002;
+    const QS_MUTE: i32 = 2003;
 
     /// One window's live DWM thumbnail plus its animation endpoints, all in
     /// `overview_hwnd`-local (client-area) coordinates.
@@ -101,17 +146,52 @@ mod imp {
     /// thread that created them).
     struct AppState {
         bar_hwnd: HWND,
+        bar_width: i32,
         overview_hwnd: HWND,
+        calendar_hwnd: HWND,
+        quick_settings_hwnd: HWND,
         overview: OverviewMode,
-        /// Captured right before opening the overview, so cancelling
-        /// (Escape / click on empty space) can restore focus to whatever
-        /// the user was actually doing. The bar itself never becomes
-        /// foreground (`WS_EX_NOACTIVATE`), so this is never just the bar.
+        calendar_open: bool,
+        quick_settings_open: bool,
+        /// Captured right before opening whichever flyout is currently
+        /// open, so cancelling (Escape / empty-area click) can restore
+        /// focus to whatever the user was actually doing. The bar itself
+        /// never becomes foreground (`WS_EX_NOACTIVATE`), so this is never
+        /// just the bar.
         previous_foreground: HWND,
     }
 
     thread_local! {
         static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Role {
+        Bar,
+        Overview,
+        Calendar,
+        QuickSettings,
+        Other,
+    }
+
+    fn role_of(hwnd: HWND) -> Role {
+        STATE.with(|s| {
+            let state = s.borrow();
+            let Some(st) = state.as_ref() else {
+                return Role::Other;
+            };
+            if hwnd == st.bar_hwnd {
+                Role::Bar
+            } else if hwnd == st.overview_hwnd {
+                Role::Overview
+            } else if hwnd == st.calendar_hwnd {
+                Role::Calendar
+            } else if hwnd == st.quick_settings_hwnd {
+                Role::QuickSettings
+            } else {
+                Role::Other
+            }
+        })
     }
 
     pub fn main() -> Result<()> {
@@ -120,6 +200,13 @@ mod imp {
 
         let _job = groveshell_common::jobobject::ShellJob::create_and_join()?;
         tracing::info!("joined shell job object");
+
+        // SAFETY: called once, early, on the same single thread that makes
+        // every other COM call in this process (volume control).
+        // Initialization failure just means volume control degrades to
+        // "unavailable" via the `Option`-returning helpers below — it's not
+        // fatal to the rest of the shell.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
 
         // SAFETY: every Win32 call below either has a call-site safety
         // comment or is a plain value/query with no aliasing or lifetime
@@ -135,6 +222,18 @@ mod imp {
                 Some(wndproc),
                 0x00404040,
             )?;
+            register_class(
+                hinstance,
+                w!("GroveShellCalendar"),
+                Some(wndproc),
+                0x00303030,
+            )?;
+            register_class(
+                hinstance,
+                w!("GroveShellQuickSettings"),
+                Some(wndproc),
+                0x00303030,
+            )?;
 
             let screen_w = GetSystemMetrics(SM_CXSCREEN);
             let screen_h = GetSystemMetrics(SM_CYSCREEN);
@@ -142,9 +241,9 @@ mod imp {
             // Bar: WS_EX_TOOLWINDOW keeps it out of the taskbar/alt-tab and
             // (as a side effect) out of its own Activities listing, since
             // `window-model::snapshot` excludes tool windows. WS_EX_NOACTIVATE
-            // means clicking the Activities label never makes the bar the
-            // foreground window — without it, `GetForegroundWindow()` in
-            // `open_overview` would see the bar itself instead of whatever
+            // means clicking anything on the bar never makes it the
+            // foreground window — without it, `GetForegroundWindow()` when
+            // opening a flyout would see the bar itself instead of whatever
             // app the user was actually using, breaking "restore focus on
             // cancel."
             let bar_hwnd = CreateWindowExW(
@@ -176,11 +275,12 @@ mod imp {
                 bar_rect.bottom - bar_rect.top,
                 true,
             );
+            let bar_width = bar_rect.right - bar_rect.left;
 
             // Overview: covers everything below the bar rather than the
-            // whole screen, so the bar (and its Activities label) stays put
-            // and visible while the overview is open, matching GNOME, where
-            // the top bar is never covered by the overview it opens.
+            // whole screen, so the bar stays visible while it's open,
+            // matching GNOME, where the top bar is never covered by the
+            // overview it opens.
             let overview_y = bar_rect.bottom;
             let overview_h = screen_h - overview_y;
             let overview_hwnd = CreateWindowExW(
@@ -199,11 +299,102 @@ mod imp {
             )
             .map_err(Error::Windows)?;
 
+            // Calendar + notifications flyout, centered under the bar's
+            // clock label, clamped so it never runs off either screen edge.
+            let calendar_x = (bar_width / 2 - CAL_WIDTH / 2).clamp(0, (screen_w - CAL_WIDTH).max(0));
+            let calendar_hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GroveShellCalendar"),
+                w!("GroveShell Calendar"),
+                WS_POPUP,
+                calendar_x,
+                overview_y,
+                CAL_WIDTH,
+                CAL_HEIGHT,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)?;
+
+            // Quick Settings flyout, right-aligned under the bar's right
+            // label.
+            let qs_x = (screen_w - QS_WIDTH - QS_LABEL_MARGIN).clamp(0, (screen_w - QS_WIDTH).max(0));
+            let quick_settings_hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                w!("GroveShellQuickSettings"),
+                w!("GroveShell Quick Settings"),
+                WS_POPUP,
+                qs_x,
+                overview_y,
+                QS_WIDTH,
+                QS_HEIGHT,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)?;
+
+            CreateWindowExW(
+                Default::default(),
+                w!("BUTTON"),
+                w!("-"),
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                QS_PADDING,
+                90,
+                40,
+                28,
+                quick_settings_hwnd,
+                HMENU(QS_VOL_DOWN as *mut c_void),
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)?;
+
+            CreateWindowExW(
+                Default::default(),
+                w!("BUTTON"),
+                w!("+"),
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                QS_PADDING + 48,
+                90,
+                40,
+                28,
+                quick_settings_hwnd,
+                HMENU(QS_VOL_UP as *mut c_void),
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)?;
+
+            CreateWindowExW(
+                Default::default(),
+                w!("BUTTON"),
+                w!("Mute"),
+                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
+                QS_WIDTH - QS_PADDING - 94,
+                90,
+                94,
+                28,
+                quick_settings_hwnd,
+                HMENU(QS_MUTE as *mut c_void),
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)?;
+
             STATE.with(|s| {
                 *s.borrow_mut() = Some(AppState {
                     bar_hwnd,
+                    bar_width,
                     overview_hwnd,
+                    calendar_hwnd,
+                    quick_settings_hwnd,
                     overview: OverviewMode::Closed,
+                    calendar_open: false,
+                    quick_settings_open: false,
                     previous_foreground: HWND(std::ptr::null_mut()),
                 });
             });
@@ -211,10 +402,11 @@ mod imp {
             // The `MoveWindow` above may have already triggered and
             // consumed a `WM_PAINT` for the bar before `STATE` existed, in
             // which case `wndproc` fell back to `DefWindowProcW` and the
-            // Activities label never actually got drawn. Force one more
-            // repaint now that `STATE` is ready so the label always shows
-            // up, regardless of how that first paint landed.
+            // bar's labels never actually got drawn. Force one more
+            // repaint now that `STATE` is ready so they always show up,
+            // regardless of how that first paint landed.
             let _ = InvalidateRect(bar_hwnd, None, true);
+            SetTimer(bar_hwnd, CLOCK_TIMER_ID, 1000, None);
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -296,11 +488,21 @@ mod imp {
         Ok(())
     }
 
-    /// Paints the "Activities" label directly onto the bar. There's no
-    /// native `BUTTON` control here — at a 16px bar height a real push
-    /// button's chrome leaves no room for legible text, so this is flat
-    /// painted text hit-tested in `WM_LBUTTONUP` instead.
+    /// SAFETY: `hdc` must be a valid device context obtained from
+    /// `BeginPaint` on the window currently handling `WM_PAINT`.
+    unsafe fn draw_text_in(hdc: HDC, rect: RECT, text: &str, format: DRAW_TEXT_FORMAT) {
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        let mut r = rect;
+        DrawTextW(hdc, &mut wide, &mut r, format);
+    }
+
+    /// Paints the bar's three labels directly onto it. There are no native
+    /// `BUTTON` controls here — at this bar height a real push button's
+    /// chrome leaves no room for legible text, so this is flat painted text
+    /// hit-tested in `WM_LBUTTONUP` instead (see `on_bar_click`).
     fn paint_bar(hwnd: HWND) {
+        let bar_width = STATE.with(|s| s.borrow().as_ref().map(|st| st.bar_width)).unwrap_or(0);
+
         // SAFETY: `hwnd` is the window currently processing `WM_PAINT`, so
         // it's guaranteed valid for the duration of this call; `ps` is a
         // local that outlives the paired `BeginPaint`/`EndPaint` call.
@@ -309,21 +511,321 @@ mod imp {
             let hdc = BeginPaint(hwnd, &mut ps);
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, COLORREF(0x00E0E0E0));
-            let mut text: Vec<u16> = "Activities".encode_utf16().collect();
-            let mut rect = RECT {
-                left: ACTIVITIES_LABEL_X,
-                top: 0,
-                right: ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH,
-                bottom: BAR_HEIGHT,
-            };
-            DrawTextW(
+
+            let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
+            draw_text_in(
                 hdc,
-                &mut text,
-                &mut rect,
-                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+                RECT {
+                    left: ACTIVITIES_LABEL_X,
+                    top: 0,
+                    right: ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH,
+                    bottom: BAR_HEIGHT,
+                },
+                "Activities",
+                format,
             );
+
+            let clock_x = bar_width / 2 - CLOCK_LABEL_WIDTH / 2;
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: clock_x,
+                    top: 0,
+                    right: clock_x + CLOCK_LABEL_WIDTH,
+                    bottom: BAR_HEIGHT,
+                },
+                &clock_text(),
+                format,
+            );
+
+            let qs_x = bar_width - QS_LABEL_WIDTH - QS_LABEL_MARGIN;
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: qs_x,
+                    top: 0,
+                    right: qs_x + QS_LABEL_WIDTH,
+                    bottom: BAR_HEIGHT,
+                },
+                &quick_settings_label_text(),
+                format,
+            );
+
             let _ = EndPaint(hwnd, &ps);
         }
+    }
+
+    fn clock_text() -> String {
+        // SAFETY: no preconditions.
+        let t = unsafe { GetLocalTime() };
+        let hour12 = match t.wHour % 12 {
+            0 => 12,
+            h => h,
+        };
+        let ampm = if t.wHour < 12 { "AM" } else { "PM" };
+        format!("{hour12:02}:{:02} {ampm}", t.wMinute)
+    }
+
+    fn quick_settings_label_text() -> String {
+        match battery_percent() {
+            Some(pct) => format!("{pct}%  Quick Settings"),
+            None => "Quick Settings".to_string(),
+        }
+    }
+
+    /// `None` when there's no battery to report (desktop on AC), not on
+    /// I/O failure — `GetSystemPowerStatus` reports `255` for "unknown",
+    /// which covers both cases; either way there's nothing meaningful to
+    /// show.
+    fn battery_percent() -> Option<u8> {
+        // SAFETY: `status` is a local, zeroed `SYSTEM_POWER_STATUS` that
+        // outlives this synchronous call.
+        unsafe {
+            let mut status = SYSTEM_POWER_STATUS::default();
+            GetSystemPowerStatus(&mut status).ok()?;
+            (status.BatteryLifePercent != 255).then_some(status.BatteryLifePercent)
+        }
+    }
+
+    fn is_leap_year(year: i32) -> bool {
+        (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+    }
+
+    fn days_in_month(year: i32, month: i32) -> i32 {
+        const DAYS: [i32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        if month == 2 && is_leap_year(year) {
+            29
+        } else {
+            DAYS[(month - 1) as usize]
+        }
+    }
+
+    fn month_name(month: i32) -> &'static str {
+        const NAMES: [&str; 12] = [
+            "January", "February", "March", "April", "May", "June", "July", "August",
+            "September", "October", "November", "December",
+        ];
+        NAMES[(month - 1) as usize]
+    }
+
+    /// Draws a real month calendar (today highlighted) over a notifications
+    /// section. The day-of-week of the 1st is derived from today's own
+    /// day-of-week/day-of-month rather than a separate date calculation,
+    /// since the two are always a fixed number of days apart within the
+    /// same month.
+    fn paint_calendar(hwnd: HWND) {
+        // SAFETY: `hwnd` is the window currently processing `WM_PAINT`.
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            SetBkMode(hdc, TRANSPARENT);
+
+            let now = GetLocalTime();
+            let year = now.wYear as i32;
+            let month = now.wMonth as i32;
+            let today = now.wDay as i32;
+            let today_dow = now.wDayOfWeek as i32;
+            let first_dow = ((today_dow - (today - 1)) % 7 + 7) % 7;
+            let days = days_in_month(year, month);
+
+            let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
+
+            SetTextColor(hdc, COLORREF(0x00FFFFFF));
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: CAL_PADDING,
+                    top: 8,
+                    right: CAL_WIDTH - CAL_PADDING,
+                    bottom: 32,
+                },
+                &format!("{} {year}", month_name(month)),
+                format,
+            );
+
+            let cell_w = (CAL_WIDTH - CAL_PADDING * 2) / 7;
+            const DOW_LABELS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+            SetTextColor(hdc, COLORREF(0x00A0A0A0));
+            for (i, label) in DOW_LABELS.iter().enumerate() {
+                let x = CAL_PADDING + i as i32 * cell_w;
+                draw_text_in(
+                    hdc,
+                    RECT {
+                        left: x,
+                        top: 40,
+                        right: x + cell_w,
+                        bottom: 60,
+                    },
+                    label,
+                    format,
+                );
+            }
+
+            let mut day = 1;
+            let mut col = first_dow;
+            let mut row = 0;
+            while day <= days {
+                let x = CAL_PADDING + col * cell_w;
+                let y = 64 + row * CAL_CELL_HEIGHT;
+                SetTextColor(
+                    hdc,
+                    if day == today {
+                        COLORREF(0x0040A0FF)
+                    } else {
+                        COLORREF(0x00E0E0E0)
+                    },
+                );
+                draw_text_in(
+                    hdc,
+                    RECT {
+                        left: x,
+                        top: y,
+                        right: x + cell_w,
+                        bottom: y + CAL_CELL_HEIGHT,
+                    },
+                    &day.to_string(),
+                    format,
+                );
+                day += 1;
+                col += 1;
+                if col == 7 {
+                    col = 0;
+                    row += 1;
+                }
+            }
+
+            let notif_format = DT_SINGLELINE | DT_VCENTER;
+            SetTextColor(hdc, COLORREF(0x00FFFFFF));
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: CAL_PADDING,
+                    top: CAL_CALENDAR_HEIGHT + 10,
+                    right: CAL_WIDTH - CAL_PADDING,
+                    bottom: CAL_CALENDAR_HEIGHT + 34,
+                },
+                "Notifications",
+                notif_format,
+            );
+            SetTextColor(hdc, COLORREF(0x00A0A0A0));
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: CAL_PADDING,
+                    top: CAL_CALENDAR_HEIGHT + 40,
+                    right: CAL_WIDTH - CAL_PADDING,
+                    bottom: CAL_CALENDAR_HEIGHT + 64,
+                },
+                "No new notifications",
+                notif_format,
+            );
+
+            let _ = EndPaint(hwnd, &ps);
+        }
+    }
+
+    fn paint_quick_settings(hwnd: HWND) {
+        // SAFETY: `hwnd` is the window currently processing `WM_PAINT`.
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            SetBkMode(hdc, TRANSPARENT);
+
+            let format = DT_SINGLELINE | DT_VCENTER;
+
+            SetTextColor(hdc, COLORREF(0x00FFFFFF));
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: QS_PADDING,
+                    top: 10,
+                    right: QS_WIDTH - QS_PADDING,
+                    bottom: 34,
+                },
+                "Quick Settings",
+                format,
+            );
+
+            let volume_text = match (get_volume_percent(), get_mute()) {
+                (Some(pct), Some(true)) => format!("Volume: {pct}% (Muted)"),
+                (Some(pct), _) => format!("Volume: {pct}%"),
+                (None, _) => "Volume: unavailable".to_string(),
+            };
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: QS_PADDING,
+                    top: 46,
+                    right: QS_WIDTH - QS_PADDING,
+                    bottom: 70,
+                },
+                &volume_text,
+                format,
+            );
+
+            SetTextColor(hdc, COLORREF(0x00A0A0A0));
+            let battery_text = match battery_percent() {
+                Some(pct) => format!("Battery: {pct}%"),
+                None => "On AC power".to_string(),
+            };
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: QS_PADDING,
+                    top: 130,
+                    right: QS_WIDTH - QS_PADDING,
+                    bottom: 154,
+                },
+                &battery_text,
+                format,
+            );
+
+            let _ = EndPaint(hwnd, &ps);
+        }
+    }
+
+    /// Acquires the default audio endpoint's volume control fresh for each
+    /// call rather than caching it — simpler and more robust against the
+    /// default device changing than holding a long-lived COM object, at
+    /// the cost of a little overhead per volume interaction (negligible;
+    /// this only ever runs in response to a button click).
+    fn with_volume<R>(f: impl FnOnce(&IAudioEndpointVolume) -> windows::core::Result<R>) -> Option<R> {
+        // SAFETY: `CoInitializeEx` was called once at process startup on
+        // this same thread; every call here is synchronous and its result
+        // fully consumed before returning.
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
+            let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
+            let volume: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None).ok()?;
+            f(&volume).ok()
+        }
+    }
+
+    fn get_volume_percent() -> Option<u32> {
+        with_volume(|v| unsafe { v.GetMasterVolumeLevelScalar() })
+            .map(|scalar| (scalar * 100.0).round() as u32)
+    }
+
+    fn get_mute() -> Option<bool> {
+        with_volume(|v| unsafe { v.GetMute() }).map(|b| b.as_bool())
+    }
+
+    fn adjust_volume(delta_percent: i32) {
+        let Some(current) = get_volume_percent() else {
+            return;
+        };
+        let next = (current as i32 + delta_percent).clamp(0, 100) as f32 / 100.0;
+        // SAFETY: no preconditions beyond `with_volume`'s own.
+        let _ = with_volume(|v| unsafe { v.SetMasterVolumeLevelScalar(next, std::ptr::null()) });
+    }
+
+    fn toggle_mute() {
+        let Some(muted) = get_mute() else {
+            return;
+        };
+        // SAFETY: no preconditions beyond `with_volume`'s own.
+        let _ = with_volume(|v| unsafe { v.SetMute(!muted, std::ptr::null()) });
     }
 
     fn ease_out(t: f64) -> f64 {
@@ -372,6 +874,134 @@ mod imp {
         }
     }
 
+    /// Hides the calendar flyout if it's open. `restore_focus` should be
+    /// `true` for an explicit dismiss (toggle-off click, Escape) and
+    /// `false` when it's being closed because another flyout is about to
+    /// take over (that flyout will own focus next) or because it's losing
+    /// activation naturally (the user already clicked something else,
+    /// which is already becoming foreground on its own — forcing our
+    /// stashed `previous_foreground` back at that moment would fight the
+    /// click that just happened).
+    fn hide_calendar(restore_focus: bool) {
+        let result = STATE.with(|s| {
+            let mut state_ref = s.borrow_mut();
+            let state = state_ref.as_mut()?;
+            if !state.calendar_open {
+                return None;
+            }
+            state.calendar_open = false;
+            Some((state.calendar_hwnd, state.previous_foreground))
+        });
+        let Some((hwnd, previous)) = result else {
+            return;
+        };
+        // SAFETY: `hwnd` is a valid, process-lifetime window; `previous`
+        // (if used) was captured moments-to-minutes ago by
+        // `GetForegroundWindow` and may have since closed, in which case
+        // `SetForegroundWindow` documented-fails rather than misbehaving.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            if restore_focus && !previous.0.is_null() {
+                let _ = SetForegroundWindow(previous);
+            }
+        }
+    }
+
+    /// Mirrors [`hide_calendar`] for the Quick Settings flyout.
+    fn hide_quick_settings(restore_focus: bool) {
+        let result = STATE.with(|s| {
+            let mut state_ref = s.borrow_mut();
+            let state = state_ref.as_mut()?;
+            if !state.quick_settings_open {
+                return None;
+            }
+            state.quick_settings_open = false;
+            Some((state.quick_settings_hwnd, state.previous_foreground))
+        });
+        let Some((hwnd, previous)) = result else {
+            return;
+        };
+        // SAFETY: see `hide_calendar`.
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            if restore_focus && !previous.0.is_null() {
+                let _ = SetForegroundWindow(previous);
+            }
+        }
+    }
+
+    fn toggle_calendar() {
+        let info = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| (st.calendar_hwnd, st.calendar_open))
+        });
+        let Some((hwnd, is_open)) = info else {
+            return;
+        };
+
+        if is_open {
+            hide_calendar(true);
+            return;
+        }
+
+        hide_quick_settings(false);
+        close_overview(None);
+
+        // SAFETY: no preconditions.
+        let previous_foreground = unsafe { GetForegroundWindow() };
+        STATE.with(|s| {
+            if let Some(state) = s.borrow_mut().as_mut() {
+                state.previous_foreground = previous_foreground;
+                state.calendar_open = true;
+            }
+        });
+
+        // SAFETY: `hwnd` is a valid, process-lifetime window.
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, true);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+    }
+
+    fn toggle_quick_settings() {
+        let info = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| (st.quick_settings_hwnd, st.quick_settings_open))
+        });
+        let Some((hwnd, is_open)) = info else {
+            return;
+        };
+
+        if is_open {
+            hide_quick_settings(true);
+            return;
+        }
+
+        hide_calendar(false);
+        close_overview(None);
+
+        // SAFETY: no preconditions.
+        let previous_foreground = unsafe { GetForegroundWindow() };
+        STATE.with(|s| {
+            if let Some(state) = s.borrow_mut().as_mut() {
+                state.previous_foreground = previous_foreground;
+                state.quick_settings_open = true;
+            }
+        });
+
+        // SAFETY: `hwnd` is a valid, process-lifetime window.
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, true);
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = SetFocus(hwnd);
+        }
+    }
+
     /// Starts the "zoom out" animation: registers a live DWM thumbnail for
     /// every currently-eligible window at its real screen position, then
     /// kicks off a timer to animate each one down to `OVERVIEW_SCALE` of
@@ -386,6 +1016,12 @@ mod imp {
         let Some(overview_hwnd) = overview_hwnd else {
             return;
         };
+
+        // The overview covers the same area any open flyout would; keeping
+        // one of those open underneath it would just be confusing dead
+        // state.
+        hide_calendar(false);
+        hide_quick_settings(false);
 
         // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
         let mut overview_screen_rect = RECT::default();
@@ -502,13 +1138,37 @@ mod imp {
         }
     }
 
-    fn on_activities_clicked() {
-        let is_closed = STATE
-            .with(|s| s.borrow().as_ref().map(|st| matches!(st.overview, OverviewMode::Closed)));
-        match is_closed {
-            Some(true) => open_overview(),
-            Some(false) => close_overview(None),
-            None => {}
+    /// Dispatches a click on the bar to whichever of its three painted
+    /// regions it landed in (see `paint_bar` for the same layout).
+    fn on_bar_click(x: i32) {
+        let bar_width = STATE.with(|s| s.borrow().as_ref().map(|st| st.bar_width));
+        let Some(bar_width) = bar_width else {
+            return;
+        };
+
+        if (ACTIVITIES_LABEL_X..ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH).contains(&x) {
+            let is_closed = STATE.with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .map(|st| matches!(st.overview, OverviewMode::Closed))
+            });
+            match is_closed {
+                Some(true) => open_overview(),
+                Some(false) => close_overview(None),
+                None => {}
+            }
+            return;
+        }
+
+        let clock_x = bar_width / 2 - CLOCK_LABEL_WIDTH / 2;
+        if (clock_x..clock_x + CLOCK_LABEL_WIDTH).contains(&x) {
+            toggle_calendar();
+            return;
+        }
+
+        let qs_x = bar_width - QS_LABEL_WIDTH - QS_LABEL_MARGIN;
+        if (qs_x..bar_width - QS_LABEL_MARGIN).contains(&x) {
+            toggle_quick_settings();
         }
     }
 
@@ -667,38 +1327,94 @@ mod imp {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        let is_bar = STATE.with(|s| s.borrow().as_ref().is_some_and(|st| st.bar_hwnd == hwnd));
+        let role = role_of(hwnd);
 
         match msg {
-            WM_PAINT if is_bar => {
-                paint_bar(hwnd);
-                LRESULT(0)
-            }
-            WM_LBUTTONUP if is_bar => {
-                let x = (lparam.0 & 0xFFFF) as i32;
-                if (ACTIVITIES_LABEL_X..ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH).contains(&x) {
-                    on_activities_clicked();
+            WM_PAINT => match role {
+                Role::Bar => {
+                    paint_bar(hwnd);
+                    LRESULT(0)
+                }
+                Role::Calendar => {
+                    paint_calendar(hwnd);
+                    LRESULT(0)
+                }
+                Role::QuickSettings => {
+                    paint_quick_settings(hwnd);
+                    LRESULT(0)
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            },
+            WM_LBUTTONUP => {
+                match role {
+                    Role::Bar => {
+                        let x = (lparam.0 & 0xFFFF) as i32;
+                        on_bar_click(x);
+                    }
+                    Role::Overview => {
+                        let x = (lparam.0 & 0xFFFF) as i32;
+                        let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                        on_overview_click(x, y);
+                    }
+                    _ => {}
                 }
                 LRESULT(0)
             }
-            WM_LBUTTONUP => {
-                let x = (lparam.0 & 0xFFFF) as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                on_overview_click(x, y);
+            WM_KEYDOWN => {
+                if wparam.0 == VK_ESCAPE.0 as usize {
+                    match role {
+                        Role::Overview => close_overview(None),
+                        Role::Calendar => hide_calendar(true),
+                        Role::QuickSettings => hide_quick_settings(true),
+                        _ => {}
+                    }
+                }
                 LRESULT(0)
             }
-            WM_KEYDOWN if !is_bar => {
-                if wparam.0 == VK_ESCAPE.0 as usize {
-                    close_overview(None);
+            WM_ACTIVATE => {
+                // LOWORD(wParam) == WA_INACTIVE means this window just lost
+                // activation — e.g. the user clicked somewhere else — which
+                // is this shell's cue to auto-dismiss a flyout, the same as
+                // clicking away from the real taskbar's date/time or quick
+                // settings panel does.
+                if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                    match role {
+                        Role::Calendar => hide_calendar(false),
+                        Role::QuickSettings => hide_quick_settings(false),
+                        _ => {}
+                    }
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_COMMAND if role == Role::QuickSettings => {
+                let control_id = (wparam.0 & 0xFFFF) as i32;
+                let notify_code = ((wparam.0 >> 16) & 0xFFFF) as u32;
+                if notify_code == BN_CLICKED {
+                    match control_id {
+                        QS_VOL_DOWN => adjust_volume(-5),
+                        QS_VOL_UP => adjust_volume(5),
+                        QS_MUTE => toggle_mute(),
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(hwnd, None, true);
                 }
                 LRESULT(0)
             }
             WM_TIMER => {
-                on_animation_tick();
+                match wparam.0 {
+                    ANIM_TIMER_ID => on_animation_tick(),
+                    CLOCK_TIMER_ID => {
+                        let bar_hwnd = STATE.with(|s| s.borrow().as_ref().map(|st| st.bar_hwnd));
+                        if let Some(bar_hwnd) = bar_hwnd {
+                            let _ = InvalidateRect(bar_hwnd, None, true);
+                        }
+                    }
+                    _ => {}
+                }
                 LRESULT(0)
             }
             WM_DESTROY => {
-                if is_bar {
+                if role == Role::Bar {
                     unregister_appbar(hwnd);
                 }
                 PostQuitMessage(0);
