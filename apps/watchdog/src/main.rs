@@ -10,7 +10,7 @@ mod imp {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use groveshell_common::{jobobject::ShellJob, Result};
-    use groveshell_ipc::{message_type, pipe};
+    use groveshell_ipc::{message_type, pipe, Envelope};
 
     const WATCHDOG_PIPE_NAME: &str = "groveshell-watchdog";
     const UNHEALTHY_AFTER: Duration = Duration::from_secs(6);
@@ -75,6 +75,22 @@ mod imp {
             Ok(envelope) if envelope.message_type == message_type::HEARTBEAT => {
                 *last_heartbeat.lock().expect("heartbeat mutex poisoned") = Some(Instant::now());
                 tracing::debug!("heartbeat received");
+            }
+            Ok(request) if request.message_type == message_type::WATCHDOG_SHUTDOWN => {
+                tracing::info!("shutdown requested; exiting");
+                let response = Envelope::new(
+                    "groveshell-watchdog",
+                    message_type::WATCHDOG_SHUTDOWN_ACK,
+                    serde_json::json!({ "echo_of": request.request_id }),
+                );
+                if let Err(e) = groveshell_ipc::framing::write_envelope(&mut conn, &response) {
+                    tracing::warn!(error = ?e, "failed to acknowledge shutdown");
+                }
+                // See the sync_all() note in the host's shutdown handler —
+                // the client needs a chance to read the ack before this
+                // process exits and the pipe handle goes away.
+                let _ = conn.sync_all();
+                std::process::exit(0);
             }
             Ok(other) => {
                 tracing::warn!(message_type = %other.message_type, "unexpected message on watchdog pipe");

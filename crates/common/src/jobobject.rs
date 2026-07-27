@@ -10,9 +10,12 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, OpenJobObjectW, TerminateJobObject,
-    JOB_OBJECT_ALL_ACCESS,
 };
 use windows::Win32::System::Threading::GetCurrentProcess;
+
+/// `JOB_OBJECT_ALL_ACCESS` from WinNT.h (`STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x1F`).
+/// Not exposed by the `windows` crate's metadata, so it's inlined here.
+const JOB_OBJECT_ALL_ACCESS: u32 = 0x001F_001F;
 
 /// Session-global job object name. Processes across the GroveShell shell
 /// share this single job so the watchdog can find and terminate the whole
@@ -60,7 +63,7 @@ impl ShellJob {
         // to an existing, already-named job object; `false` means the
         // returned handle is not inheritable by child processes.
         let handle: HANDLE =
-            unsafe { OpenJobObjectW(JOB_OBJECT_ALL_ACCESS.0, false, PCWSTR(name.as_ptr())) }
+            unsafe { OpenJobObjectW(JOB_OBJECT_ALL_ACCESS, false, PCWSTR(name.as_ptr())) }
                 .map_err(Error::Windows)?;
 
         // SAFETY: `handle` was just opened above with terminate access

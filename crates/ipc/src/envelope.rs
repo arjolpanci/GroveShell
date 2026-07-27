@@ -35,4 +35,12 @@ pub mod message_type {
     pub const PING: &str = "host.ping";
     pub const PONG: &str = "host.pong";
     pub const HEARTBEAT: &str = "watchdog.heartbeat";
+    /// Requests a graceful exit. Sent to either the host or the watchdog
+    /// pipe; the receiver answers with the matching `*_ack` and then calls
+    /// `std::process::exit`, so this is a normal stop, not the crash-loop
+    /// recovery path in `docs/PROJECT_PLAN.md` §13.2.
+    pub const SHUTDOWN: &str = "host.shutdown";
+    pub const SHUTDOWN_ACK: &str = "host.shutdown_ack";
+    pub const WATCHDOG_SHUTDOWN: &str = "watchdog.shutdown";
+    pub const WATCHDOG_SHUTDOWN_ACK: &str = "watchdog.shutdown_ack";
 }

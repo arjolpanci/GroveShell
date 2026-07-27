@@ -295,6 +295,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "groveshell-ui"
+version = "0.1.0"
+dependencies = [
+ "groveshell-common",
+ "groveshell-window-model",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "groveshell-watchdog"
 version = "0.1.0"
 dependencies = [
@@ -302,6 +312,13 @@ dependencies = [
  "groveshell-ipc",
  "serde_json",
  "tracing",
+ "windows",
+]
+
+[[package]]
+name = "groveshell-window-model"
+version = "0.1.0"
+dependencies = [
  "windows",
 ]
 

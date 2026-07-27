@@ -25,3 +25,4 @@ windows = "0.58"
 groveshell-common = { path = "crates/common" }
 groveshell-config = { path = "crates/config" }
 groveshell-ipc = { path = "crates/ipc" }
+groveshell-window-model = { path = "crates/window-model" }
