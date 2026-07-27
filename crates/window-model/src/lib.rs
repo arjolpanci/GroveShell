@@ -10,6 +10,7 @@
 //! deliberately out of scope here and remain a follow-up.
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -70,6 +71,24 @@ fn inspect(hwnd: HWND) -> Option<WindowRecord> {
     // duration of this synchronous callback frame.
     unsafe {
         if !IsWindowVisible(hwnd).as_bool() {
+            return None;
+        }
+
+        // Many background/tray apps (and most built-in shell hosts, e.g.
+        // Widgets, Search, Shell Experience Host) keep a top-level window
+        // that reports `IsWindowVisible == true` but is DWM-cloaked and
+        // never actually drawn on screen — the same signal the real
+        // taskbar uses to decide whether something gets a button. Without
+        // this check, closing an app to the tray would still leave it
+        // listed here as if it had an open window.
+        let mut cloaked: u32 = 0;
+        let _ = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut u32 as *mut std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+        if cloaked != 0 {
             return None;
         }
 
