@@ -9,6 +9,8 @@
 //! updates, and the full eligibility/diagnostic model described in §6 are
 //! deliberately out of scope here and remain a follow-up.
 
+pub mod workspace;
+
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::System::Threading::{
@@ -17,8 +19,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    GWL_EXSTYLE, GW_OWNER, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 /// A window rectangle in screen coordinates, left/top inclusive and
@@ -76,18 +78,42 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
     // call's lifetime.
     let records = &mut *(lparam.0 as *mut Vec<WindowRecord>);
 
-    if let Some(record) = inspect(hwnd) {
+    if let Some(record) = inspect(hwnd, true) {
         records.push(record);
     }
 
     TRUE
 }
 
-fn inspect(hwnd: HWND) -> Option<WindowRecord> {
-    // SAFETY: `hwnd` is supplied by `EnumWindows` and is valid for the
-    // duration of this synchronous callback frame.
+/// Re-inspects a single, previously-known window by handle, bypassing the
+/// `IsWindowVisible` gate that [`snapshot`] applies. Used by workspace
+/// switching (see [`workspace`]): a window parked on an inactive workspace
+/// is hidden via `ShowWindow(SW_HIDE)`, so a fresh `snapshot()` would never
+/// see it again even though it's still eligible and still assigned to a
+/// workspace. Returns `None` if the handle no longer refers to a live,
+/// eligible top-level window (closed, or reused for something ineligible —
+/// see the module docs on HWND reuse; this crate has no generation-counter
+/// identity yet, so a rare same-tick reuse can't be distinguished here).
+pub fn describe(hwnd: isize) -> Option<WindowRecord> {
+    inspect(HWND(hwnd as *mut std::ffi::c_void), false)
+}
+
+/// Whether `hwnd` still refers to a live window at all, regardless of
+/// eligibility. Used to prune workspace assignments for windows that have
+/// since been destroyed.
+pub fn is_alive(hwnd: isize) -> bool {
+    // SAFETY: `hwnd` is just a numeric value passed to a query API; `IsWindow`
+    // documented-returns false for any value that isn't a live window handle.
+    unsafe { IsWindow(HWND(hwnd as *mut std::ffi::c_void)).as_bool() }
+}
+
+fn inspect(hwnd: HWND, require_visible: bool) -> Option<WindowRecord> {
+    // SAFETY: `hwnd` is either supplied by `EnumWindows` (valid for the
+    // duration of that synchronous callback frame) or a previously-known
+    // handle passed to `describe`, which documented-fails harmlessly below
+    // if the handle is no longer live.
     unsafe {
-        if !IsWindowVisible(hwnd).as_bool() {
+        if require_visible && !IsWindowVisible(hwnd).as_bool() {
             return None;
         }
 
