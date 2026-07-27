@@ -1,13 +1,24 @@
 //! `groveshell-ui`: first-iteration shell UI. Per `docs/PROJECT_PLAN.md`
-//! §10.1/§10.2, creates a single top bar with three regions — Activities
-//! (left), a clock (center), and a Quick Settings affordance (right) — plus
-//! three flyouts:
+//! §10.1/§10.2, creates **one top bar per monitor** (Phase 4: "Create
+//! per-monitor top bar windows and reserve working area") — only the
+//! primary monitor's bar carries the three interactive regions (Activities,
+//! clock, Quick Settings); other monitors just get an empty reserved strip
+//! for now. Three flyouts:
 //!
-//! - **Activities overview**: clicking Activities zooms the whole desktop
-//!   out to ~60% into the middle of the overview, using live DWM thumbnails
-//!   (`DwmRegisterThumbnail`) of the real open windows. Clicking a
-//!   thumbnail reverses the animation back to that window's real position
-//!   and focuses it.
+//! - **Activities overview**: spans the full virtual screen (every
+//!   monitor), so a window on a non-primary monitor is fully inside its
+//!   bounds and clickable — it previously only spanned the primary
+//!   monitor, which clipped/broke windows on any other monitor. Each
+//!   monitor gets its own "workspace card": a fixed-size rectangle (its
+//!   desktop area below its own bar) that shrinks toward *its own* center,
+//!   with that monitor's window thumbnails scaling in lockstep with it —
+//!   not one shared pivot for the whole multi-monitor span, which would
+//!   make two monitors' windows collide toward a single point between
+//!   them. The card itself is drawn as a solid rect so a workspace's
+//!   boundary stays visible even when a window inside it is small (the
+//!   real desktop wallpaper isn't captured — see `paint_overview`).
+//!   Clicking a thumbnail reverses the animation back to that window's
+//!   real position and focuses it.
 //! - **Calendar + notifications**: clicking the clock opens a Windows-11-style
 //!   flyout centered below it — a real month calendar (today highlighted)
 //!   stacked over a notifications section. The notifications section is a
@@ -23,15 +34,20 @@
 //!   (Explorer replacement) per `docs/PROJECT_PLAN.md` §7 and ADR-002.
 //!
 //! Only one flyout is ever open at a time; opening any of the three closes
-//! the other two. The bar reserves its strip of the work area via the
-//! AppBar API (`SHAppBarMessage`), the same mechanism the Windows taskbar
-//! uses, so maximized windows and desktop icon layout respect it instead of
-//! being covered.
+//! the other two. Each bar reserves its strip of its own monitor's work
+//! area via the AppBar API (`SHAppBarMessage`), the same mechanism the
+//! Windows taskbar uses, so maximized windows and desktop icon layout
+//! respect it instead of being covered.
 //!
-//! Deliberately out of scope for this slice: multiple workspaces (there is
-//! only ever "the current desktop" right now), hot corners, hotkeys, and
-//! live updates while the overview is open (a window closing mid-overview
-//! just leaves a stale thumbnail until the overview is reopened).
+//! Deliberately out of scope for this slice: multiple *virtual desktops*
+//! (Windows' own Task View desktops) — DWM already cloaks windows on an
+//! inactive virtual desktop, and this shell's cloaked-window filter (in
+//! `groveshell-window-model`) already excludes those, so the overview only
+//! ever shows the current virtual desktop's windows, but there's no UI to
+//! switch between virtual desktops yet. Also out of scope: hot corners,
+//! hotkeys, per-monitor DPI scaling, and live updates while the overview is
+//! open (a window closing mid-overview just leaves a stale thumbnail until
+//! the overview is reopened).
 
 #[cfg(windows)]
 mod imp {
@@ -41,15 +57,15 @@ mod imp {
 
     use groveshell_common::{Error, Result};
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Foundation::{BOOL, COLORREF, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
     use windows::Win32::Graphics::Dwm::{
         DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
         DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
     };
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DrawTextW, EndPaint, InvalidateRect, SetBkMode,
-        SetTextColor, DRAW_TEXT_FORMAT, DT_CENTER, DT_SINGLELINE, DT_VCENTER, HDC, PAINTSTRUCT,
-        TRANSPARENT,
+        BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, EnumDisplayMonitors,
+        FillRect, GetMonitorInfoW, InvalidateRect, SetBkMode, SetTextColor, DRAW_TEXT_FORMAT,
+        DT_CENTER, DT_SINGLELINE, DT_VCENTER, HDC, HMONITOR, MONITORINFO, PAINTSTRUCT, TRANSPARENT,
     };
     use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
     use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
@@ -57,6 +73,7 @@ mod imp {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     use windows::Win32::System::SystemInformation::GetLocalTime;
+    use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
     use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE};
     use windows::Win32::UI::Shell::{
         SHAppBarMessage, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
@@ -76,14 +93,14 @@ mod imp {
     const QS_LABEL_WIDTH: i32 = 170;
     const QS_LABEL_MARGIN: i32 = 8;
 
-    /// How much of its original size the whole desktop shrinks to in the
-    /// Activities overview — GNOME-style "zoom out", not a per-window grid
-    /// layout.
+    /// How much of its own size a workspace card (and everything on it)
+    /// shrinks to in the Activities overview — GNOME-style "zoom out",
+    /// each monitor toward its own center.
     const OVERVIEW_SCALE: f64 = 0.6;
     const ANIM_DURATION: Duration = Duration::from_millis(250);
     const ANIM_TIMER_ID: usize = 1;
     const ANIM_TIMER_INTERVAL_MS: u32 = 16;
-    /// Refreshes the bar's clock text once a second.
+    /// Refreshes the primary bar's clock text once a second.
     const CLOCK_TIMER_ID: usize = 2;
 
     const CAL_WIDTH: i32 = 320;
@@ -99,6 +116,23 @@ mod imp {
     const QS_VOL_DOWN: i32 = 2001;
     const QS_VOL_UP: i32 = 2002;
     const QS_MUTE: i32 = 2003;
+
+    #[derive(Clone, Copy)]
+    struct MonitorInfo {
+        /// Full monitor bounds in virtual-screen coordinates (which can be
+        /// negative — the primary monitor anchors the origin, so a monitor
+        /// to its left or above it has negative coordinates).
+        rect: RECT,
+        is_primary: bool,
+    }
+
+    /// One monitor's top-level bar window plus the rect the AppBar system
+    /// actually assigned it.
+    struct BarWindow {
+        hwnd: HWND,
+        rect: RECT,
+        is_primary: bool,
+    }
 
     /// One window's live DWM thumbnail plus its animation endpoints, all in
     /// `overview_hwnd`-local (client-area) coordinates.
@@ -116,20 +150,32 @@ mod imp {
         current: RECT,
     }
 
+    /// A monitor's "workspace card" background rect, animated the same way
+    /// as `ThumbAnim` but with no DWM handle — it's plain GDI fill, redrawn
+    /// via `InvalidateRect` on every animation tick.
+    struct CardAnim {
+        from: RECT,
+        to: RECT,
+        current: RECT,
+    }
+
     enum OverviewMode {
         Closed,
         Opening {
             started: Instant,
             thumbs: Vec<ThumbAnim>,
+            cards: Vec<CardAnim>,
         },
         /// Idle, fully zoomed out; `thumbs[].current` is stable and is what
         /// clicks are hit-tested against.
         Open {
             thumbs: Vec<ThumbAnim>,
+            cards: Vec<CardAnim>,
         },
         Closing {
             started: Instant,
             thumbs: Vec<ThumbAnim>,
+            cards: Vec<CardAnim>,
             /// `Some(hwnd)` when closing because a thumbnail was clicked
             /// (focus that window afterward); `None` when cancelled
             /// (Escape / empty-area click — restore whatever was focused
@@ -145,8 +191,12 @@ mod imp {
     /// anyway (window procedures for these windows only ever run on the
     /// thread that created them).
     struct AppState {
-        bar_hwnd: HWND,
-        bar_width: i32,
+        bars: Vec<BarWindow>,
+        /// Cached from `bars` for quick access — the only bar with
+        /// Activities/clock/Quick Settings, and the one the calendar/QS
+        /// flyouts are anchored under.
+        primary_bar_hwnd: HWND,
+        primary_bar_rect: RECT,
         overview_hwnd: HWND,
         calendar_hwnd: HWND,
         quick_settings_hwnd: HWND,
@@ -155,9 +205,9 @@ mod imp {
         quick_settings_open: bool,
         /// Captured right before opening whichever flyout is currently
         /// open, so cancelling (Escape / empty-area click) can restore
-        /// focus to whatever the user was actually doing. The bar itself
-        /// never becomes foreground (`WS_EX_NOACTIVATE`), so this is never
-        /// just the bar.
+        /// focus to whatever the user was actually doing. The bars
+        /// themselves never become foreground (`WS_EX_NOACTIVATE`), so
+        /// this is never just a bar.
         previous_foreground: HWND,
     }
 
@@ -167,7 +217,7 @@ mod imp {
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Role {
-        Bar,
+        Bar { is_primary: bool },
         Overview,
         Calendar,
         QuickSettings,
@@ -180,9 +230,12 @@ mod imp {
             let Some(st) = state.as_ref() else {
                 return Role::Other;
             };
-            if hwnd == st.bar_hwnd {
-                Role::Bar
-            } else if hwnd == st.overview_hwnd {
+            if let Some(bar) = st.bars.iter().find(|b| b.hwnd == hwnd) {
+                return Role::Bar {
+                    is_primary: bar.is_primary,
+                };
+            }
+            if hwnd == st.overview_hwnd {
                 Role::Overview
             } else if hwnd == st.calendar_hwnd {
                 Role::Calendar
@@ -194,7 +247,86 @@ mod imp {
         })
     }
 
+    /// Enumerates real monitors via `EnumDisplayMonitors`, falling back to
+    /// a single synthetic monitor covering `GetSystemMetrics(SM_CXSCREEN
+    /// /SM_CYSCREEN)` if that call somehow returns nothing (shouldn't
+    /// happen on any real system, but every caller relies on this list
+    /// being non-empty).
+    fn enumerate_monitors() -> Vec<MonitorInfo> {
+        let mut monitors: Vec<MonitorInfo> = Vec::new();
+        // SAFETY: `monitors` is a local `Vec` whose address is passed
+        // through as `lparam` and only read back by `monitor_enum_proc`
+        // during this synchronous call.
+        unsafe {
+            let _ = EnumDisplayMonitors(
+                None,
+                None,
+                Some(monitor_enum_proc),
+                LPARAM(&mut monitors as *mut Vec<MonitorInfo> as isize),
+            );
+        }
+
+        if monitors.is_empty() {
+            // SAFETY: no preconditions; a plain metrics query.
+            let (w, h) = unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) };
+            monitors.push(MonitorInfo {
+                rect: RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                is_primary: true,
+            });
+        }
+        monitors
+    }
+
+    unsafe extern "system" fn monitor_enum_proc(
+        hmonitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `lparam` was created from a live `&mut Vec<MonitorInfo>`
+        // in `enumerate_monitors`, and this callback runs synchronously
+        // within that call's lifetime.
+        let monitors = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
+
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmonitor, &mut info).as_bool() {
+            monitors.push(MonitorInfo {
+                rect: info.rcMonitor,
+                is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+            });
+        }
+        TRUE
+    }
+
     pub fn main() -> Result<()> {
+        // SAFETY: must run before any window is created or any DPI-
+        // sensitive API is called (GetWindowRect, GetSystemMetrics,
+        // EnumDisplayMonitors, DWM window attributes, ...) — this is the
+        // very first thing `main` does. Without it, Windows silently
+        // "DPI-virtualizes" coordinates for this process, and different
+        // APIs virtualize inconsistently: `DwmGetWindowAttribute`'s
+        // extended frame bounds come back in true physical pixels
+        // regardless, while a plain `GetWindowRect` from a DPI-unaware
+        // process gets scaled to look like 96 DPI. On a single monitor
+        // both just happen to agree; on a mixed-DPI multi-monitor setup
+        // they don't, and window-model's rect for anything on the
+        // non-100%-scaled monitor comes out the wrong size/position
+        // relative to everything else this process computes — this was
+        // reproduced directly (a window measuring ~1129x635 via
+        // `GetWindowRect` reported as ~2236x1259 here, matching a 200%
+        // scale factor exactly) before adding this call.
+        let _ = unsafe {
+            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+        };
+
         let _log_guard = groveshell_common::logging::init("ui")?;
         tracing::info!("groveshell-ui starting");
 
@@ -235,63 +367,78 @@ mod imp {
                 0x00303030,
             )?;
 
-            let screen_w = GetSystemMetrics(SM_CXSCREEN);
-            let screen_h = GetSystemMetrics(SM_CYSCREEN);
+            // One bar per monitor (Phase 4). WS_EX_TOOLWINDOW keeps each
+            // out of the taskbar/alt-tab and (as a side effect) out of its
+            // own Activities listing, since `window-model::snapshot`
+            // excludes tool windows. WS_EX_NOACTIVATE means clicking
+            // anything on a bar never makes it the foreground window —
+            // without it, `GetForegroundWindow()` when opening a flyout
+            // would see the bar itself instead of whatever app the user
+            // was actually using, breaking "restore focus on cancel."
+            let monitors = enumerate_monitors();
+            let mut bars = Vec::new();
+            for monitor in &monitors {
+                let width = monitor.rect.right - monitor.rect.left;
+                let bar_hwnd = CreateWindowExW(
+                    WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    w!("GroveShellBar"),
+                    w!("GroveShell"),
+                    WS_POPUP | WS_VISIBLE,
+                    monitor.rect.left,
+                    monitor.rect.top,
+                    width,
+                    BAR_HEIGHT,
+                    None,
+                    None,
+                    hinstance,
+                    None,
+                )
+                .map_err(Error::Windows)?;
 
-            // Bar: WS_EX_TOOLWINDOW keeps it out of the taskbar/alt-tab and
-            // (as a side effect) out of its own Activities listing, since
-            // `window-model::snapshot` excludes tool windows. WS_EX_NOACTIVATE
-            // means clicking anything on the bar never makes it the
-            // foreground window — without it, `GetForegroundWindow()` when
-            // opening a flyout would see the bar itself instead of whatever
-            // app the user was actually using, breaking "restore focus on
-            // cancel."
-            let bar_hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                w!("GroveShellBar"),
-                w!("GroveShell"),
-                WS_POPUP | WS_VISIBLE,
-                0,
-                0,
-                screen_w,
-                BAR_HEIGHT,
-                None,
-                None,
-                hinstance,
-                None,
-            )
-            .map_err(Error::Windows)?;
+                // Register this bar as a top-edge AppBar (the same
+                // mechanism the Windows taskbar uses) so it reserves its
+                // strip of *its own monitor's* work area — the AppBar API
+                // has been monitor-aware since Windows 8, determined by
+                // which monitor the given rect falls on.
+                let bar_rect =
+                    register_appbar(bar_hwnd, monitor.rect.left, monitor.rect.top, width, BAR_HEIGHT);
+                let _ = MoveWindow(
+                    bar_hwnd,
+                    bar_rect.left,
+                    bar_rect.top,
+                    bar_rect.right - bar_rect.left,
+                    bar_rect.bottom - bar_rect.top,
+                    true,
+                );
 
-            // Register the bar as a top-edge AppBar (the same mechanism the
-            // Windows taskbar uses) so it reserves its strip of the work
-            // area instead of just floating on top of maximized windows and
-            // desktop icons.
-            let bar_rect = register_appbar(bar_hwnd, screen_w, BAR_HEIGHT);
-            let _ = MoveWindow(
-                bar_hwnd,
-                bar_rect.left,
-                bar_rect.top,
-                bar_rect.right - bar_rect.left,
-                bar_rect.bottom - bar_rect.top,
-                true,
-            );
-            let bar_width = bar_rect.right - bar_rect.left;
+                bars.push(BarWindow {
+                    hwnd: bar_hwnd,
+                    rect: bar_rect,
+                    is_primary: monitor.is_primary,
+                });
+            }
 
-            // Overview: covers everything below the bar rather than the
-            // whole screen, so the bar stays visible while it's open,
-            // matching GNOME, where the top bar is never covered by the
-            // overview it opens.
-            let overview_y = bar_rect.bottom;
-            let overview_h = screen_h - overview_y;
+            let primary = bars.iter().find(|b| b.is_primary).unwrap_or(&bars[0]);
+            let primary_bar_hwnd = primary.hwnd;
+            let primary_bar_rect = primary.rect;
+
+            // Overview: spans the full virtual screen (every monitor), not
+            // just the primary one — a window on another monitor needs to
+            // be fully inside the overview's bounds to be visible and
+            // clickable at all.
+            let virtual_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            let virtual_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let virtual_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            let virtual_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let overview_hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 w!("GroveShellOverview"),
                 w!("GroveShell Activities"),
                 WS_POPUP,
-                0,
-                overview_y,
-                screen_w,
-                overview_h,
+                virtual_x,
+                virtual_y,
+                virtual_w,
+                virtual_h,
                 None,
                 None,
                 hinstance,
@@ -299,16 +446,19 @@ mod imp {
             )
             .map_err(Error::Windows)?;
 
-            // Calendar + notifications flyout, centered under the bar's
-            // clock label, clamped so it never runs off either screen edge.
-            let calendar_x = (bar_width / 2 - CAL_WIDTH / 2).clamp(0, (screen_w - CAL_WIDTH).max(0));
+            // Calendar + notifications flyout, centered under the primary
+            // bar's clock label, clamped so it never runs off that
+            // monitor's edges.
+            let primary_bar_width = primary_bar_rect.right - primary_bar_rect.left;
+            let calendar_x = (primary_bar_rect.left + primary_bar_width / 2 - CAL_WIDTH / 2)
+                .clamp(primary_bar_rect.left, (primary_bar_rect.right - CAL_WIDTH).max(primary_bar_rect.left));
             let calendar_hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 w!("GroveShellCalendar"),
                 w!("GroveShell Calendar"),
                 WS_POPUP,
                 calendar_x,
-                overview_y,
+                primary_bar_rect.bottom,
                 CAL_WIDTH,
                 CAL_HEIGHT,
                 None,
@@ -318,16 +468,17 @@ mod imp {
             )
             .map_err(Error::Windows)?;
 
-            // Quick Settings flyout, right-aligned under the bar's right
-            // label.
-            let qs_x = (screen_w - QS_WIDTH - QS_LABEL_MARGIN).clamp(0, (screen_w - QS_WIDTH).max(0));
+            // Quick Settings flyout, right-aligned under the primary bar's
+            // right label.
+            let qs_x = (primary_bar_rect.right - QS_WIDTH - QS_LABEL_MARGIN)
+                .clamp(primary_bar_rect.left, (primary_bar_rect.right - QS_WIDTH).max(primary_bar_rect.left));
             let quick_settings_hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 w!("GroveShellQuickSettings"),
                 w!("GroveShell Quick Settings"),
                 WS_POPUP,
                 qs_x,
-                overview_y,
+                primary_bar_rect.bottom,
                 QS_WIDTH,
                 QS_HEIGHT,
                 None,
@@ -385,10 +536,13 @@ mod imp {
             )
             .map_err(Error::Windows)?;
 
+            let bar_hwnds: Vec<HWND> = bars.iter().map(|b| b.hwnd).collect();
+
             STATE.with(|s| {
                 *s.borrow_mut() = Some(AppState {
-                    bar_hwnd,
-                    bar_width,
+                    bars,
+                    primary_bar_hwnd,
+                    primary_bar_rect,
                     overview_hwnd,
                     calendar_hwnd,
                     quick_settings_hwnd,
@@ -399,14 +553,16 @@ mod imp {
                 });
             });
 
-            // The `MoveWindow` above may have already triggered and
-            // consumed a `WM_PAINT` for the bar before `STATE` existed, in
-            // which case `wndproc` fell back to `DefWindowProcW` and the
-            // bar's labels never actually got drawn. Force one more
-            // repaint now that `STATE` is ready so they always show up,
+            // A `MoveWindow` above may have already triggered and consumed
+            // a `WM_PAINT` for a bar before `STATE` existed, in which case
+            // `wndproc` fell back to `DefWindowProcW` and the primary bar's
+            // labels never actually got drawn. Force one more repaint on
+            // every bar now that `STATE` is ready so they always show up,
             // regardless of how that first paint landed.
-            let _ = InvalidateRect(bar_hwnd, None, true);
-            SetTimer(bar_hwnd, CLOCK_TIMER_ID, 1000, None);
+            for bar_hwnd in bar_hwnds {
+                let _ = InvalidateRect(bar_hwnd, None, true);
+            }
+            SetTimer(primary_bar_hwnd, CLOCK_TIMER_ID, 1000, None);
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -419,16 +575,17 @@ mod imp {
     }
 
     /// Registers `bar_hwnd` as a top-edge AppBar and reserves a
-    /// `bar_height`-tall strip of the primary monitor for it, returning the
-    /// rect the system assigned (per `ABM_SETPOS` semantics, this is what
-    /// the caller should actually move/resize the window to). Every other
-    /// top-level window's maximize/work-area layout is recalculated by the
-    /// system as a side effect, exactly as it is for the real taskbar.
+    /// `bar_height`-tall strip of the monitor at `(x, y)` for it, returning
+    /// the rect the system assigned (per `ABM_SETPOS` semantics, this is
+    /// what the caller should actually move/resize the window to). Every
+    /// other top-level window's maximize/work-area layout on that monitor
+    /// is recalculated by the system as a side effect, exactly as it is
+    /// for the real taskbar.
     ///
     /// SAFETY: `bar_hwnd` must be a live window for the duration of this
     /// call; `SHAppBarMessage` only reads/writes through the `APPBARDATA`
     /// pointer for the duration of each call.
-    unsafe fn register_appbar(bar_hwnd: HWND, screen_w: i32, bar_height: i32) -> RECT {
+    unsafe fn register_appbar(bar_hwnd: HWND, x: i32, y: i32, width: i32, bar_height: i32) -> RECT {
         let mut abd = APPBARDATA {
             cbSize: std::mem::size_of::<APPBARDATA>() as u32,
             hWnd: bar_hwnd,
@@ -438,14 +595,15 @@ mod imp {
 
         abd.uEdge = ABE_TOP;
         abd.rc = RECT {
-            left: 0,
-            top: 0,
-            right: screen_w,
-            bottom: bar_height,
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + bar_height,
         };
         // ABM_QUERYPOS lets other appbars adjust the proposed rect (e.g. if
-        // the Windows taskbar already sits at the top); our height is
-        // fixed regardless, so only `bottom` is reasserted afterward.
+        // the Windows taskbar already sits at the top of this monitor);
+        // our height is fixed regardless, so only `bottom` is reasserted
+        // afterward.
         SHAppBarMessage(ABM_QUERYPOS, &mut abd);
         abd.rc.bottom = abd.rc.top + bar_height;
 
@@ -496,60 +654,73 @@ mod imp {
         DrawTextW(hdc, &mut wide, &mut r, format);
     }
 
-    /// Paints the bar's three labels directly onto it. There are no native
-    /// `BUTTON` controls here — at this bar height a real push button's
-    /// chrome leaves no room for legible text, so this is flat painted text
+    /// Paints a bar. Non-primary bars are just the plain class-brush
+    /// background (still validated via `BeginPaint`/`EndPaint` so Windows
+    /// doesn't keep re-queuing `WM_PAINT`) — only the primary monitor
+    /// carries Activities/clock/Quick Settings (per
+    /// `docs/PROJECT_PLAN.md` §10.1). There are no native `BUTTON`
+    /// controls for these — at this bar height a real push button's chrome
+    /// leaves no room for legible text, so this is flat painted text
     /// hit-tested in `WM_LBUTTONUP` instead (see `on_bar_click`).
-    fn paint_bar(hwnd: HWND) {
-        let bar_width = STATE.with(|s| s.borrow().as_ref().map(|st| st.bar_width)).unwrap_or(0);
-
+    fn paint_bar(hwnd: HWND, is_primary: bool) {
         // SAFETY: `hwnd` is the window currently processing `WM_PAINT`, so
         // it's guaranteed valid for the duration of this call; `ps` is a
         // local that outlives the paired `BeginPaint`/`EndPaint` call.
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x00E0E0E0));
 
-            let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
-            draw_text_in(
-                hdc,
-                RECT {
-                    left: ACTIVITIES_LABEL_X,
-                    top: 0,
-                    right: ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH,
-                    bottom: BAR_HEIGHT,
-                },
-                "Activities",
-                format,
-            );
+            if is_primary {
+                let bar_width = STATE
+                    .with(|s| {
+                        s.borrow()
+                            .as_ref()
+                            .map(|st| st.primary_bar_rect.right - st.primary_bar_rect.left)
+                    })
+                    .unwrap_or(0);
 
-            let clock_x = bar_width / 2 - CLOCK_LABEL_WIDTH / 2;
-            draw_text_in(
-                hdc,
-                RECT {
-                    left: clock_x,
-                    top: 0,
-                    right: clock_x + CLOCK_LABEL_WIDTH,
-                    bottom: BAR_HEIGHT,
-                },
-                &clock_text(),
-                format,
-            );
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, COLORREF(0x00E0E0E0));
 
-            let qs_x = bar_width - QS_LABEL_WIDTH - QS_LABEL_MARGIN;
-            draw_text_in(
-                hdc,
-                RECT {
-                    left: qs_x,
-                    top: 0,
-                    right: qs_x + QS_LABEL_WIDTH,
-                    bottom: BAR_HEIGHT,
-                },
-                &quick_settings_label_text(),
-                format,
-            );
+                let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
+                draw_text_in(
+                    hdc,
+                    RECT {
+                        left: ACTIVITIES_LABEL_X,
+                        top: 0,
+                        right: ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH,
+                        bottom: BAR_HEIGHT,
+                    },
+                    "Activities",
+                    format,
+                );
+
+                let clock_x = bar_width / 2 - CLOCK_LABEL_WIDTH / 2;
+                draw_text_in(
+                    hdc,
+                    RECT {
+                        left: clock_x,
+                        top: 0,
+                        right: clock_x + CLOCK_LABEL_WIDTH,
+                        bottom: BAR_HEIGHT,
+                    },
+                    &clock_text(),
+                    format,
+                );
+
+                let qs_x = bar_width - QS_LABEL_WIDTH - QS_LABEL_MARGIN;
+                draw_text_in(
+                    hdc,
+                    RECT {
+                        left: qs_x,
+                        top: 0,
+                        right: qs_x + QS_LABEL_WIDTH,
+                        bottom: BAR_HEIGHT,
+                    },
+                    &quick_settings_label_text(),
+                    format,
+                );
+            }
 
             let _ = EndPaint(hwnd, &ps);
         }
@@ -784,6 +955,42 @@ mod imp {
         }
     }
 
+    /// Draws every workspace card at its current (possibly mid-animation)
+    /// rect. This is a flat placeholder "desktop" fill, not the real
+    /// wallpaper: reliably capturing it would mean decoding whatever
+    /// format/location Windows currently stores it in (JPEG/PNG, sometimes
+    /// per-monitor, sometimes a transcoded cache file), which needs GDI+/WIC
+    /// rather than classic GDI — left as a follow-up. This still fixes the
+    /// actual complaint it's standing in for: every card now has a fixed,
+    /// visible boundary, so a small window inside it doesn't look like it's
+    /// floating in empty space.
+    fn paint_overview(hwnd: HWND) {
+        let cards = STATE.with(|s| {
+            s.borrow().as_ref().and_then(|st| match &st.overview {
+                OverviewMode::Opening { cards, .. }
+                | OverviewMode::Open { cards, .. }
+                | OverviewMode::Closing { cards, .. } => {
+                    Some(cards.iter().map(|c| c.current).collect::<Vec<_>>())
+                }
+                OverviewMode::Closed => None,
+            })
+        });
+
+        // SAFETY: `hwnd` is the window currently processing `WM_PAINT`.
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            if let Some(cards) = cards {
+                let brush = CreateSolidBrush(COLORREF(0x00805030));
+                for rect in cards {
+                    FillRect(hdc, &rect, brush);
+                }
+                let _ = DeleteObject(brush);
+            }
+            let _ = EndPaint(hwnd, &ps);
+        }
+    }
+
     /// Acquires the default audio endpoint's volume control fresh for each
     /// call rather than caching it — simpler and more robust against the
     /// default device changing than holding a long-lived COM object, at
@@ -846,9 +1053,9 @@ mod imp {
     }
 
     /// Scales `r` toward `(pivot_x, pivot_y)` by factor `s` — the "zoom
-    /// out toward the center of the overview" transform applied uniformly
-    /// to every window's rect, as a group, rather than rearranging them
-    /// into a grid.
+    /// out toward the center of its own workspace card" transform applied
+    /// uniformly to a card and everything on it, as a group, rather than
+    /// rearranging windows into a grid.
     fn scale_about(r: RECT, pivot_x: i32, pivot_y: i32, s: f64) -> RECT {
         let scale = |v: i32, pivot: i32| pivot + ((v - pivot) as f64 * s).round() as i32;
         RECT {
@@ -1002,11 +1209,12 @@ mod imp {
         }
     }
 
-    /// Starts the "zoom out" animation: registers a live DWM thumbnail for
-    /// every currently-eligible window at its real screen position, then
+    /// Starts the "zoom out" animation: for every monitor, registers its
+    /// workspace card (see module docs) and a live DWM thumbnail for every
+    /// currently-eligible window on it at its real screen position, then
     /// kicks off a timer to animate each one down to `OVERVIEW_SCALE` of
-    /// its size, centered in the overview. No-op if the overview isn't
-    /// currently `Closed` (already open or mid-animation).
+    /// its size around its *own monitor's* center. No-op if the overview
+    /// isn't currently `Closed` (already open or mid-animation).
     fn open_overview() {
         let overview_hwnd = STATE.with(|s| {
             s.borrow().as_ref().and_then(|st| {
@@ -1030,8 +1238,38 @@ mod imp {
         }
         let origin_x = overview_screen_rect.left;
         let origin_y = overview_screen_rect.top;
-        let pivot_x = (overview_screen_rect.right - origin_x) / 2;
-        let pivot_y = (overview_screen_rect.bottom - origin_y) / 2;
+
+        struct MonitorCard {
+            /// This monitor's desktop area (below its own bar), in
+            /// overview-local coordinates.
+            rect: RECT,
+            pivot: (i32, i32),
+        }
+        let monitor_cards: Vec<MonitorCard> = enumerate_monitors()
+            .iter()
+            .map(|m| {
+                let local = RECT {
+                    left: m.rect.left - origin_x,
+                    top: m.rect.top - origin_y + BAR_HEIGHT,
+                    right: m.rect.right - origin_x,
+                    bottom: m.rect.bottom - origin_y,
+                };
+                let pivot = ((local.left + local.right) / 2, (local.top + local.bottom) / 2);
+                MonitorCard { rect: local, pivot }
+            })
+            .collect();
+
+        let cards: Vec<CardAnim> = monitor_cards
+            .iter()
+            .map(|mc| {
+                let to = scale_about(mc.rect, mc.pivot.0, mc.pivot.1, OVERVIEW_SCALE);
+                CardAnim {
+                    from: mc.rect,
+                    to,
+                    current: mc.rect,
+                }
+            })
+            .collect();
 
         let mut thumbs = Vec::new();
         for window in groveshell_window_model::snapshot() {
@@ -1050,7 +1288,26 @@ mod imp {
                 right: window.rect.right - origin_x,
                 bottom: window.rect.bottom - origin_y,
             };
-            let to = scale_about(from, pivot_x, pivot_y, OVERVIEW_SCALE);
+
+            // Scale this window in lockstep with whichever monitor's card
+            // contains its center — not one shared pivot for the whole
+            // multi-monitor span, which would make two monitors' windows
+            // collide toward a single point somewhere between them.
+            // Falls back to the first monitor if the center is somehow
+            // outside all of them (e.g. a monitor was just disconnected).
+            let center_x = (from.left + from.right) / 2;
+            let center_y = (from.top + from.bottom) / 2;
+            let owner = monitor_cards
+                .iter()
+                .find(|mc| {
+                    center_x >= mc.rect.left
+                        && center_x < mc.rect.right
+                        && center_y >= mc.rect.top
+                        && center_y < mc.rect.bottom
+                })
+                .unwrap_or(&monitor_cards[0]);
+
+            let to = scale_about(from, owner.pivot.0, owner.pivot.1, OVERVIEW_SCALE);
 
             // Show it immediately at "from" — exactly where the real
             // window currently sits — so the animation reads as that
@@ -1075,6 +1332,7 @@ mod imp {
                 state.overview = OverviewMode::Opening {
                     started: Instant::now(),
                     thumbs,
+                    cards,
                 };
             }
         });
@@ -1088,8 +1346,8 @@ mod imp {
         }
     }
 
-    /// Starts the reverse animation from wherever the thumbnails currently
-    /// are back to each window's real position, then hides the overview
+    /// Starts the reverse animation from wherever the thumbnails/cards
+    /// currently are back to their real positions, then hides the overview
     /// and focuses `focus_after` (or restores whatever was focused before
     /// Activities was opened, if `None`). Works whether the overview is
     /// currently `Open` (idle) or still `Opening` (interrupts it smoothly
@@ -1104,7 +1362,7 @@ mod imp {
 
             let mode = std::mem::replace(&mut state.overview, OverviewMode::Closed);
             match mode {
-                OverviewMode::Open { thumbs } | OverviewMode::Opening { thumbs, .. } => {
+                OverviewMode::Open { thumbs, cards } | OverviewMode::Opening { thumbs, cards, .. } => {
                     let thumbs = thumbs
                         .into_iter()
                         .map(|th| ThumbAnim {
@@ -1114,9 +1372,18 @@ mod imp {
                             ..th
                         })
                         .collect();
+                    let cards = cards
+                        .into_iter()
+                        .map(|c| CardAnim {
+                            from: c.current,
+                            to: c.from,
+                            current: c.current,
+                        })
+                        .collect();
                     state.overview = OverviewMode::Closing {
                         started: Instant::now(),
                         thumbs,
+                        cards,
                         focus_after,
                     };
                     Some(state.overview_hwnd)
@@ -1138,10 +1405,14 @@ mod imp {
         }
     }
 
-    /// Dispatches a click on the bar to whichever of its three painted
-    /// regions it landed in (see `paint_bar` for the same layout).
+    /// Dispatches a click on the primary bar to whichever of its three
+    /// painted regions it landed in (see `paint_bar` for the same layout).
     fn on_bar_click(x: i32) {
-        let bar_width = STATE.with(|s| s.borrow().as_ref().map(|st| st.bar_width));
+        let bar_width = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| st.primary_bar_rect.right - st.primary_bar_rect.left)
+        });
         let Some(bar_width) = bar_width else {
             return;
         };
@@ -1174,11 +1445,12 @@ mod imp {
 
     /// Hit-tests a click against the overview's current thumbnail rects
     /// (only meaningful while `Open`); focuses the clicked window if any,
-    /// otherwise treats it as "click on empty space" and just cancels.
+    /// otherwise treats it as "click on empty space" (including clicking a
+    /// workspace card where nothing is) and just cancels.
     fn on_overview_click(x: i32, y: i32) {
         let hit = STATE.with(|s| {
             s.borrow().as_ref().and_then(|st| match &st.overview {
-                OverviewMode::Open { thumbs } => thumbs.iter().find_map(|th| {
+                OverviewMode::Open { thumbs, .. } => thumbs.iter().find_map(|th| {
                     let r = th.current;
                     (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
                         .then_some(th.hwnd)
@@ -1206,28 +1478,40 @@ mod imp {
             let state = state_ref.as_mut()?;
 
             let mode = std::mem::replace(&mut state.overview, OverviewMode::Closed);
-            let (new_mode, updates, completion) = match mode {
+            let (new_mode, thumb_updates, completion) = match mode {
                 OverviewMode::Opening {
                     started,
                     mut thumbs,
+                    mut cards,
                 } => {
                     let t = progress(started);
                     let eased = ease_out(t);
                     let updates = tick_thumbs(&mut thumbs, eased);
+                    tick_cards(&mut cards, eased);
                     if t >= 1.0 {
-                        (OverviewMode::Open { thumbs }, updates, Some(Completion::Opened))
+                        (
+                            OverviewMode::Open { thumbs, cards },
+                            updates,
+                            Some(Completion::Opened),
+                        )
                     } else {
-                        (OverviewMode::Opening { started, thumbs }, updates, None)
+                        (
+                            OverviewMode::Opening { started, thumbs, cards },
+                            updates,
+                            None,
+                        )
                     }
                 }
                 OverviewMode::Closing {
                     started,
                     mut thumbs,
+                    mut cards,
                     focus_after,
                 } => {
                     let t = progress(started);
                     let eased = ease_out(t);
                     let updates = tick_thumbs(&mut thumbs, eased);
+                    tick_cards(&mut cards, eased);
                     if t >= 1.0 {
                         (
                             OverviewMode::Closed,
@@ -1239,6 +1523,7 @@ mod imp {
                             OverviewMode::Closing {
                                 started,
                                 thumbs,
+                                cards,
                                 focus_after,
                             },
                             updates,
@@ -1249,15 +1534,24 @@ mod imp {
                 other => (other, Vec::new(), None),
             };
             state.overview = new_mode;
-            Some((state.overview_hwnd, updates, completion))
+            Some((state.overview_hwnd, thumb_updates, completion))
         });
 
-        let Some((overview_hwnd, updates, completion)) = result else {
+        let Some((overview_hwnd, thumb_updates, completion)) = result else {
             return;
         };
 
-        for (thumbnail, rect) in updates {
+        for (thumbnail, rect) in thumb_updates {
             set_thumb_rect(thumbnail, rect);
+        }
+
+        // The workspace cards are plain GDI painting (no DWM handle to
+        // push updates through, unlike the thumbnails above), so the only
+        // way to show their new interpolated position each tick is a
+        // repaint.
+        // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
+        unsafe {
+            let _ = InvalidateRect(overview_hwnd, None, true);
         }
 
         let Some(completion) = completion else {
@@ -1321,6 +1615,12 @@ mod imp {
             .collect()
     }
 
+    fn tick_cards(cards: &mut [CardAnim], t: f64) {
+        for card in cards.iter_mut() {
+            card.current = lerp_rect(card.from, card.to, t);
+        }
+    }
+
     unsafe extern "system" fn wndproc(
         hwnd: HWND,
         msg: u32,
@@ -1331,8 +1631,12 @@ mod imp {
 
         match msg {
             WM_PAINT => match role {
-                Role::Bar => {
-                    paint_bar(hwnd);
+                Role::Bar { is_primary } => {
+                    paint_bar(hwnd, is_primary);
+                    LRESULT(0)
+                }
+                Role::Overview => {
+                    paint_overview(hwnd);
                     LRESULT(0)
                 }
                 Role::Calendar => {
@@ -1343,11 +1647,11 @@ mod imp {
                     paint_quick_settings(hwnd);
                     LRESULT(0)
                 }
-                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+                Role::Other => DefWindowProcW(hwnd, msg, wparam, lparam),
             },
             WM_LBUTTONUP => {
                 match role {
-                    Role::Bar => {
+                    Role::Bar { is_primary: true } => {
                         let x = (lparam.0 & 0xFFFF) as i32;
                         on_bar_click(x);
                     }
@@ -1404,9 +1708,10 @@ mod imp {
                 match wparam.0 {
                     ANIM_TIMER_ID => on_animation_tick(),
                     CLOCK_TIMER_ID => {
-                        let bar_hwnd = STATE.with(|s| s.borrow().as_ref().map(|st| st.bar_hwnd));
-                        if let Some(bar_hwnd) = bar_hwnd {
-                            let _ = InvalidateRect(bar_hwnd, None, true);
+                        let primary =
+                            STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
+                        if let Some(primary) = primary {
+                            let _ = InvalidateRect(primary, None, true);
                         }
                     }
                     _ => {}
@@ -1414,7 +1719,7 @@ mod imp {
                 LRESULT(0)
             }
             WM_DESTROY => {
-                if role == Role::Bar {
+                if let Role::Bar { .. } = role {
                     unregister_appbar(hwnd);
                 }
                 PostQuitMessage(0);
