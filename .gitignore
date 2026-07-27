@@ -1,0 +1,24 @@
+# Rust build output
+/target/
+
+# Claude Code — local session/settings state, never shared
+.claude/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local environment / secrets
+.env
+.env.*
+
+# Backup files left by rustfmt or merge conflicts
+*.rs.bk
+*.orig

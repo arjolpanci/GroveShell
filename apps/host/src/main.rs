@@ -1,8 +1,9 @@
 //! `groveshell-host`: the always-on shell process. Acquires a single-instance
 //! lock, joins the shared shell job object (`docs/PROJECT_PLAN.md` §13.3),
-//! loads configuration, then serves `host.ping` on the `groveshell-host` pipe
-//! and pushes `watchdog.heartbeat` to the `groveshell-watchdog` pipe every
-//! [`imp::HEARTBEAT_INTERVAL`], per `docs/PROJECT_PLAN.md` §13.2.
+//! loads configuration, then serves `host.ping` and `host.shutdown` on the
+//! `groveshell-host` pipe and pushes `watchdog.heartbeat` to the
+//! `groveshell-watchdog` pipe every [`imp::HEARTBEAT_INTERVAL`], per
+//! `docs/PROJECT_PLAN.md` §13.2.
 
 #[cfg(windows)]
 mod imp {
@@ -111,9 +112,10 @@ mod imp {
         }
     }
 
-    /// Serves `host.ping` requests on the `groveshell-host` pipe forever,
-    /// answering each with `host.pong`. This is the Phase 0 manual smoke test
-    /// surface (`groveshell-cli ping`).
+    /// Serves `host.ping` and `host.shutdown` requests on the
+    /// `groveshell-host` pipe forever, answering the former with `host.pong`
+    /// and the latter with `host.shutdown_ack` before exiting. This is the
+    /// Phase 0 manual smoke test surface (`groveshell-cli ping`/`shutdown`).
     ///
     /// Each accepted connection is handled on its own short-lived thread
     /// rather than inline, so a client that connects and then never writes
@@ -133,11 +135,11 @@ mod imp {
                     continue;
                 }
             };
-            std::thread::spawn(move || handle_ping_connection(conn));
+            std::thread::spawn(move || handle_connection(conn));
         }
     }
 
-    fn handle_ping_connection(mut conn: std::fs::File) {
+    fn handle_connection(mut conn: std::fs::File) {
         match groveshell_ipc::framing::read_envelope(&mut conn) {
             Ok(request) if request.message_type == message_type::PING => {
                 let response = Envelope::new(
@@ -158,6 +160,22 @@ mod imp {
                 if let Err(e) = conn.sync_all() {
                     tracing::warn!(error = ?e, "failed to flush ping response to client");
                 }
+            }
+            Ok(request) if request.message_type == message_type::SHUTDOWN => {
+                tracing::info!("shutdown requested; exiting");
+                let response = Envelope::new(
+                    "groveshell-host",
+                    message_type::SHUTDOWN_ACK,
+                    serde_json::json!({ "echo_of": request.request_id }),
+                );
+                if let Err(e) = groveshell_ipc::framing::write_envelope(&mut conn, &response) {
+                    tracing::warn!(error = ?e, "failed to acknowledge shutdown");
+                }
+                // See the sync_all() note above the PING arm — the client
+                // must have a chance to read the ack before the process
+                // exits and the pipe handle disappears out from under it.
+                let _ = conn.sync_all();
+                std::process::exit(0);
             }
             Ok(other) => {
                 tracing::warn!(message_type = %other.message_type, "unexpected message on host pipe");
