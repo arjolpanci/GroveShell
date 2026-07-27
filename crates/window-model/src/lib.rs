@@ -9,16 +9,27 @@
 //! updates, and the full eligibility/diagnostic model described in §6 are
 //! deliberately out of scope here and remain a follow-up.
 
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GetWindowLongPtrW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WS_EX_TOOLWINDOW,
+    EnumWindows, GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    GWL_EXSTYLE, GW_OWNER, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
+
+/// A window rectangle in screen coordinates, left/top inclusive and
+/// right/bottom exclusive — matches Win32's own `RECT` convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
 
 /// One eligible top-level window as of the moment [`snapshot`] was taken.
 /// `hwnd` is the raw handle value; it is only meaningful until the next
@@ -34,6 +45,12 @@ pub struct WindowRecord {
     /// `docs/PROJECT_PLAN.md` §12, UIPI limits control over elevated
     /// windows; the same restriction applies to inspecting them).
     pub exe_name: Option<String>,
+    /// On-screen bounds, used to seed the Activities overview's "zoom out
+    /// from where the window actually is" animation. For a minimized
+    /// window this is the last known restored position (`GetWindowRect`
+    /// reports a meaningless off-screen rect for minimized windows), so
+    /// the overview still has somewhere sensible to zoom from.
+    pub rect: Rect,
 }
 
 /// Enumerates all top-level windows and returns the ones that look like
@@ -125,7 +142,55 @@ fn inspect(hwnd: HWND) -> Option<WindowRecord> {
             title,
             pid,
             exe_name: exe_name_for_pid(pid),
+            rect: window_rect(hwnd),
         })
+    }
+}
+
+/// Best-effort on-screen bounds for `hwnd`. Minimized windows report a
+/// nonsensical off-screen `GetWindowRect` (classically `(-32000, -32000)`),
+/// so those fall back to `GetWindowPlacement`'s saved restore rect instead.
+/// Otherwise, `DWMWA_EXTENDED_FRAME_BOUNDS` is preferred over a raw
+/// `GetWindowRect` because it excludes the invisible resize-border padding
+/// many apps have, which would otherwise make the overview's thumbnail
+/// slightly larger than the window's visible content.
+fn window_rect(hwnd: HWND) -> Rect {
+    // SAFETY: `hwnd` is valid for the duration of this synchronous call,
+    // same as every other inspection in this module.
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if GetWindowPlacement(hwnd, &mut placement).is_ok() {
+                return placement.rcNormalPosition.into();
+            }
+        }
+
+        let mut rect = RECT::default();
+        let extended_ok = DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut rect as *mut RECT as *mut std::ffi::c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_ok();
+        if !extended_ok {
+            let _ = GetWindowRect(hwnd, &mut rect);
+        }
+        rect.into()
+    }
+}
+
+impl From<RECT> for Rect {
+    fn from(r: RECT) -> Self {
+        Rect {
+            left: r.left,
+            top: r.top,
+            right: r.right,
+            bottom: r.bottom,
+        }
     }
 }
 
