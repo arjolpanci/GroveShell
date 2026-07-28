@@ -7,6 +7,7 @@ mod calendar;
 mod dock;
 mod icons;
 mod monitors;
+mod monitor_workspaces;
 mod movesize;
 mod overview;
 mod quick_settings;
