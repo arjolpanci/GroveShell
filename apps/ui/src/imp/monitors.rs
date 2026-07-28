@@ -177,6 +177,9 @@ unsafe extern "system" fn monitor_enum_proc(
     _rect: *mut RECT,
     lparam: LPARAM,
 ) -> BOOL {
+    // SAFETY: `lparam` was created from a live `&mut Vec<MonitorInfo>`
+    // in `enumerate_monitors`, and this callback runs synchronously
+    // within that call's lifetime.
     let monitors = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
 
     let mut info = MONITORINFOEXW {
