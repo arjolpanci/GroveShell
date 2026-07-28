@@ -36,16 +36,25 @@ you picked.
   `Ctrl+Alt+Shift+←/→` sends the focused window away. Windows on inactive
   workspaces are parked off-screen rather than hidden, with a snapshot taken
   at park time so previews don't go blank when apps stop rendering.
+- Live window tracking. `SetWinEventHook` picks up new, closed, and renamed
+  windows in the background, and switching to a parked window through
+  Alt+Tab or the taskbar's own window list brings its workspace along with
+  it. A small identity registry means a recycled window handle never
+  inherits a dead window's workspace or preview.
 - The Activities overview: fixed-size workspace cards in a draggable
   carousel. The focused card is a little larger than its neighbors, opening
   and closing animate as a zoom, and cards get rounded corners and drop
-  shadows. All of it is our own double-buffered GDI compositing.
+  shadows. You can drag a window's preview onto another card to move it
+  there, or start typing to search open windows and installed apps. All of
+  it is our own double-buffered GDI compositing.
 - Taskbar replacement. The Windows taskbar is hidden and its reserved strip
   handed back to applications while GroveShell runs, then restored on exit.
   If a run dies without cleaning up, the next launch repairs it.
 - A safety net: host and watchdog processes with heartbeats, a job object so
   child processes die together, and `scripts\recover.ps1`, which depends on
   nothing else working.
+- A `groveshell-cli` for diagnostics: `ping`, `shutdown`, `list-windows`, and
+  `list-monitors`.
 
 ## Roadmap
 
@@ -58,11 +67,11 @@ Condensed, with current status:
 - [x] Watchdog heartbeat and Explorer recovery
 - [x] Structured rotating logs, standalone recovery script
 
-### Phase 1: Window inventory (partial)
+### Phase 1: Window inventory (done)
 - [x] Top-level window enumeration with an eligibility policy (visible, uncloaked, unowned, titled)
-- [ ] `SetWinEventHook` live tracking (currently snapshot plus re-sync on demand)
-- [ ] Generation-counter `WindowId` identity across HWND reuse
-- [ ] `list-windows` / `list-monitors` CLI commands
+- [x] `SetWinEventHook` live tracking (create, destroy, show, hide, name change, foreground), debounced into the workspace model
+- [x] Generation-counter `WindowId` identity across HWND reuse
+- [x] `list-windows` / `list-monitors` CLI commands
 
 ### Phase 2: Global move/resize and hot corners
 - [ ] Low-level mouse and keyboard hooks
@@ -86,13 +95,13 @@ Condensed, with current status:
 - [ ] Dock (pinned and running apps)
 - [ ] Settings for bar height and keybindings
 
-### Phase 5: Activities overview (partial)
+### Phase 5: Activities overview (done)
 - [x] Carousel layout engine with focused-card scaling
 - [x] Window previews from our own captures, which survive apps that stop rendering off-screen
 - [x] Zoom and fade open/close animations, smooth drag with snap
 - [x] Click to focus, click empty space to switch or cancel
-- [ ] Dragging a window between workspaces in the overview
-- [ ] Application and window search
+- [x] Dragging a window between workspaces in the overview
+- [x] Application and window search (type to search, Enter activates the top result)
 
 ### Phase 6: Hardening and accessibility
 - [ ] Mixed-DPI and display-topology testing

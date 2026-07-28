@@ -9,9 +9,13 @@
 //! updates, and the full eligibility/diagnostic model described in §6 are
 //! deliberately out of scope here and remain a follow-up.
 
+pub mod registry;
 pub mod workspace;
 
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Graphics::Gdi::{
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
@@ -96,6 +100,73 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
 /// identity yet, so a rare same-tick reuse can't be distinguished here).
 pub fn describe(hwnd: isize) -> Option<WindowRecord> {
     inspect(HWND(hwnd as *mut std::ffi::c_void), false)
+}
+
+/// One connected display as of the moment [`monitors`] was called.
+#[derive(Debug, Clone, Copy)]
+pub struct MonitorRecord {
+    /// Full monitor bounds in virtual-screen coordinates.
+    pub rect: Rect,
+    /// The monitor's work area (bounds minus taskbar/AppBar reservations).
+    pub work: Rect,
+    pub is_primary: bool,
+}
+
+/// Enumerates connected monitors. Coordinates are physical pixels only if
+/// the calling process is per-monitor DPI aware (see
+/// [`make_process_dpi_aware`]); a DPI-unaware caller gets virtualized
+/// values.
+pub fn monitors() -> Vec<MonitorRecord> {
+    unsafe extern "system" fn monitor_proc(
+        hmonitor: HMONITOR,
+        _hdc: HDC,
+        _rect: *mut RECT,
+        lparam: LPARAM,
+    ) -> BOOL {
+        // SAFETY: `lparam` is the address of the local `Vec` below, only
+        // used during this synchronous enumeration.
+        let out = &mut *(lparam.0 as *mut Vec<MonitorRecord>);
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if GetMonitorInfoW(hmonitor, &mut info).as_bool() {
+            const MONITORINFOF_PRIMARY: u32 = 1;
+            out.push(MonitorRecord {
+                rect: info.rcMonitor.into(),
+                work: info.rcWork.into(),
+                is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+            });
+        }
+        TRUE
+    }
+
+    let mut records: Vec<MonitorRecord> = Vec::new();
+    // SAFETY: `records` outlives the synchronous enumeration; see
+    // `snapshot` for the identical pattern.
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(monitor_proc),
+            LPARAM(&mut records as *mut Vec<MonitorRecord> as isize),
+        );
+    }
+    records
+}
+
+/// Opts the calling process into per-monitor DPI awareness so window and
+/// monitor rects come back in real physical pixels. Must run before any
+/// DPI-sensitive call; harmless if it fails (coordinates just come back
+/// virtualized). Exposed here so CLI consumers don't need their own
+/// `windows` dependency for one call.
+pub fn make_process_dpi_aware() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    // SAFETY: plain process-wide mode switch, documented to fail (not
+    // misbehave) if a DPI context was already set.
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
 /// Whether `hwnd` still refers to a live window at all, regardless of
