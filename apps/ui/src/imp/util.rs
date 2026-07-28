@@ -6,7 +6,10 @@ use windows::Win32::Graphics::Gdi::{
     CreateFontW, DrawTextW, DRAW_TEXT_FORMAT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DEFAULT_PITCH, HDC, HFONT, OUT_DEFAULT_PRECIS,
 };
-use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
+use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow};
 
 use super::state::scaled;
 
@@ -53,4 +56,48 @@ pub(crate) fn progress_dur(started: std::time::Instant, duration: std::time::Dur
 
 pub(crate) fn progress(started: std::time::Instant) -> f64 {
     progress_dur(started, super::state::ANIM_DURATION)
+}
+
+/// `SetForegroundWindow`, but reliable even when called from a context
+/// Windows doesn't consider a direct result of user input — notably
+/// from `WM_TIMER` (an animation completing, e.g. a carousel slide
+/// landing on the workspace a clicked window lives on). A plain
+/// `SetForegroundWindow` there is silently denied by Windows' anti
+/// focus-stealing lock (confirmed live: it returns `false` and nothing
+/// happens), even though the whole chain started from a real click a
+/// moment earlier — and confirmed live again that the textbook
+/// `AttachThreadInput` workaround *alone* isn't always enough either.
+/// What reliably works, verified live in this exact scenario, is a
+/// synthetic Alt tap first: it resets Windows' internal "was there
+/// recent input" heuristic that the lock is actually gated on, after
+/// which a plain `SetForegroundWindow` succeeds on its own.
+/// `AttachThreadInput` is kept as a second fallback in case some other
+/// process's foreground lock is stricter still.
+pub(crate) fn force_foreground(target: HWND) {
+    // SAFETY: every call here is synchronous; the synthetic Alt tap is
+    // a documented, harmless nudge (Windows Explorer and various
+    // launchers use the same trick), and `target`'s validity is the
+    // caller's documented precondition, same as a direct
+    // `SetForegroundWindow` call.
+    unsafe {
+        if SetForegroundWindow(target).as_bool() {
+            return;
+        }
+
+        keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        if SetForegroundWindow(target).as_bool() {
+            return;
+        }
+
+        let current_fg = GetForegroundWindow();
+        let mut current_pid = 0u32;
+        let current_thread = GetWindowThreadProcessId(current_fg, Some(&mut current_pid));
+        let this_thread = GetCurrentThreadId();
+        if current_thread != 0 && current_thread != this_thread {
+            let _ = AttachThreadInput(this_thread, current_thread, true);
+            let _ = SetForegroundWindow(target);
+            let _ = AttachThreadInput(this_thread, current_thread, false);
+        }
+    }
 }

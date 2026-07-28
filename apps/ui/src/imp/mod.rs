@@ -4,6 +4,7 @@
 
 mod bar;
 mod calendar;
+mod dock;
 mod monitors;
 mod overview;
 mod quick_settings;
@@ -376,6 +377,8 @@ pub fn main() -> Result<()> {
                 window_drag: None,
                 window_pop_anim: None,
                 hover_thumb: None,
+                dock_apps: Vec::new(),
+                dock_hover: None,
                 search_query: String::new(),
                 window_registry: WindowRegistry::new(),
             });
