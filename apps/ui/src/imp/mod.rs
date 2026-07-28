@@ -46,7 +46,7 @@ use groveshell_window_model::workspace::WorkspaceTracker;
 
 use bar::{on_bar_click, on_bar_hover, on_bar_mouse_leave, paint_bar, register_appbar, unregister_appbar, QS_LABEL_MARGIN};
 use calendar::{hide_calendar, paint_calendar, CAL_HEIGHT, CAL_WIDTH};
-use monitors::{enumerate_monitors, monitor_index_for_center, monitors_sorted_by_x};
+use monitors::{enumerate_monitors, monitor_index_for_center};
 use movesize::{
     check_hot_corners, install_move_size_hooks, on_drag_timer, uninstall_move_size_hooks,
     DRAG_TIMER_ID, HOTCORNER_INTERVAL_MS, HOTCORNER_TIMER_ID,
@@ -229,6 +229,7 @@ pub fn main() -> Result<()> {
                 hwnd: bar_hwnd,
                 rect: bar_rect,
                 is_primary: monitor.is_primary,
+                monitor: monitor.device_name.clone(),
             });
         }
 
@@ -243,29 +244,33 @@ pub fn main() -> Result<()> {
         let primary_bar_hwnd = primary.hwnd;
         let primary_bar_rect = primary.rect;
 
-        // Overview: spans the full virtual screen (every monitor), not
-        // just the primary one — a window on another monitor needs to
-        // be fully inside the overview's bounds to be visible and
-        // clickable at all.
-        let virtual_x = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let virtual_y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let virtual_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let virtual_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
-        let overview_hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-            w!("GroveShellOverview"),
-            w!("GroveShell Activities"),
-            WS_POPUP,
-            virtual_x,
-            virtual_y,
-            virtual_w,
-            virtual_h,
-            None,
-            None,
-            hinstance,
-            None,
-        )
-        .map_err(Error::Windows)?;
+        // One Activities overview per monitor now, sized to that monitor's
+        // own rect (not the virtual screen) — see the design doc §D. Created
+        // eagerly at startup (not lazily) since there's no live-resize path
+        // for an already-open overview window yet; lazy creation is only
+        // needed for hotplug (Task 10), which creates one on demand there.
+        let mut overviews: std::collections::HashMap<String, overview::OverviewInstance> =
+            std::collections::HashMap::new();
+        for monitor in &monitors {
+            let width = monitor.rect.right - monitor.rect.left;
+            let height = monitor.rect.bottom - monitor.rect.top;
+            let overview_hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+                w!("GroveShellOverview"),
+                w!("GroveShell Activities"),
+                WS_POPUP,
+                monitor.rect.left,
+                monitor.rect.top,
+                width,
+                height,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)?;
+            overviews.insert(monitor.device_name.clone(), overview::OverviewInstance::new(overview_hwnd));
+        }
 
         // Calendar + notifications flyout, centered under the primary
         // bar's clock label, clamped so it never runs off that
@@ -337,39 +342,44 @@ pub fn main() -> Result<()> {
         // Seed each with whatever windows are already on that monitor
         // right now so a fresh launch doesn't show every open window
         // crammed onto workspace 0.
-        let sorted_monitors = monitors_sorted_by_x();
-        let primary_index = sorted_monitors.iter().position(|m| m.is_primary).unwrap_or(0);
-        let mut workspaces = WorkspaceTracker::with_monitor_workspaces(sorted_monitors.len(), primary_index);
+        let mut workspaces = monitor_workspaces::MonitorWorkspaces::new();
+        for monitor in &monitors {
+            workspaces.insert_monitor(
+                monitor.device_name.clone(),
+                WorkspaceTracker::with_monitor_workspaces(1, 0),
+            );
+        }
         for window in groveshell_window_model::snapshot() {
             let center_x = (window.rect.left + window.rect.right) / 2;
             let center_y = (window.rect.top + window.rect.bottom) / 2;
-            let index = monitor_index_for_center(&sorted_monitors, center_x, center_y).unwrap_or(primary_index);
-            workspaces.assign_to_index(window.hwnd, index);
+            let target_monitor = monitor_index_for_center(&monitors, center_x, center_y)
+                .and_then(|i| monitors.get(i))
+                .or_else(|| monitors.iter().find(|m| m.is_primary))
+                .map(|m| m.device_name.clone());
+            if let Some(device_name) = target_monitor {
+                if let Some(tracker) = workspaces.get_mut(&device_name) {
+                    tracker.assign_to_index(window.hwnd, 0);
+                }
+            }
         }
+
+        let primary_monitor = monitors.iter().find(|m| m.is_primary)
+            .map(|m| m.device_name.clone())
+            .unwrap_or_else(|| monitors[0].device_name.clone());
 
         STATE.with(|s| {
             *s.borrow_mut() = Some(AppState {
                 bars,
                 primary_bar_hwnd,
                 primary_bar_rect,
-                overview_hwnd,
+                primary_monitor,
                 calendar_hwnd,
                 quick_settings_hwnd,
-                overview: OverviewMode::Closed,
                 calendar_open: false,
                 quick_settings_open: false,
                 previous_foreground: HWND(std::ptr::null_mut()),
                 workspaces,
-                carousel_offset: 0.0,
-                carousel_drag: None,
-                carousel_anim: None,
-                carousel_close_after: None,
-                window_drag: None,
-                window_pop_anim: None,
-                hover_thumb: None,
-                dock_apps: Vec::new(),
-                dock_hover: None,
-                search_query: String::new(),
+                overviews,
                 window_registry: WindowRegistry::new(),
                 qs_pill_hover: false,
                 qs_volume_dragging: false,
@@ -638,7 +648,7 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_DESTROY => {
-            if let Role::Bar { is_primary } = role {
+            if let Role::Bar { is_primary, .. } = role {
                 unregister_appbar(hwnd);
                 if is_primary {
                     uninstall_win_event_hooks();
@@ -656,14 +666,7 @@ unsafe extern "system" fn wndproc(
                     let tracked: Vec<isize> = STATE.with(|s| {
                         s.borrow()
                             .as_ref()
-                            .map(|st| {
-                                st.workspaces
-                                    .workspace_ids()
-                                    .to_vec()
-                                    .into_iter()
-                                    .flat_map(|id| st.workspaces.windows_on(id))
-                                    .collect()
-                            })
+                            .map(|st| st.workspaces.all_tracked_windows())
                             .unwrap_or_default()
                     });
                     for tracked_hwnd in tracked {
