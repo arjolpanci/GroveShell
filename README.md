@@ -31,16 +31,25 @@ you picked.
   clock with a calendar flyout, and a Wi-Fi/volume/battery status pill. It is
   per-monitor DPI aware and reserves its strip through the same AppBar
   mechanism the real taskbar uses.
+- Real icon assets ([Lucide](https://lucide.dev), ISC-licensed) instead of
+  hand-drawn shapes, checked into `apps/ui/resources/icons/` and embedded
+  into the binary at compile time. States pick the matching variant rather
+  than one icon being reused for everything: Wi-Fi on/off, three volume
+  levels plus muted, five battery levels plus charging, Bluetooth on/off.
 - A GNOME-style Quick Settings panel behind that status pill (hover it for a
-  highlight, click anywhere on it to open): Wi-Fi and Dark Mode toggle chips
-  that actually flip the real system state (Wi-Fi radio via `wlanapi.dll`,
-  theme via the same registry values Settings itself writes), a real
-  draggable volume slider, and battery status with charging/low-battery
-  states. Bluetooth, Airplane mode, Do Not Disturb, Night Light, and a
-  brightness slider aren't in yet: the first four need either WinRT or
-  fragile undocumented registry blobs, and brightness control is unreliable
-  on laptop panels without WMI, so all of it is deferred rather than shipped
-  half-working.
+  highlight, click anywhere on it to open): a real rounded card with a drop
+  shadow, and four toggle chips that all flip actual system state, not just
+  their own appearance. Wi-Fi is a plain Win32 call (`wlanapi.dll`); Dark
+  Mode writes the same registry values Settings' own toggle does; Bluetooth
+  and Airplane Mode go through the WinRT `Windows.Devices.Radios` API, since
+  there's no classic Win32 call for either (Airplane Mode is approximated
+  the way most third-party toggles do it: on means every known radio is off,
+  and it doesn't remember each radio's prior state the way the real OS flag
+  does). Below the chips, a real draggable volume slider with the
+  percentage shown, and battery status with charging/low-battery states.
+  Do Not Disturb, Night Light, and a brightness slider still aren't in:
+  the first two need fragile undocumented registry blobs with no public API
+  at all, and brightness control is unreliable on laptop panels without WMI.
 - GNOME-style workspaces. Each monitor is a pinned workspace, and a dynamic
   tail keeps one empty workspace at the end. `Ctrl+Alt+←/→` switches,
   `Ctrl+Alt+Shift+←/→` sends the focused window away. Windows on inactive
@@ -119,8 +128,8 @@ Condensed, with current status:
 - [x] Per-monitor DPI scaling, rounded bottom corners
 - [x] Windows taskbar hidden while running, restored on exit
 - [x] Dock (pinned and running apps), overview-only, mirrored from the real taskbar's pins
-- [x] GNOME-style Quick Settings: status pill with Wi-Fi/volume/battery glyphs, working Wi-Fi and Dark Mode toggles, draggable volume slider
-- [ ] Bluetooth, Airplane mode, Do Not Disturb, Night Light toggles, and a brightness slider (need WinRT or undocumented registry blobs; deferred)
+- [x] GNOME-style Quick Settings: rounded card with a drop shadow, status pill with Wi-Fi/volume/battery glyphs, working Wi-Fi/Dark Mode/Bluetooth/Airplane Mode toggles, draggable volume slider
+- [ ] Do Not Disturb, Night Light toggles, and a brightness slider (no public API for the first two; brightness needs WMI and is unreliable on laptop panels; deferred)
 - [ ] Mirroring real system tray icons into the bar (feasibility being checked against this Windows 11 build's actual tray internals, which may need a different technique on newer builds)
 - [ ] Central settings UI (bar height, keybindings, dock pin management)
 

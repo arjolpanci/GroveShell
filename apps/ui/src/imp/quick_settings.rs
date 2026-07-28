@@ -28,14 +28,18 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::calendar::hide_calendar;
+use super::icons::{battery_icon, draw_icon, volume_icon, Icon};
 use super::overview::{close_overview, draw_shadow};
+use super::radios::{
+    airplane_mode_on, bluetooth_on, set_airplane_mode_on, set_bluetooth_on,
+};
 use super::state::{scaled, STATE};
 use super::theme::{apps_use_light_theme, toggle_theme};
-use super::util::{draw_battery_glyph, draw_text_in, draw_volume_glyph, draw_wifi_glyph};
+use super::util::draw_text_in;
 use super::wifi::{set_wifi_radio_on, wifi_radio_on};
 
 pub(crate) const QS_WIDTH: i32 = 320;
-pub(crate) const QS_HEIGHT: i32 = 240;
+pub(crate) const QS_HEIGHT: i32 = 316;
 /// Room around the visible card for the drop shadow (see the module
 /// docs) — comfortably more than `draw_shadow`'s 6-layer spread plus
 /// its downward bias needs.
@@ -68,6 +72,8 @@ struct QsLayout {
     card: RECT,
     wifi_chip: RECT,
     theme_chip: RECT,
+    bluetooth_chip: RECT,
+    airplane_chip: RECT,
     mute_button: RECT,
     volume_track: RECT,
     battery_row: RECT,
@@ -108,7 +114,21 @@ fn qs_layout(dpi: u32) -> QsLayout {
         bottom: chips_top + chip_h,
     };
 
-    let volume_top = wifi_chip.bottom + row_gap;
+    let chips_row2_top = wifi_chip.bottom + chip_gap;
+    let bluetooth_chip = RECT {
+        left: pad,
+        top: chips_row2_top,
+        right: pad + chip_w,
+        bottom: chips_row2_top + chip_h,
+    };
+    let airplane_chip = RECT {
+        left: bluetooth_chip.right + chip_gap,
+        top: chips_row2_top,
+        right: content_right,
+        bottom: chips_row2_top + chip_h,
+    };
+
+    let volume_top = bluetooth_chip.bottom + row_gap;
     let mute_button = RECT {
         left: pad,
         top: volume_top + (volume_h - icon) / 2,
@@ -130,7 +150,7 @@ fn qs_layout(dpi: u32) -> QsLayout {
         bottom: battery_top + battery_h,
     };
 
-    QsLayout { card, wifi_chip, theme_chip, mute_button, volume_track, battery_row }
+    QsLayout { card, wifi_chip, theme_chip, bluetooth_chip, airplane_chip, mute_button, volume_track, battery_row }
 }
 
 /// `None` when there's no battery to report (desktop on AC) — the
@@ -233,20 +253,23 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
             );
         };
 
-        let wifi_on = wifi_radio_on();
-        let wifi_icon_rect = RECT {
-            left: layout.wifi_chip.left + scaled(14, dpi),
-            top: layout.wifi_chip.top + (layout.wifi_chip.bottom - layout.wifi_chip.top - scaled(QS_ICON_SIZE, dpi)) / 2,
-            right: layout.wifi_chip.left + scaled(14, dpi) + scaled(QS_ICON_SIZE, dpi),
-            bottom: layout.wifi_chip.top + (layout.wifi_chip.bottom - layout.wifi_chip.top + scaled(QS_ICON_SIZE, dpi)) / 2,
+        let icon_rect_in = |chip: RECT| -> RECT {
+            let size = scaled(QS_ICON_SIZE, dpi);
+            let inset = scaled(14, dpi);
+            let mid = (chip.top + chip.bottom) / 2;
+            RECT { left: chip.left + inset, top: mid - size / 2, right: chip.left + inset + size, bottom: mid + size / 2 }
         };
+
+        let wifi_on = wifi_radio_on();
+        let wifi_icon_rect = icon_rect_in(layout.wifi_chip);
         draw_chip(
             wifi_on.unwrap_or(false),
             wifi_on.is_some(),
             layout.wifi_chip,
             &|| {
                 let color = if wifi_on.is_some() { text_color } else { muted_text_color };
-                draw_wifi_glyph(hdc, wifi_icon_rect, color, wifi_on.unwrap_or(false));
+                let icon = if wifi_on.unwrap_or(false) { Icon::Wifi } else { Icon::WifiOff };
+                draw_icon(hdc, wifi_icon_rect, icon, color);
             },
             match wifi_on {
                 Some(true) => "Wi-Fi",
@@ -256,43 +279,55 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
         );
 
         let light = apps_use_light_theme();
-        let theme_icon_rect = RECT {
-            left: layout.theme_chip.left + scaled(14, dpi),
-            top: layout.theme_chip.top + (layout.theme_chip.bottom - layout.theme_chip.top - scaled(QS_ICON_SIZE, dpi)) / 2,
-            right: layout.theme_chip.left + scaled(14, dpi) + scaled(QS_ICON_SIZE, dpi),
-            bottom: layout.theme_chip.top + (layout.theme_chip.bottom - layout.theme_chip.top + scaled(QS_ICON_SIZE, dpi)) / 2,
-        };
+        let theme_icon_rect = icon_rect_in(layout.theme_chip);
         draw_chip(
             light == Some(false),
             light.is_some(),
             layout.theme_chip,
             &|| {
                 let color = if light.is_some() { text_color } else { muted_text_color };
-                let r = (theme_icon_rect.right - theme_icon_rect.left) / 2;
-                let cx = (theme_icon_rect.left + theme_icon_rect.right) / 2;
-                let cy = (theme_icon_rect.top + theme_icon_rect.bottom) / 2;
-                if light == Some(false) {
-                    // Dark mode is on: a filled moon (solid circle).
-                    fill_ellipse(hdc, RECT { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r }, color);
-                } else {
-                    // Light mode (or unknown): a sun — hollow circle
-                    // with a few short rays.
-                    let pen = CreatePen(PS_SOLID, 1, color);
-                    let previous_pen = SelectObject(hdc, pen);
-                    SelectObject(hdc, hollow);
-                    let _ = Ellipse(hdc, cx - r + 3, cy - r + 3, cx + r - 3, cy + r - 3);
-                    for (dx, dy) in [(0, -r), (0, r), (-r, 0), (r, 0)] {
-                        let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, cx + dx * 3 / 4, cy + dy * 3 / 4, None);
-                        let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, cx + dx, cy + dy);
-                    }
-                    SelectObject(hdc, previous_pen);
-                    let _ = DeleteObject(pen);
-                }
+                let icon = if light == Some(false) { Icon::Moon } else { Icon::Sun };
+                draw_icon(hdc, theme_icon_rect, icon, color);
             },
             match light {
                 Some(false) => "Dark Mode",
                 Some(true) => "Light Mode",
                 None => "Theme N/A",
+            },
+        );
+
+        let bluetooth_state = bluetooth_on();
+        let bluetooth_icon_rect = icon_rect_in(layout.bluetooth_chip);
+        draw_chip(
+            bluetooth_state.unwrap_or(false),
+            bluetooth_state.is_some(),
+            layout.bluetooth_chip,
+            &|| {
+                let color = if bluetooth_state.is_some() { text_color } else { muted_text_color };
+                let icon = if bluetooth_state.unwrap_or(false) { Icon::Bluetooth } else { Icon::BluetoothOff };
+                draw_icon(hdc, bluetooth_icon_rect, icon, color);
+            },
+            match bluetooth_state {
+                Some(true) => "Bluetooth",
+                Some(false) => "Bluetooth Off",
+                None => "No Bluetooth",
+            },
+        );
+
+        let airplane_state = airplane_mode_on();
+        let airplane_icon_rect = icon_rect_in(layout.airplane_chip);
+        draw_chip(
+            airplane_state.unwrap_or(false),
+            airplane_state.is_some(),
+            layout.airplane_chip,
+            &|| {
+                let color = if airplane_state.is_some() { text_color } else { muted_text_color };
+                draw_icon(hdc, airplane_icon_rect, Icon::Plane, color);
+            },
+            match airplane_state {
+                Some(true) => "Airplane Mode",
+                Some(false) => "Airplane Mode Off",
+                None => "Unavailable",
             },
         );
 
@@ -302,7 +337,7 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
         // number, so leaving it out was genuinely ambiguous).
         let muted = get_mute().unwrap_or(false);
         SetTextColor(hdc, text_color);
-        draw_volume_glyph(hdc, layout.mute_button, text_color, muted);
+        draw_icon(hdc, layout.mute_button, volume_icon(muted, get_volume_percent().unwrap_or(0)), text_color);
 
         let track_h = scaled(6, dpi);
         let percent_label_w = scaled(40, dpi);
@@ -356,7 +391,8 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
             right: layout.battery_row.left + scaled(QS_ICON_SIZE, dpi),
             bottom: layout.battery_row.top + scaled(QS_ICON_SIZE, dpi),
         };
-        draw_battery_glyph(hdc, battery_icon_rect, battery_color, battery_status().map(|(p, _)| p).unwrap_or(100));
+        let (battery_pct, battery_charging) = battery_status().unwrap_or((100, false));
+        draw_icon(hdc, battery_icon_rect, battery_icon(battery_pct, battery_charging), battery_color);
         SetTextColor(hdc, battery_color);
         draw_text_in(
             hdc,
@@ -435,6 +471,14 @@ pub(crate) fn on_quick_settings_mouse_down(hwnd: HWND, x: i32, y: i32) {
         }
     } else if hit(layout.theme_chip) {
         toggle_theme();
+    } else if hit(layout.bluetooth_chip) {
+        if let Some(on) = bluetooth_on() {
+            set_bluetooth_on(!on);
+        }
+    } else if hit(layout.airplane_chip) {
+        if let Some(on) = airplane_mode_on() {
+            set_airplane_mode_on(!on);
+        }
     } else if hit(layout.mute_button) {
         toggle_mute();
     } else if y >= layout.volume_track.top - scaled(8, dpi) && y < layout.volume_track.bottom + scaled(8, dpi)
