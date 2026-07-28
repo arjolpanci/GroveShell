@@ -28,8 +28,8 @@ use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, GetClassLongPtrW, GetClientRect, GetForegroundWindow, GetSystemMetrics, IsIconic,
-    KillTimer, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
+    DrawIconEx, FindWindowW, GetClassLongPtrW, GetClientRect, GetForegroundWindow, GetSystemMetrics,
+    IsIconic, KillTimer, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
     ShowWindow, DI_NORMAL, GCLP_HICONSM, HICON, ICON_SMALL, LWA_ALPHA,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SPI_GETDESKWALLPAPER,
     SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SystemParametersInfoW, WM_GETICON,
@@ -51,10 +51,12 @@ pub(crate) const CAROUSEL_DRAG_CLICK_THRESHOLD_PX: i32 = 6;
 /// or a keyboard/hotkey-triggered switch takes to slide into view.
 const CAROUSEL_SNAP_DURATION: Duration = Duration::from_millis(220);
 /// How many pixels of pointer movement it takes to drag the carousel by
-/// one full page. Deliberately independent of the actual page-to-page
-/// pixel pitch (`card_layout`'s card width can be over a thousand
-/// pixels on a large monitor) — this is a fixed, comfortable swipe
-/// distance instead, same idea as a touch or trackpad paging gesture.
+/// one full page, at 96 DPI (scaled at the drag's use site same as every
+/// other layout constant here). Deliberately independent of the actual
+/// page-to-page pixel pitch (`card_layout`'s card width can be over a
+/// thousand pixels on a large monitor) — this is a fixed, comfortable
+/// swipe distance instead, same idea as a touch or trackpad paging
+/// gesture.
 const CAROUSEL_DRAG_PAGE_DISTANCE_PX: f64 = 480.0;
 
 /// A workspace card's width as a fraction of the overview's full
@@ -745,12 +747,26 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
             (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
                 .then_some(OverviewHit::Window { page: th.page, hwnd: th.hwnd })
         });
+        // A precise rect-containment test here leaves the *gap* between
+        // adjacent cards as dead space that falls through to "close the
+        // overview" — with only two workspaces the neighboring card is
+        // a thin sliver at the screen edge, so a click aimed at it very
+        // easily lands a few pixels short, in that gap, and closes
+        // instead of switching. Snapping to the nearest page along the
+        // carousel axis instead (same math `carousel_offset` itself
+        // uses) tiles the whole row with no dead zones between cards —
+        // only genuinely outside the outermost card, or outside the
+        // cards' vertical band entirely, still falls through.
         let hit = thumb_hit.or_else(|| {
-            cards.iter().find_map(|c| {
-                let r = displayed_rect(c.rect, c.page, st.carousel_offset, pitch, card_rect);
-                (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
-                    .then_some(OverviewHit::EmptyPage { page: c.page })
-            })
+            if !cards.is_empty() && y >= card_rect.top && y < card_rect.bottom {
+                let card_center_x = (card_rect.left + card_rect.right) / 2;
+                let approx_offset = st.carousel_offset + (x - card_center_x) as f64 / pitch as f64;
+                let max_page = st.workspaces.workspace_ids().len().saturating_sub(1);
+                let page = approx_offset.round().clamp(0.0, max_page as f64) as usize;
+                ((approx_offset - page as f64).abs() <= 0.5).then_some(OverviewHit::EmptyPage { page })
+            } else {
+                None
+            }
         });
         (hit, current)
     });
@@ -907,7 +923,13 @@ pub(crate) fn on_overview_drag_move(x: i32, y: i32) {
         let drag = state.carousel_drag.as_mut()?;
         let delta_px = x - drag.start_x;
         drag.max_delta = drag.max_delta.max(delta_px.abs());
-        let raw_offset = drag.start_offset - delta_px as f64 / CAROUSEL_DRAG_PAGE_DISTANCE_PX;
+        // `x`/`delta_px` are physical pixels (the overview is per-monitor
+        // DPI aware); the comfortable "swipe this far for one page"
+        // distance has to scale the same way or the drag feels twitchy
+        // and overshoots on a high-DPI display — same real pointer
+        // travel produces more raw pixels there.
+        let page_distance_px = scaled(CAROUSEL_DRAG_PAGE_DISTANCE_PX as i32, reference_dpi()) as f64;
+        let raw_offset = drag.start_offset - delta_px as f64 / page_distance_px;
         state.carousel_offset = raw_offset.clamp(0.0, (workspace_count.max(1) - 1) as f64);
         Some(state.overview_hwnd)
     });
@@ -1042,10 +1064,20 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
             return None;
         };
         let (card_rect, pitch) = card_layout();
-        let target = cards.iter().find_map(|c| {
-            let r = displayed_rect(c.rect, c.page, state.carousel_offset, pitch, card_rect);
-            (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(c.page)
-        })?;
+        // Same nearest-page snapping as `on_overview_click`, and for the
+        // same reason — a release aimed at a thin sliver of a neighbor
+        // card shouldn't silently cancel just for landing in the gap
+        // next to it instead of exactly on it.
+        if cards.is_empty() || y < card_rect.top || y >= card_rect.bottom {
+            return None;
+        }
+        let card_center_x = (card_rect.left + card_rect.right) / 2;
+        let approx_offset = state.carousel_offset + (x - card_center_x) as f64 / pitch as f64;
+        let max_page = state.workspaces.workspace_ids().len().saturating_sub(1);
+        let target = approx_offset.round().clamp(0.0, max_page as f64) as usize;
+        if (approx_offset - target as f64).abs() > 0.5 {
+            return None;
+        }
         if target == drag.from_page {
             return None;
         }
@@ -2367,10 +2399,39 @@ pub(crate) fn on_animation_tick() {
                     let _ = ShowWindow(overview_hwnd, SW_HIDE);
                 }
 
+                // Whatever we do next — refocus a specific window, hand
+                // focus to the desktop, or nothing at all — Windows can
+                // still decide on its own, a few milliseconds later, to
+                // reactivate whatever real application window was
+                // legitimately active before all this (confirmed live:
+                // the user's terminal, still on the workspace they just
+                // left). `on_foreground_changed` would otherwise
+                // dutifully follow that back and silently undo the
+                // switch. There's no specific stale window to filter out
+                // here — it's whatever the OS hands focus back to — so
+                // this is a blanket cooldown on the whole follow
+                // behavior instead, covering both this handoff and
+                // whatever Windows does immediately after it.
+                super::workspaces::suppress_foreground_follow(Duration::from_millis(500));
+
+                // `previous_foreground` was captured when the overview
+                // *opened* — if the user has since switched to a
+                // different workspace inside it (e.g. landed on an empty
+                // one with nothing to explicitly focus), refocusing that
+                // stale window would land back on the wrong workspace.
+                // Only fall back to it if it's still on the workspace
+                // we're actually closing onto.
                 let target = focus_after.or_else(|| {
-                    STATE
-                        .with(|s| s.borrow().as_ref().map(|st| st.previous_foreground))
-                        .filter(|h| !h.0.is_null() && *h != overview_hwnd)
+                    STATE.with(|s| {
+                        let st = s.borrow();
+                        let st = st.as_ref()?;
+                        let prev = st.previous_foreground;
+                        (!prev.0.is_null()
+                            && prev != overview_hwnd
+                            && st.workspaces.workspace_of(prev.0 as isize)
+                                == Some(st.workspaces.current_id()))
+                        .then_some(prev)
+                    })
                 });
                 if let Some(target) = target {
                     // SAFETY: `target` was either just clicked (still
@@ -2383,6 +2444,16 @@ pub(crate) fn on_animation_tick() {
                         }
                     }
                     force_foreground(target);
+                } else {
+                    // Nothing on the workspace we're closing onto to
+                    // focus — hand focus to the desktop itself rather
+                    // than leaving some unrelated window as foreground.
+                    // SAFETY: `w!("Progman")` is a well-known, permanent
+                    // system window class; a lookup failure just means
+                    // this best-effort nudge doesn't happen.
+                    if let Ok(desktop) = unsafe { FindWindowW(w!("Progman"), None) } {
+                        force_foreground(desktop);
+                    }
                 }
             }
         }

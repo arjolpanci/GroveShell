@@ -2,8 +2,9 @@
 //! park/unpark mechanics that make an inactive workspace's windows
 //! disappear from the real screen without ever being `SW_HIDE`-hidden.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -321,11 +322,40 @@ pub(crate) fn on_window_sync_timer(bar_hwnd: HWND) {
     rebuild_open_overview_pages();
 }
 
+thread_local! {
+    /// Set by [`suppress_foreground_follow`] to make `on_foreground_changed`
+    /// ignore foreground-change events for a short window.
+    static SUPPRESS_FOLLOW_UNTIL: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Ignores the next `duration` of foreground-change events entirely,
+/// rather than just skipping the one we know is stale. Closing the
+/// overview onto a workspace with nothing to focus explicitly hands
+/// focus to the desktop (see `overview.rs`'s `Completion::Closed`) —
+/// but that handoff isn't the end of it: confirmed live, Windows
+/// reliably re-activates whatever real application window was legitimately
+/// active before (e.g. the terminal the user is actually working in) a
+/// couple of milliseconds later, on its own, as if the desktop never
+/// really "stuck" as foreground. `on_foreground_changed` would then
+/// dutifully follow *that* window back to its workspace, silently
+/// undoing the switch the user just made. There's no single window
+/// handle to filter out — it's whatever the OS decides to hand focus
+/// back to — so the fix is a brief cooldown on the whole follow
+/// behavior instead.
+pub(crate) fn suppress_foreground_follow(duration: Duration) {
+    SUPPRESS_FOLLOW_UNTIL.with(|c| c.set(Some(Instant::now() + duration)));
+}
+
 /// A window from another process just became foreground. If it lives
 /// on a non-current workspace (still reachable through Alt+Tab), follow
 /// it there — its parked position would otherwise leave the user
 /// staring at a focused window they can't see.
 fn on_foreground_changed(hwnd: HWND) {
+    let suppressed =
+        SUPPRESS_FOLLOW_UNTIL.with(|c| c.get().is_some_and(|until| Instant::now() < until));
+    if suppressed {
+        return;
+    }
     let target = STATE.with(|s| {
         let state_ref = s.borrow();
         let st = state_ref.as_ref()?;

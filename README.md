@@ -55,6 +55,14 @@ you picked.
   your real Windows taskbar's pinned shortcuts and adds a running-indicator
   dot for anything currently open, pinned or not. A click focuses a running
   app or launches a pinned one.
+- The Windows key remapped to Activities, GNOME-style: a plain tap opens or
+  closes the overview instead of the Start Menu. Holding it down and
+  left-dragging moves whatever window is under the cursor; holding it and
+  right-dragging resizes that window from whichever corner you grabbed.
+  Works on any window, not just this shell's own, through a pair of
+  system-wide low-level hooks. Pushing the cursor into a monitor's
+  top-left corner also opens the overview, the same hot-corner trigger
+  GNOME uses.
 - Taskbar replacement. The Windows taskbar is hidden and its reserved strip
   handed back to applications while GroveShell runs, then restored on exit.
   If a run dies without cleaning up, the next launch repairs it.
@@ -81,11 +89,11 @@ Condensed, with current status:
 - [x] Generation-counter `WindowId` identity across HWND reuse
 - [x] `list-windows` / `list-monitors` CLI commands
 
-### Phase 2: Global move/resize and hot corners
-- [ ] Low-level mouse and keyboard hooks
-- [ ] Alt+drag move and resize for any window
-- [ ] Hot-corner activation for the overview
-- [ ] Win key remapped to Activities
+### Phase 2: Global move/resize and hot corners (done)
+- [x] Low-level mouse and keyboard hooks
+- [x] Win+drag move and resize for any window
+- [x] Hot-corner activation for the overview
+- [x] Win key remapped to Activities
 
 ### Phase 3: Managed workspaces (partial)
 - [x] Workspace domain model (pure, unit-tested) with the dynamic empty-tail policy
