@@ -6,6 +6,7 @@ mod bar;
 mod calendar;
 mod dock;
 mod monitors;
+mod movesize;
 mod overview;
 mod quick_settings;
 mod state;
@@ -39,6 +40,10 @@ use groveshell_window_model::workspace::WorkspaceTracker;
 use bar::{on_bar_click, paint_bar, register_appbar, unregister_appbar, QS_LABEL_MARGIN};
 use calendar::{hide_calendar, paint_calendar, CAL_HEIGHT, CAL_WIDTH};
 use monitors::{enumerate_monitors, monitor_index_for_center, monitors_sorted_by_x};
+use movesize::{
+    check_hot_corners, install_move_size_hooks, on_drag_timer, uninstall_move_size_hooks,
+    DRAG_TIMER_ID, HOTCORNER_INTERVAL_MS, HOTCORNER_TIMER_ID,
+};
 use overview::{
     close_overview, on_animation_tick, on_overview_arrow, on_overview_char,
     on_overview_drag_end, on_overview_drag_move, on_overview_drag_start, on_overview_hover,
@@ -417,6 +422,8 @@ pub fn main() -> Result<()> {
         );
 
         install_win_event_hooks();
+        install_move_size_hooks();
+        SetTimer(primary_bar_hwnd, HOTCORNER_TIMER_ID, HOTCORNER_INTERVAL_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -608,6 +615,8 @@ unsafe extern "system" fn wndproc(
             match wparam.0 {
                 ANIM_TIMER_ID => on_animation_tick(),
                 SYNC_TIMER_ID => on_window_sync_timer(hwnd),
+                HOTCORNER_TIMER_ID => check_hot_corners(),
+                DRAG_TIMER_ID => on_drag_timer(),
                 CLOCK_TIMER_ID => {
                     let primary =
                         STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
@@ -632,6 +641,7 @@ unsafe extern "system" fn wndproc(
                 unregister_appbar(hwnd);
                 if is_primary {
                     uninstall_win_event_hooks();
+                    uninstall_move_size_hooks();
                     let _ = UnregisterHotKey(hwnd, HOTKEY_WS_PREV);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_WS_NEXT);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_MOVE_WIN_PREV);
