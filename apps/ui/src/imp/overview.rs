@@ -14,7 +14,7 @@ use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen,
-    CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, InvalidateRect,
+    CreateRoundRectRgn, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse, EndPaint, InvalidateRect,
     FillRect, GetDC, GetStockObject, HBITMAP, HDC, ReleaseDC, RoundRect,
     SelectClipRgn, SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt,
     HALFTONE, HOLLOW_BRUSH, NULL_PEN, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
@@ -40,7 +40,7 @@ use super::calendar::hide_calendar;
 use super::monitors::monitors_sorted_by_x;
 use super::quick_settings::hide_quick_settings;
 use super::state::{reference_dpi, scaled, STATE, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, BAR_HEIGHT};
-use super::util::{bar_font, draw_text_in, ease_out, progress, progress_dur};
+use super::util::{bar_font, draw_text_in, ease_out, force_foreground, progress, progress_dur};
 use super::workspaces::commit_workspace_switch;
 
 /// Below this many pixels of horizontal movement, a press-and-release
@@ -65,7 +65,7 @@ const CARD_WIDTH_FRACTION: f64 = 0.62;
 /// Gap above a card, below the top bar — room for a future search box.
 const CARD_MARGIN_TOP: i32 = 70;
 /// Gap below a card — room for the future dock (not implemented yet).
-const CARD_MARGIN_BOTTOM: i32 = 120;
+pub(crate) const CARD_MARGIN_BOTTOM: i32 = 120;
 /// Horizontal gap between adjacent cards; together with the card width
 /// this sets the carousel's page-to-page pitch.
 const CARD_GAP: i32 = 56;
@@ -383,7 +383,7 @@ fn layout_grid(
 /// apps set), falling back to its window class's icon. Returned handles
 /// are owned by the window/class itself and must never be destroyed
 /// here.
-fn window_icon(hwnd: HWND) -> Option<HICON> {
+pub(crate) fn window_icon(hwnd: HWND) -> Option<HICON> {
     // SAFETY: `hwnd` is a live top-level window; both queries are
     // synchronous and read-only.
     unsafe {
@@ -448,7 +448,7 @@ fn zoom_rect(r: RECT, anchor_x: f64, anchor_y: f64, s: f64) -> RECT {
 /// to refresh it in place after a workspace switch
 /// (`workspaces::commit_workspace_switch` calls this rather than
 /// patching the previous session's pages piecemeal).
-pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize) {
+pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize, Vec<super::dock::DockApp>) {
     let live = super::workspaces::sync_workspaces();
 
     let (workspace_ids, current_pos): (Vec<groveshell_window_model::workspace::WorkspaceId>, usize) =
@@ -462,6 +462,11 @@ pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize) {
     let (card_rect, _) = card_layout();
     let mut cards = Vec::new();
     let mut thumbs = Vec::new();
+    // Every tracked window across every workspace, parked or not — the
+    // dock needs the full set (`live` alone only covers what's actually
+    // on screen right now) to know what's running regardless of which
+    // page it's parked on.
+    let mut all_windows: Vec<groveshell_window_model::WindowRecord> = Vec::new();
 
     for (page, &ws_id) in workspace_ids.iter().enumerate() {
         cards.push(CardAnim { page, rect: card_rect });
@@ -488,6 +493,7 @@ pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize) {
                     .or_else(|| groveshell_window_model::describe(hwnd))
             })
             .collect();
+        all_windows.extend(windows.iter().cloned());
 
         for (slot_rect, icon_rect, window) in layout_grid(card_rect, windows) {
             let source = HWND(window.hwnd as *mut c_void);
@@ -513,7 +519,8 @@ pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize) {
         }
     }
 
-    (cards, thumbs, current_pos)
+    let dock_apps = super::dock::build_dock_apps(&all_windows);
+    (cards, thumbs, current_pos, dock_apps)
 }
 
 /// Shows the overview and fades it in (see the module docs on why
@@ -539,7 +546,7 @@ pub(crate) fn open_overview() {
     hide_calendar(false);
     hide_quick_settings(false);
 
-    let (cards, thumbs, current_pos) = build_carousel_pages();
+    let (cards, thumbs, current_pos, dock_apps) = build_carousel_pages();
 
     // SAFETY: no preconditions.
     let previous_foreground = unsafe { GetForegroundWindow() };
@@ -551,6 +558,8 @@ pub(crate) fn open_overview() {
             state.carousel_drag = None;
             state.carousel_anim = None;
             state.carousel_close_after = None;
+            state.dock_apps = dock_apps;
+            state.dock_hover = None;
             state.overview = OverviewMode::Opening {
                 started: Instant::now(),
                 thumbs,
@@ -589,12 +598,13 @@ pub(crate) fn rebuild_open_overview_pages() {
         return;
     };
 
-    let (cards, thumbs, _current_pos) = build_carousel_pages();
+    let (cards, thumbs, _current_pos, dock_apps) = build_carousel_pages();
 
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
             if matches!(state.overview, OverviewMode::Open { .. }) {
                 state.overview = OverviewMode::Open { thumbs, cards };
+                state.dock_apps = dock_apps;
             }
         }
     });
@@ -632,6 +642,7 @@ pub(crate) fn close_overview(focus_after: Option<HWND>) {
                 state.window_drag = None;
                 state.window_pop_anim = None;
                 state.hover_thumb = None;
+                state.dock_hover = None;
                 state.search_query.clear();
                 Some(state.overview_hwnd)
             }
@@ -699,6 +710,26 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
         return;
     }
 
+    // Dock hit-testing next: a click there launches/focuses instead of
+    // ever reaching card/thumbnail hit-testing below (the dock sits in
+    // the bottom margin, outside any card, so there's no real overlap —
+    // this is just the natural place to check first).
+    let dock_hit = STATE.with(|s| {
+        let state = s.borrow();
+        let st = state.as_ref()?;
+        if !matches!(st.overview, OverviewMode::Open { .. }) {
+            return None;
+        }
+        let (_, slots) = super::dock::dock_layout(st.dock_apps.len());
+        slots
+            .iter()
+            .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+    });
+    if let Some(index) = dock_hit {
+        super::dock::activate_dock_app(index);
+        return;
+    }
+
     let (hit, current) = STATE.with(|s| {
         let state = s.borrow();
         let Some(st) = state.as_ref() else {
@@ -750,6 +781,13 @@ pub(crate) fn on_overview_drag_start(x: i32, y: i32) {
         // While searching, presses belong to the results panel
         // (handled as clicks on release), not to dragging.
         if !state.search_query.is_empty() {
+            return None;
+        }
+        // The dock has no drag behavior — a press on it is handled
+        // entirely as a click on release (see `on_overview_click`), so
+        // just don't start any drag for it.
+        let (_, dock_slots) = super::dock::dock_layout(state.dock_apps.len());
+        if dock_slots.iter().any(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
             return None;
         }
         let thumb = {
@@ -893,13 +931,34 @@ pub(crate) fn on_overview_hover(x: i32, y: i32) {
         let OverviewMode::Open { thumbs, .. } = &state.overview else {
             return None;
         };
-        let (card_rect, pitch) = card_layout();
-        let hovered = thumbs.iter().find_map(|th| {
-            let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
-            (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(th.hwnd.0 as isize)
-        });
+
+        // Dock icons take priority: a dock slot is never also a window
+        // preview, so at most one of `hovered`/`dock_hit` is ever Some.
+        let (_, dock_slots) = super::dock::dock_layout(state.dock_apps.len());
+        let dock_hit = dock_slots
+            .iter()
+            .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+
+        let hovered = if dock_hit.is_some() {
+            None
+        } else {
+            let (card_rect, pitch) = card_layout();
+            thumbs.iter().find_map(|th| {
+                let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
+                (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(th.hwnd.0 as isize)
+            })
+        };
+
+        let mut changed = false;
         if state.hover_thumb.map(|(hwnd, _)| hwnd) != hovered {
             state.hover_thumb = hovered.map(|hwnd| (hwnd, Instant::now()));
+            changed = true;
+        }
+        if state.dock_hover.map(|(i, _)| i) != dock_hit {
+            state.dock_hover = dock_hit.map(|i| (i, Instant::now()));
+            changed = true;
+        }
+        if changed {
             Some(state.overview_hwnd)
         } else {
             None
@@ -1442,8 +1501,33 @@ pub(crate) fn paint_overview(hwnd: HWND) {
             let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
             Some((place(th.rect, th.page), intensity))
         });
-        let search = (!st.search_query.is_empty()).then(|| st.search_query.clone());
-        Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, search))
+
+        // The dock: bar rect, one (slot, icon, is_running) triple per
+        // entry with an icon, and the hover glow for whichever slot the
+        // pointer sits on, if any. Page-local like everything else
+        // above (`dock_layout` already accounts for the card's own
+        // position), so no `place()` transform — the dock doesn't
+        // carousel-shift or zoom with the cards.
+        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(st.dock_apps.len());
+        let dock_icons: Vec<(RECT, HICON, bool)> = st
+            .dock_apps
+            .iter()
+            .zip(dock_slots.iter())
+            .filter_map(|(app, rect)| app.icon.map(|icon| (*rect, icon, !app.windows.is_empty())))
+            .collect();
+        let dock_hover_glow = st.dock_hover.and_then(|(i, started)| {
+            let rect = dock_slots.get(i)?;
+            let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
+            Some((*rect, intensity))
+        });
+        let dock = (!st.dock_apps.is_empty()).then_some((dock_bar_rect, dock_icons, dock_hover_glow));
+
+        // Always shown (so people know it's there — see the module
+        // docs) rather than only once typing starts; the results
+        // dropdown underneath it only appears once there's an actual
+        // query (see the paint site).
+        let search = st.search_query.clone();
+        Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, dock, search))
     });
 
     // Double-buffered: everything is composed into a memory bitmap and
@@ -1471,10 +1555,11 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         FillRect(mem, &client, backdrop_brush);
         let _ = DeleteObject(backdrop_brush);
 
-        if let Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, search)) = content {
+        if let Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, dock, search)) = content {
             let dpi = reference_dpi();
             let card_radius = scaled(CARD_CORNER_RADIUS, dpi);
             let thumb_radius = scaled(THUMB_CORNER_RADIUS, dpi);
+            let dock_radius = scaled(super::dock::DOCK_CORNER_RADIUS, dpi);
             // Cheap stretch mode for all per-frame scaling — sources
             // are already HALFTONE-prescaled to ~the right size.
             SetStretchBltMode(mem, windows::Win32::Graphics::Gdi::COLORONCOLOR);
@@ -1597,9 +1682,64 @@ pub(crate) fn paint_overview(hwnd: HWND) {
                 }
             }
 
-            // Type-to-search results panel, over everything else.
-            if let Some(query) = &search {
-                let results = search_results(query);
+            // The dock: a rounded bar (shadow, then fill, matching the
+            // rest of the overview's chrome) along the bottom of the
+            // focused card, one icon per entry with a small dot beneath
+            // any that are currently running, then its own hover glow.
+            if let Some((bar_rect, dock_icons, dock_hover_glow)) = dock {
+                draw_shadow(mem, bar_rect, dock_radius, 4);
+                let dock_brush = CreateSolidBrush(COLORREF(0x002A2A2A));
+                let null_pen = GetStockObject(NULL_PEN);
+                let previous_brush = SelectObject(mem, dock_brush);
+                let previous_pen = SelectObject(mem, null_pen);
+                let _ = RoundRect(
+                    mem,
+                    bar_rect.left,
+                    bar_rect.top,
+                    bar_rect.right,
+                    bar_rect.bottom,
+                    dock_radius * 2,
+                    dock_radius * 2,
+                );
+                SelectObject(mem, previous_pen);
+                SelectObject(mem, previous_brush);
+                let _ = DeleteObject(dock_brush);
+
+                let running_dot_brush = CreateSolidBrush(COLORREF(0x00E0E0E0));
+                let running_dot_radius = super::dock::dock_running_dot_radius();
+                for (rect, icon, running) in &dock_icons {
+                    let size = rect.right - rect.left;
+                    let _ = DrawIconEx(mem, rect.left, rect.top, *icon, size, size, 0, None, DI_NORMAL);
+                    if *running {
+                        let cx = (rect.left + rect.right) / 2;
+                        let dot_y = rect.bottom + running_dot_radius + 2;
+                        let previous = SelectObject(mem, running_dot_brush);
+                        let _ = Ellipse(
+                            mem,
+                            cx - running_dot_radius,
+                            dot_y - running_dot_radius,
+                            cx + running_dot_radius,
+                            dot_y + running_dot_radius,
+                        );
+                        SelectObject(mem, previous);
+                    }
+                }
+                let _ = DeleteObject(running_dot_brush);
+
+                if let Some((rect, intensity)) = dock_hover_glow {
+                    if intensity > 0.001 {
+                        draw_glow_border(mem, rect, thumb_radius, intensity);
+                    }
+                }
+            }
+
+            // The search bar itself is always visible while the overview
+            // is open — a placeholder when empty, the live query once
+            // typing starts — so people discover it's there without
+            // needing to already know to type. The results dropdown
+            // beneath it only appears once there's an actual query.
+            {
+                let results = if search.is_empty() { Vec::new() } else { search_results(&search) };
                 let (panel, rows) = search_layout(dpi, results.len());
                 draw_shadow(mem, panel, thumb_radius, 4);
                 let panel_brush = CreateSolidBrush(COLORREF(0x002A2A2A));
@@ -1636,13 +1776,23 @@ pub(crate) fn paint_overview(hwnd: HWND) {
                     right: r.right - pad,
                     bottom: r.bottom,
                 };
-                SetTextColor(mem, COLORREF(0x00A0A0A0));
-                draw_text_in(
-                    mem,
-                    inset(&rows[0]),
-                    &format!("Search: {query}"),
-                    DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-                );
+                if search.is_empty() {
+                    SetTextColor(mem, COLORREF(0x00707070));
+                    draw_text_in(
+                        mem,
+                        inset(&rows[0]),
+                        "Type to search",
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                    );
+                } else {
+                    SetTextColor(mem, COLORREF(0x00A0A0A0));
+                    draw_text_in(
+                        mem,
+                        inset(&rows[0]),
+                        &format!("Search: {search}"),
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                    );
+                }
                 SetTextColor(mem, COLORREF(0x00E0E0E0));
                 for (i, result) in results.iter().enumerate() {
                     let label = match result {
@@ -2172,11 +2322,15 @@ pub(crate) fn on_animation_tick() {
         let thumb_hover_easing = state
             .hover_thumb
             .is_some_and(|(_, started)| progress_dur(started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
+        let dock_hover_easing = state
+            .dock_hover
+            .is_some_and(|(_, started)| progress_dur(started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
         let keep_timer = fade_running
             || state.carousel_anim.is_some()
             || state.window_pop_anim.is_some()
             || card_hover_easing
-            || thumb_hover_easing;
+            || thumb_hover_easing
+            || dock_hover_easing;
         Some((state.overview_hwnd, fade_alpha, completion, carousel_close_after, keep_timer))
     });
 
@@ -2227,8 +2381,8 @@ pub(crate) fn on_animation_tick() {
                         if IsIconic(target).as_bool() {
                             let _ = ShowWindow(target, SW_RESTORE);
                         }
-                        let _ = SetForegroundWindow(target);
                     }
+                    force_foreground(target);
                 }
             }
         }

@@ -44,9 +44,17 @@ you picked.
 - The Activities overview: fixed-size workspace cards in a draggable
   carousel. The focused card is a little larger than its neighbors, opening
   and closing animate as a zoom, and cards get rounded corners and drop
-  shadows. You can drag a window's preview onto another card to move it
-  there, or start typing to search open windows and installed apps. All of
-  it is our own double-buffered GDI compositing.
+  shadows. Dragging a window's preview onto another card pops it out with a
+  short animation and moves it there, and hovering any preview (or a dock
+  icon) glows it so you can see what you're about to click. A search bar
+  sits at the top the whole time the overview is open, ready for you to type
+  and search open windows or installed apps. All of it is our own
+  double-buffered GDI compositing.
+- A dock along the bottom of the focused card, GNOME-dash style: appears
+  only inside the overview, not as an always-visible taskbar. It mirrors
+  your real Windows taskbar's pinned shortcuts and adds a running-indicator
+  dot for anything currently open, pinned or not. A click focuses a running
+  app or launches a pinned one.
 - Taskbar replacement. The Windows taskbar is hidden and its reserved strip
   handed back to applications while GroveShell runs, then restored on exit.
   If a run dies without cleaning up, the next launch repairs it.
@@ -92,16 +100,16 @@ Condensed, with current status:
 - [x] Activities button, workspace dots, clock, calendar, quick settings
 - [x] Per-monitor DPI scaling, rounded bottom corners
 - [x] Windows taskbar hidden while running, restored on exit
-- [ ] Dock (pinned and running apps)
-- [ ] Settings for bar height and keybindings
+- [x] Dock (pinned and running apps), overview-only, mirrored from the real taskbar's pins
+- [ ] Central settings UI (bar height, keybindings, dock pin management)
 
 ### Phase 5: Activities overview (done)
 - [x] Carousel layout engine with focused-card scaling
 - [x] Window previews from our own captures, which survive apps that stop rendering off-screen
 - [x] Zoom and fade open/close animations, smooth drag with snap
 - [x] Click to focus, click empty space to switch or cancel
-- [x] Dragging a window between workspaces in the overview
-- [x] Application and window search (type to search, Enter activates the top result)
+- [x] Dragging a window between workspaces in the overview, with pop in/out animations and a hover glow on previews and dock icons
+- [x] Application and window search, always visible, not just while typing (type to search, Enter activates the top result)
 
 ### Phase 6: Hardening and accessibility
 - [ ] Mixed-DPI and display-topology testing

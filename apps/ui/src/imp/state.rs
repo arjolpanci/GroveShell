@@ -10,6 +10,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use groveshell_window_model::registry::WindowRegistry;
 use groveshell_window_model::workspace::WorkspaceTracker;
 
+use super::dock::DockApp;
 use super::overview::{CarouselAnim, CarouselDrag, OverviewMode, WindowDrag, WindowPopAnim};
 
 /// Half of the original 32px guess — the Windows taskbar itself is
@@ -115,6 +116,14 @@ pub(crate) struct AppState {
     /// over any preview, or while a carousel/window drag is active
     /// (those have their own hover feedback).
     pub(crate) hover_thumb: Option<(isize, Instant)>,
+    /// The dock's current contents — rebuilt alongside `thumbs`/`cards`
+    /// every time the overview opens or rebuilds (see
+    /// `overview::build_carousel_pages`).
+    pub(crate) dock_apps: Vec<DockApp>,
+    /// The dock icon currently under the pointer, and when hovering it
+    /// started — same ease-in glow mechanism as `hover_thumb`, just a
+    /// separate target since a dock icon isn't a window preview.
+    pub(crate) dock_hover: Option<(usize, Instant)>,
     /// Live text of the overview's type-to-search; empty = search off.
     pub(crate) search_query: String,
     /// Stable identity across HWND reuse (see `registry`): consulted by
