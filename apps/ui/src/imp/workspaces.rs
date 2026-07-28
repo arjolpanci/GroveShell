@@ -120,13 +120,14 @@ pub(crate) fn unpark_window(hwnd: HWND) {
 /// as soon as you land on a workspace in the overview too, rather than
 /// waiting for it to close. No-op if `target_index` is already
 /// current.
-pub(crate) fn commit_workspace_switch(target_index: usize) {
+pub(crate) fn commit_workspace_switch(monitor: &str, target_index: usize) {
     let switch = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
-        let from_pinned = state.workspaces.is_pinned(state.workspaces.current_index());
-        let to_pinned = state.workspaces.is_pinned(target_index);
-        let (from_id, to_id) = state.workspaces.switch_to_index(target_index)?;
+        let tracker = state.workspaces.get_mut(monitor)?;
+        let from_pinned = tracker.is_pinned(tracker.current_index());
+        let to_pinned = tracker.is_pinned(target_index);
+        let (from_id, to_id) = tracker.switch_to_index(target_index)?;
         // Two pinned workspaces are two physical monitors, both already
         // on screen — switching between them is purely a focus/indicator
         // change, nothing to hide or show. Any other pair shares screen
@@ -135,8 +136,8 @@ pub(crate) fn commit_workspace_switch(target_index: usize) {
         // incoming ones actually show — with a single monitor, its one
         // pinned workspace included, or switching does nothing visible.
         let both_pinned = from_pinned && to_pinned;
-        let hide = if both_pinned { Vec::new() } else { state.workspaces.windows_on(from_id) };
-        let show = if both_pinned { Vec::new() } else { state.workspaces.windows_on(to_id) };
+        let hide = if both_pinned { Vec::new() } else { tracker.windows_on(from_id) };
+        let show = if both_pinned { Vec::new() } else { tracker.windows_on(to_id) };
         Some((hide, show))
     });
     let Some((hide, show)) = switch else {
@@ -155,7 +156,7 @@ pub(crate) fn commit_workspace_switch(target_index: usize) {
     // workspaces exist at all (dynamic growth/shrink), and which
     // windows live where, so patching the previous session's pages
     // piecemeal was a correctness trap — see `rebuild_open_overview_pages`.
-    rebuild_open_overview_pages();
+    super::overview::rebuild_open_overview_pages(monitor);
     refresh_bar_indicator();
 }
 
@@ -165,21 +166,29 @@ pub(crate) fn commit_workspace_switch(target_index: usize) {
 /// rather than silently following onto the new one.
 pub(crate) fn switch_workspace_relative(delta: i32) {
     sync_workspaces();
+    // SAFETY: no preconditions.
+    let fg = unsafe { GetForegroundWindow() };
+    let Some(monitor) = super::monitors::monitor_key_of_window(fg) else {
+        return;
+    };
     let (target, overview_open) = STATE.with(|s| {
         s.borrow()
             .as_ref()
-            .map(|st| {
-                (
-                    st.workspaces.clamped_relative_index(delta),
-                    matches!(st.overview, OverviewMode::Open { .. }),
-                )
+            .and_then(|st| {
+                let tracker = st.workspaces.get(&monitor)?;
+                let overview_open = st
+                    .overviews
+                    .get(&monitor)
+                    .map(|ov| matches!(ov.mode, OverviewMode::Open { .. }))
+                    .unwrap_or(false);
+                Some((tracker.clamped_relative_index(delta), overview_open))
             })
             .unwrap_or((0, false))
     });
     if overview_open {
-        snap_carousel_to(target, None);
+        snap_carousel_to(&monitor, target, None);
     } else {
-        commit_workspace_switch(target);
+        commit_workspace_switch(&monitor, target);
     }
 }
 
@@ -199,13 +208,17 @@ pub(crate) fn move_focused_window_relative(delta: i32) {
     if fg.0.is_null() || role_of(fg) != Role::Other {
         return;
     }
+    let Some(monitor) = super::monitors::monitor_key_of_window(fg) else {
+        return;
+    };
     sync_workspaces();
     let hwnd = fg.0 as isize;
     let moved = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
-        let target = state.workspaces.pinned_count();
-        state.workspaces.move_window_to_index(hwnd, target)
+        let tracker = state.workspaces.get_mut(&monitor)?;
+        let target = tracker.pinned_count();
+        tracker.move_window_to_index(hwnd, target)
     });
     if moved.is_some() {
         park_window(fg);
@@ -319,7 +332,12 @@ pub(crate) fn on_window_sync_timer(bar_hwnd: HWND) {
     }
     sync_workspaces();
     refresh_bar_indicator();
-    rebuild_open_overview_pages();
+    let monitors: Vec<String> = STATE.with(|s| {
+        s.borrow().as_ref().map(|st| st.overviews.keys().cloned().collect()).unwrap_or_default()
+    });
+    for monitor in &monitors {
+        rebuild_open_overview_pages(monitor);
+    }
 }
 
 thread_local! {
@@ -356,15 +374,19 @@ fn on_foreground_changed(hwnd: HWND) {
     if suppressed {
         return;
     }
+    let Some(monitor) = super::monitors::monitor_key_of_window(hwnd) else {
+        return;
+    };
     let target = STATE.with(|s| {
         let state_ref = s.borrow();
         let st = state_ref.as_ref()?;
-        let id = st.workspaces.workspace_of(hwnd.0 as isize)?;
-        let index = st.workspaces.index_of(id)?;
-        (index != st.workspaces.current_index()).then_some(index)
+        let tracker = st.workspaces.get(&monitor)?;
+        let id = tracker.workspace_of(hwnd.0 as isize)?;
+        let index = tracker.index_of(id)?;
+        (index != tracker.current_index()).then_some(index)
     });
     if let Some(index) = target {
-        commit_workspace_switch(index);
+        commit_workspace_switch(&monitor, index);
     }
 }
 
@@ -390,38 +412,43 @@ pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
     let monitors = monitors_sorted_by_x();
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
-            let current = state.workspaces.current_index();
-            let current_pinned = state.workspaces.is_pinned(current);
             for window in &live {
                 // Identity first: a recycled HWND (same handle, new
                 // process) must not inherit the dead window's
                 // assignment or park-time snapshot.
                 let (_, reused) = state.window_registry.observe(window.hwnd, window.pid);
                 if reused {
-                    state.workspaces.forget(window.hwnd);
+                    // A recycled hwnd may have belonged to any monitor's
+                    // tracker; `forget` on a tracker that never had it
+                    // assigned is a documented no-op.
+                    for name in state.workspaces.device_names().map(str::to_string).collect::<Vec<_>>() {
+                        if let Some(tracker) = state.workspaces.get_mut(&name) {
+                            tracker.forget(window.hwnd);
+                        }
+                    }
                     drop_window_snapshot(window.hwnd);
                 }
-                if state.workspaces.workspace_of(window.hwnd).is_some() {
+                if state.workspaces.monitor_of_window(window.hwnd).is_some() {
                     continue;
                 }
-                let index = if current_pinned {
-                    let center_x = (window.rect.left + window.rect.right) / 2;
-                    let center_y = (window.rect.top + window.rect.bottom) / 2;
-                    super::monitors::monitor_index_for_center(&monitors, center_x, center_y).unwrap_or(current)
-                } else {
-                    current
-                };
-                state.workspaces.assign_to_index(window.hwnd, index);
+                let center_x = (window.rect.left + window.rect.right) / 2;
+                let center_y = (window.rect.top + window.rect.bottom) / 2;
+                let target_monitor = super::monitors::monitor_index_for_center(&monitors, center_x, center_y)
+                    .and_then(|i| monitors.get(i))
+                    .map(|m| m.device_name.clone())
+                    .unwrap_or_else(|| state.primary_monitor.clone());
+                if let Some(tracker) = state.workspaces.get_mut(&target_monitor) {
+                    let index = tracker.current_index();
+                    tracker.assign_to_index(window.hwnd, index);
+                }
             }
-            state.workspaces.prune(groveshell_window_model::is_alive);
+            for name in state.workspaces.device_names().map(str::to_string).collect::<Vec<_>>() {
+                if let Some(tracker) = state.workspaces.get_mut(&name) {
+                    tracker.prune(groveshell_window_model::is_alive);
+                }
+            }
             state.window_registry.prune(groveshell_window_model::is_alive);
-            let tracked: Vec<isize> = state
-                .workspaces
-                .workspace_ids()
-                .to_vec()
-                .into_iter()
-                .flat_map(|id| state.workspaces.windows_on(id))
-                .collect();
+            let tracked = state.workspaces.all_tracked_windows();
             retain_window_snapshots(&tracked);
         }
     });
