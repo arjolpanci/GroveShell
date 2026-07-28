@@ -1,16 +1,17 @@
 //! Monitor enumeration: real bounds, work areas, and DPI, plus the
 //! left-to-right ordering pinned monitor-workspaces are created in.
 
-use windows::Win32::Foundation::{BOOL, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO,
+    EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW, MonitorFromPoint,
+    MonitorFromWindow, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
 const MONITORINFOF_PRIMARY: u32 = 1;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct MonitorInfo {
     /// Full monitor bounds in virtual-screen coordinates (which can be
     /// negative — the primary monitor anchors the origin, so a monitor
@@ -25,6 +26,12 @@ pub(crate) struct MonitorInfo {
     /// convert this module's 96-DPI layout constants to physical
     /// pixels via [`super::state::scaled`].
     pub(crate) dpi: u32,
+    /// Stable identity for this monitor within the current session (e.g.
+    /// `\\.\DISPLAY1`), from `MONITORINFOEXW::szDevice`. Used to key
+    /// per-monitor workspace/overview state instead of `HMONITOR` (not
+    /// guaranteed stable across hotplug) or screen position (changes
+    /// when a monitor is added/removed to the left of another).
+    pub(crate) device_name: String,
 }
 
 /// Enumerates real monitors via `EnumDisplayMonitors`, falling back to
@@ -60,6 +67,7 @@ pub(crate) fn enumerate_monitors() -> Vec<MonitorInfo> {
             work: rect,
             is_primary: true,
             dpi: 96,
+            device_name: "\\\\.\\DISPLAY-FALLBACK".to_string(),
         });
     }
     monitors
@@ -85,29 +93,111 @@ pub(crate) fn monitor_index_for_center(monitors: &[MonitorInfo], center_x: i32, 
     })
 }
 
+fn device_name_of(hmonitor: HMONITOR) -> Option<String> {
+    // SAFETY: `hmonitor` came from `MonitorFromWindow`/`MonitorFromPoint`,
+    // which always return a valid handle (falling back to the nearest
+    // real monitor per `MONITOR_DEFAULTTONEAREST`).
+    unsafe {
+        let mut info = MONITORINFOEXW {
+            monitorInfo: windows::Win32::Graphics::Gdi::MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(hmonitor, &mut info as *mut _ as *mut _).as_bool() {
+            return None;
+        }
+        let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+        Some(String::from_utf16_lossy(&info.szDevice[..len]))
+    }
+}
+
+/// The device name of the monitor `hwnd` is currently on (nearest match
+/// if it straddles more than one) — used to route a keyboard shortcut
+/// triggered while that window is focused.
+#[allow(dead_code)]
+pub(crate) fn monitor_key_of_window(hwnd: HWND) -> Option<String> {
+    // SAFETY: `hwnd` is a live window; a plain geometry query.
+    let hmonitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    device_name_of(hmonitor)
+}
+
+/// The device name of the monitor the given screen point is on — used to
+/// route a hot-corner trigger or Win-key tap to whichever monitor the
+/// cursor is actually over.
+#[allow(dead_code)]
+pub(crate) fn monitor_key_at_point(pt: POINT) -> Option<String> {
+    // SAFETY: plain geometry query, no preconditions.
+    let hmonitor = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    device_name_of(hmonitor)
+}
+
+/// The `MonitorInfo` matching `device_name`, if it's still connected.
+#[allow(dead_code)]
+pub(crate) fn monitor_by_device_name<'a>(
+    monitors: &'a [MonitorInfo],
+    device_name: &str,
+) -> Option<&'a MonitorInfo> {
+    monitors.iter().find(|m| m.device_name == device_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake(device_name: &str, left: i32) -> MonitorInfo {
+        MonitorInfo {
+            rect: RECT { left, top: 0, right: left + 1920, bottom: 1080 },
+            work: RECT { left, top: 0, right: left + 1920, bottom: 1080 },
+            is_primary: left == 0,
+            dpi: 96,
+            device_name: device_name.to_string(),
+        }
+    }
+
+    #[test]
+    fn finds_monitor_by_device_name_regardless_of_order() {
+        let monitors = vec![fake("\\\\.\\DISPLAY2", 1920), fake("\\\\.\\DISPLAY1", 0)];
+        let found = monitor_by_device_name(&monitors, "\\\\.\\DISPLAY1").unwrap();
+        assert!(found.is_primary);
+        assert_eq!(found.rect.left, 0);
+    }
+
+    #[test]
+    fn missing_device_name_returns_none() {
+        let monitors = vec![fake("\\\\.\\DISPLAY1", 0)];
+        assert!(monitor_by_device_name(&monitors, "\\\\.\\DISPLAY9").is_none());
+    }
+}
+
 unsafe extern "system" fn monitor_enum_proc(
     hmonitor: HMONITOR,
     _hdc: HDC,
     _rect: *mut RECT,
     lparam: LPARAM,
 ) -> BOOL {
-    // SAFETY: `lparam` was created from a live `&mut Vec<MonitorInfo>`
-    // in `enumerate_monitors`, and this callback runs synchronously
-    // within that call's lifetime.
     let monitors = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
 
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+    let mut info = MONITORINFOEXW {
+        monitorInfo: windows::Win32::Graphics::Gdi::MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFOEXW>() as u32,
+            ..Default::default()
+        },
         ..Default::default()
     };
-    if GetMonitorInfoW(hmonitor, &mut info).as_bool() {
+    if GetMonitorInfoW(hmonitor, &mut info as *mut _ as *mut _).as_bool() {
         let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
         let _ = GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let device_name = String::from_utf16_lossy(
+            &info.szDevice[..info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len())],
+        );
         monitors.push(MonitorInfo {
-            rect: info.rcMonitor,
-            work: info.rcWork,
-            is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+            rect: info.monitorInfo.rcMonitor,
+            work: info.monitorInfo.rcWork,
+            is_primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
             dpi: dpi_x.max(96),
+            device_name,
         });
     }
     TRUE
