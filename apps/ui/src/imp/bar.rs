@@ -4,30 +4,71 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, Ellipse, SelectObject, SetBkMode, SetTextColor,
+    CreateSolidBrush, DeleteObject, Ellipse, RoundRect, SelectObject, SetBkMode, SetTextColor,
     BeginPaint, EndPaint, PAINTSTRUCT, TRANSPARENT, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    HOLLOW_BRUSH, GetStockObject,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
 };
-use windows::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SetWindowPos};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SetWindowPos,
+};
 
 use super::overview::{close_overview, open_overview, snap_carousel_to};
-use super::quick_settings::{quick_settings_label_text, toggle_quick_settings};
+use super::quick_settings::{battery_status, get_mute, toggle_quick_settings};
 use super::overview::OverviewMode;
 use super::state::{scaled, STATE};
-use super::util::{bar_font, draw_text_in};
+use super::util::{bar_font, draw_text_in, draw_battery_glyph, draw_volume_glyph, draw_wifi_glyph, blend_toward_white};
+use super::wifi::wifi_radio_on;
 use super::workspaces::commit_workspace_switch;
 use super::calendar::clock_text;
 use super::calendar::toggle_calendar;
+
+/// 96-DPI layout of the status pill (Wi-Fi/volume/battery glyphs) that
+/// replaced the old plain "42% Quick Settings" text label — one click
+/// target for the whole pill, same as GNOME's single combined status
+/// menu rather than a separate flyout per icon.
+const QS_PILL_HEIGHT: i32 = 20;
+const QS_PILL_PADDING_X: i32 = 8;
+const QS_ICON_SIZE: i32 = 15;
+const QS_ICON_GAP: i32 = 10;
+const QS_PILL_RADIUS: i32 = 10;
+const QS_PILL_RIGHT_MARGIN: i32 = 10;
+
+/// The status pill's own rect and its three icon slots, in physical
+/// pixels at `dpi` — a pure function of `bar_width`/`dpi` so painting
+/// and hit-testing can never disagree, same pattern as the overview's
+/// `card_layout`.
+fn qs_pill_layout(bar_width: i32, dpi: u32, bar_h: i32) -> (RECT, [RECT; 3]) {
+    let icon = scaled(QS_ICON_SIZE, dpi);
+    let gap = scaled(QS_ICON_GAP, dpi);
+    let pad_x = scaled(QS_PILL_PADDING_X, dpi);
+    let pill_h = scaled(QS_PILL_HEIGHT, dpi);
+    let pill_w = pad_x * 2 + icon * 3 + gap * 2;
+    let right_margin = scaled(QS_PILL_RIGHT_MARGIN, dpi);
+    let pill = RECT {
+        left: bar_width - right_margin - pill_w,
+        top: (bar_h - pill_h) / 2,
+        right: bar_width - right_margin,
+        bottom: (bar_h - pill_h) / 2 + pill_h,
+    };
+    let icon_top = pill.top + (pill_h - icon) / 2;
+    let mut slots = [RECT::default(); 3];
+    for (i, slot) in slots.iter_mut().enumerate() {
+        let left = pill.left + pad_x + i as i32 * (icon + gap);
+        *slot = RECT { left, top: icon_top, right: left + icon, bottom: icon_top + icon };
+    }
+    (pill, slots)
+}
 
 /// Hit-test region for the painted (not native controls — there isn't
 /// enough vertical room in the bar for real button chrome) bar labels.
 pub(crate) const ACTIVITIES_LABEL_X: i32 = 8;
 pub(crate) const ACTIVITIES_LABEL_WIDTH: i32 = 72;
 pub(crate) const CLOCK_LABEL_WIDTH: i32 = 130;
-pub(crate) const QS_LABEL_WIDTH: i32 = 170;
 pub(crate) const QS_LABEL_MARGIN: i32 = 8;
 
 /// Bar-side workspace indicator: a row of small dots to the right of
@@ -174,18 +215,24 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool) {
                 format,
             );
 
-            let qs_x = bar_width - scaled(QS_LABEL_WIDTH + QS_LABEL_MARGIN, dpi);
-            draw_text_in(
-                hdc,
-                RECT {
-                    left: qs_x,
-                    top: 0,
-                    right: qs_x + scaled(QS_LABEL_WIDTH, dpi),
-                    bottom: bar_h,
-                },
-                &quick_settings_label_text(),
-                format,
-            );
+            let (pill, slots) = qs_pill_layout(bar_width, dpi, bar_h);
+            let hovered = STATE.with(|s| s.borrow().as_ref().map(|st| st.qs_pill_hover)).unwrap_or(false);
+            if hovered {
+                let highlight = CreateSolidBrush(blend_toward_white(0x00202020, 0.15));
+                let previous_brush = SelectObject(hdc, highlight);
+                SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
+                let radius = scaled(QS_PILL_RADIUS, dpi);
+                let _ = RoundRect(hdc, pill.left, pill.top, pill.right, pill.bottom, radius * 2, radius * 2);
+                SelectObject(hdc, previous_brush);
+                let _ = DeleteObject(highlight);
+            }
+
+            let glyph_color = COLORREF(0x00E0E0E0);
+            let wifi_on = wifi_radio_on();
+            draw_wifi_glyph(hdc, slots[0], glyph_color, wifi_on.unwrap_or(false));
+            draw_volume_glyph(hdc, slots[1], glyph_color, get_mute().unwrap_or(false));
+            let percent = battery_status().map(|(pct, _)| pct).unwrap_or(100);
+            draw_battery_glyph(hdc, slots[2], glyph_color, percent);
 
             SelectObject(hdc, previous_font);
             let _ = DeleteObject(font);
@@ -252,9 +299,84 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32) {
         return;
     }
 
-    let qs_x = bar_width - scaled(QS_LABEL_WIDTH + QS_LABEL_MARGIN, dpi);
-    if (qs_x..bar_width - scaled(QS_LABEL_MARGIN, dpi)).contains(&x) {
+    let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
+    let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
+    if (pill.left..pill.right).contains(&x) {
         toggle_quick_settings();
+    }
+}
+
+/// Bar-only mouse tracking: whether the pointer sits over the status
+/// pill, for the hover highlight in `paint_bar`. `TrackMouseEvent`
+/// arms a one-shot `WM_MOUSELEAVE` so the highlight clears the instant
+/// the pointer leaves the bar entirely, not just when it moves to
+/// another spot on the bar.
+pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, _y: i32) {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let bar_width = STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|st| st.primary_bar_rect.right - st.primary_bar_rect.left)
+    });
+    let Some(bar_width) = bar_width else {
+        return;
+    };
+    let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
+    let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
+    let hovered = (pill.left..pill.right).contains(&x);
+
+    let changed = STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        let Some(state) = state_ref.as_mut() else {
+            return false;
+        };
+        if state.qs_pill_hover == hovered {
+            return false;
+        }
+        state.qs_pill_hover = hovered;
+        true
+    });
+    if changed {
+        // SAFETY: `hwnd` is the bar window currently handling this move.
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+        }
+    }
+    if hovered {
+        // SAFETY: a plain, fully-initialized local struct passed by
+        // pointer only for the duration of this call.
+        unsafe {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut tme);
+        }
+    }
+}
+
+/// Clears the status pill's hover highlight once the pointer actually
+/// leaves the bar (see `on_bar_hover`).
+pub(crate) fn on_bar_mouse_leave(hwnd: HWND) {
+    let changed = STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        let Some(state) = state_ref.as_mut() else {
+            return false;
+        };
+        if !state.qs_pill_hover {
+            return false;
+        }
+        state.qs_pill_hover = false;
+        true
+    });
+    if changed {
+        // SAFETY: `hwnd` is the bar window that just received
+        // `WM_MOUSELEAVE`.
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+        }
     }
 }
 

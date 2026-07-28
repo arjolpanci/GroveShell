@@ -130,6 +130,17 @@ pub(crate) struct AppState {
     /// `sync_workspaces` so a recycled handle doesn't inherit the dead
     /// window's workspace assignment or snapshot.
     pub(crate) window_registry: WindowRegistry,
+    /// Whether the pointer is currently over the bar's Wi-Fi/volume/
+    /// battery status pill — drawn as a translucent-white rounded-rect
+    /// highlight behind it, same idea as the dock/overview hover glows
+    /// but without the ease-in animation (the bar has no per-frame
+    /// timer to drive one, and a flat on/off highlight is plenty for
+    /// something this small).
+    pub(crate) qs_pill_hover: bool,
+    /// Whether the Quick Settings volume slider is currently being
+    /// dragged — set on a press inside the track, cleared on release
+    /// regardless of where the pointer ends up (standard slider feel).
+    pub(crate) qs_volume_dragging: bool,
 }
 
 thread_local! {
