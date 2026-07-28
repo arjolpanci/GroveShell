@@ -9,11 +9,9 @@
 **Primary implementation language:** Rust
 **License recommendation:** Apache-2.0 OR MIT dual license
 
-### Important naming and legal note
+### Naming note
 
-"GroveShell" should be treated as a temporary development codename, not as a legally cleared release name. GNOME is a registered trademark of the GNOME Foundation. The Foundation's published guidance says third parties should not modify or compound the GNOME word mark with other words and should not imply endorsement. An open-source license does not remove trademark risk. Before a public release, either obtain written permission or rename the project to an independent mark. The project must not use the GNOME foot logo or closely imitate official GNOME branding.
-
-Safe README wording during development: "This experimental Windows shell is inspired by aspects of the GNOME Shell workflow. GNOME is a registered trademark of the GNOME Foundation. This project is independent and is not affiliated with, sponsored by, or endorsed by the GNOME Foundation."
+The project originally carried a name that compounded the GNOME word mark, which the GNOME Foundation's trademark guidance doesn't allow. It was renamed to GroveShell — an independent name — early in development, which resolved that concern (see ADR-008). The standing rules are simple: no GNOME code, assets, foot logo, or branding imitation, and the README keeps a disclaimer that the project is independent and not affiliated with, sponsored by, or endorsed by the GNOME Foundation. GNOME is a registered trademark of the GNOME Foundation.
 
 ## 1. Executive summary
 
@@ -746,7 +744,7 @@ Show the test plan before implementation.
 | Preview capture consumes GPU/memory | Poor battery life and stalls | Lazy previews, frame throttling, thumbnail MVP, pause when overview closed. |
 | Shell crash strands user | Severe usability failure | Watchdog, panic shortcut, recovery executable, Explorer fallback. |
 | Elevated windows cannot be controlled | Inconsistent behavior | Document limitation; optional narrow broker later. |
-| Name infringes GNOME trademark | Repository or release dispute | Use working codename only; seek permission or rebrand before release. |
+| Name infringes GNOME trademark | Repository or release dispute | Resolved: renamed from the original GNOME-derived name to GroveShell (see ADR-008); never use GNOME branding or assets. |
 
 ## 19. Packaging, distribution, and release channels
 
