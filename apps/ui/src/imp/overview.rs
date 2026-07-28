@@ -91,6 +91,13 @@ const THUMB_CORNER_RADIUS: i32 = 8;
 /// monitor's) and 1.0 (its normal carousel size).
 const OVERVIEW_ZOOM_MAX: f64 = 1.0 / CARD_WIDTH_FRACTION;
 
+/// How long a dragged window's ghost takes to pop in at pickup or pop
+/// out at drop (see `WindowPopAnim`).
+const WINDOW_POP_DURATION: Duration = Duration::from_millis(140);
+/// How long the hover glow takes to ease to full intensity once the
+/// pointer settles over a card while dragging a window.
+const WINDOW_HOVER_GLOW_DURATION: Duration = Duration::from_millis(220);
+
 /// Overview search: cap on rendered results, and 96-DPI layout metrics
 /// for the results panel (see `search_layout`).
 const SEARCH_MAX_RESULTS: usize = 8;
@@ -196,6 +203,35 @@ pub(crate) struct WindowDrag {
     /// cache used to paint the drag ghost.
     pub(crate) base_w: i32,
     pub(crate) base_h: i32,
+    /// Which card the pointer currently sits over, and when it started
+    /// sitting there — drives the hover glow's ease-in (see
+    /// `WINDOW_HOVER_GLOW_DURATION`); resets whenever the hovered card
+    /// changes.
+    pub(crate) hover_page: Option<usize>,
+    pub(crate) hover_started: Instant,
+}
+
+/// A short pop in/out of the drag ghost: grows from nothing when a
+/// window is first picked up (so it visibly "snaps out" of its
+/// workspace rather than appearing full-size instantly), and shrinks
+/// back to nothing at the release point when dropped (landing in the
+/// new workspace or cancelling back into the old one) — both ends of
+/// the drag read as a deliberate motion instead of a teleport. Driven
+/// by the same `ANIM_TIMER` as the carousel/fade animations; see
+/// `on_animation_tick`.
+pub(crate) struct WindowPopAnim {
+    pub(crate) started: Instant,
+    pub(crate) hwnd: isize,
+    pub(crate) base_w: i32,
+    pub(crate) base_h: i32,
+    /// Screen point the ghost pops in/out around. For a pickup this
+    /// tracks the live cursor (read from `AppState::window_drag`
+    /// while the drag is still active); for a drop the drag is already
+    /// gone, so the release point is frozen here instead.
+    pub(crate) at: Option<(i32, i32)>,
+    /// `true` grows 0 -> full size (pickup); `false` shrinks full -> 0
+    /// (drop, whether the move landed or was cancelled).
+    pub(crate) growing: bool,
 }
 
 /// One row in the overview's search results.
@@ -594,6 +630,8 @@ pub(crate) fn close_overview(focus_after: Option<HWND>) {
                 state.carousel_anim = None;
                 state.carousel_close_after = None;
                 state.window_drag = None;
+                state.window_pop_anim = None;
+                state.hover_thumb = None;
                 state.search_query.clear();
                 Some(state.overview_hwnd)
             }
@@ -703,57 +741,84 @@ pub(crate) fn on_overview_drag_start(x: i32, y: i32) {
     // The click that starts this drag just re-activated (and re-raised)
     // the overview — put the bars back on top of it.
     raise_bars_topmost();
-    STATE.with(|s| {
-        if let Some(state) = s.borrow_mut().as_mut() {
-            if !matches!(state.overview, OverviewMode::Open { .. }) {
-                return;
-            }
-            // While searching, presses belong to the results panel
-            // (handled as clicks on release), not to dragging.
-            if !state.search_query.is_empty() {
-                return;
-            }
-            let thumb = {
-                let OverviewMode::Open { thumbs, .. } = &state.overview else {
-                    unreachable!()
-                };
-                let (card_rect, pitch) = card_layout();
-                thumbs.iter().find_map(|th| {
-                    let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
-                    (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then(|| {
-                        (
-                            th.hwnd.0 as isize,
-                            th.page,
-                            th.rect.right - th.rect.left,
-                            th.rect.bottom - th.rect.top,
-                        )
-                    })
-                })
+    let overview_hwnd = STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        let state = state_ref.as_mut()?;
+        if !matches!(state.overview, OverviewMode::Open { .. }) {
+            return None;
+        }
+        // While searching, presses belong to the results panel
+        // (handled as clicks on release), not to dragging.
+        if !state.search_query.is_empty() {
+            return None;
+        }
+        let thumb = {
+            let OverviewMode::Open { thumbs, .. } = &state.overview else {
+                unreachable!()
             };
-            match thumb {
-                Some((hwnd, from_page, base_w, base_h)) => {
-                    state.window_drag = Some(WindowDrag {
-                        hwnd,
-                        from_page,
-                        start_x: x,
-                        start_y: y,
-                        cur_x: x,
-                        cur_y: y,
-                        max_delta: 0,
-                        base_w,
-                        base_h,
-                    });
-                }
-                None => {
-                    state.carousel_drag = Some(CarouselDrag {
-                        start_x: x,
-                        start_offset: state.carousel_offset,
-                        max_delta: 0,
-                    });
-                }
+            let (card_rect, pitch) = card_layout();
+            thumbs.iter().find_map(|th| {
+                let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
+                (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then(|| {
+                    (
+                        th.hwnd.0 as isize,
+                        th.page,
+                        th.rect.right - th.rect.left,
+                        th.rect.bottom - th.rect.top,
+                    )
+                })
+            })
+        };
+        // Either kind of drag replaces the plain-hover glow with its
+        // own hover feedback (per-window ghost/pop, or per-card glow).
+        state.hover_thumb = None;
+        match thumb {
+            Some((hwnd, from_page, base_w, base_h)) => {
+                state.window_drag = Some(WindowDrag {
+                    hwnd,
+                    from_page,
+                    start_x: x,
+                    start_y: y,
+                    cur_x: x,
+                    cur_y: y,
+                    max_delta: 0,
+                    base_w,
+                    base_h,
+                    hover_page: Some(from_page),
+                    hover_started: Instant::now(),
+                });
+                // Pop the ghost into being rather than having it appear
+                // at full size instantly — the "snaps out of the
+                // workspace" feel the drag was missing.
+                state.window_pop_anim = Some(WindowPopAnim {
+                    started: Instant::now(),
+                    hwnd,
+                    base_w,
+                    base_h,
+                    at: None,
+                    growing: true,
+                });
+                Some(state.overview_hwnd)
+            }
+            None => {
+                state.carousel_drag = Some(CarouselDrag {
+                    start_x: x,
+                    start_offset: state.carousel_offset,
+                    max_delta: 0,
+                });
+                None
             }
         }
     });
+
+    if let Some(overview_hwnd) = overview_hwnd {
+        // SAFETY: `overview_hwnd` is a valid, process-lifetime window;
+        // keeps the pickup pop animating even if the pointer doesn't
+        // move again immediately.
+        unsafe {
+            SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+        }
+    }
 }
 
 /// Follows the pointer while a drag is active. A window drag just
@@ -768,11 +833,35 @@ pub(crate) fn on_overview_drag_move(x: i32, y: i32) {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
 
-        if let Some(drag) = state.window_drag.as_mut() {
+        if state.window_drag.is_some() {
+            // Hit-test which card (if any) the pointer sits over now,
+            // before taking `window_drag` mutably — needed for the
+            // hover glow's ease-in, which resets whenever the hovered
+            // card changes. Read-only pass over `state.overview`/
+            // `state.carousel_offset` first to avoid borrowing `state`
+            // both ways at once.
+            let hovered = match &state.overview {
+                OverviewMode::Open { cards, .. } => {
+                    let (card_rect, pitch) = card_layout();
+                    cards.iter().find_map(|c| {
+                        let r = displayed_rect(c.rect, c.page, state.carousel_offset, pitch, card_rect);
+                        (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(c.page)
+                    })
+                }
+                _ => None,
+            };
+
+            let Some(drag) = state.window_drag.as_mut() else {
+                unreachable!("just checked window_drag.is_some() above");
+            };
             drag.cur_x = x;
             drag.cur_y = y;
             let travel = (x - drag.start_x).abs().max((y - drag.start_y).abs());
             drag.max_delta = drag.max_delta.max(travel);
+            if drag.hover_page != hovered {
+                drag.hover_page = hovered;
+                drag.hover_started = Instant::now();
+            }
             return Some(state.overview_hwnd);
         }
 
@@ -789,6 +878,44 @@ pub(crate) fn on_overview_drag_move(x: i32, y: i32) {
     }
 }
 
+/// Plain pointer movement with no button held: tracks which window
+/// preview (if any) sits under the cursor so it can get the same
+/// ease-in glow as the drag-hover highlight, just so you can see what
+/// you're about to click. A no-op while a carousel or window drag is
+/// in progress — those already show their own hover feedback.
+pub(crate) fn on_overview_hover(x: i32, y: i32) {
+    let overview_hwnd = STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        let state = state_ref.as_mut()?;
+        if state.carousel_drag.is_some() || state.window_drag.is_some() {
+            return None;
+        }
+        let OverviewMode::Open { thumbs, .. } = &state.overview else {
+            return None;
+        };
+        let (card_rect, pitch) = card_layout();
+        let hovered = thumbs.iter().find_map(|th| {
+            let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
+            (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(th.hwnd.0 as isize)
+        });
+        if state.hover_thumb.map(|(hwnd, _)| hwnd) != hovered {
+            state.hover_thumb = hovered.map(|hwnd| (hwnd, Instant::now()));
+            Some(state.overview_hwnd)
+        } else {
+            None
+        }
+    });
+    if let Some(overview_hwnd) = overview_hwnd {
+        // SAFETY: `overview_hwnd` is a valid, process-lifetime window;
+        // keeps the glow easing in even if the pointer stops moving the
+        // instant it lands on a preview.
+        unsafe {
+            SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+        }
+        repaint_overview(overview_hwnd);
+    }
+}
+
 /// Ends whichever drag is active (or, if none — the button went down
 /// outside `Open`, or never moved past the click threshold — dispatches
 /// a plain click instead). A window drag released over a *different*
@@ -798,6 +925,13 @@ pub(crate) fn on_overview_drag_end(x: i32, y: i32) {
     let window_drag = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.window_drag.take()));
     if let Some(drag) = window_drag {
         if drag.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+            // Never actually became a visible drag — clear the pickup
+            // pop before it has a chance to flash on screen.
+            STATE.with(|s| {
+                if let Some(state) = s.borrow_mut().as_mut() {
+                    state.window_pop_anim = None;
+                }
+            });
             on_overview_click(x, y);
         } else {
             on_window_drop(drag, x, y);
@@ -860,10 +994,30 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
         Some((target, state.workspaces.current_index()))
     });
 
-    let overview_hwnd = STATE.with(|s| s.borrow().as_ref().map(|st| st.overview_hwnd));
+    // Either way — landed on a new workspace or cancelled back onto its
+    // own — the ghost pops back out of existence at the release point,
+    // mirroring the pop-in at pickup, rather than just vanishing.
+    let overview_hwnd = STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        let state = state_ref.as_mut()?;
+        state.window_pop_anim = Some(WindowPopAnim {
+            started: Instant::now(),
+            hwnd: drag.hwnd,
+            base_w: drag.base_w,
+            base_h: drag.base_h,
+            at: Some((x, y)),
+            growing: false,
+        });
+        Some(state.overview_hwnd)
+    });
+
     let Some((target, current)) = moved else {
-        // Cancelled: just erase the ghost.
+        // Cancelled: nothing to reassign, just let the pop-out play.
         if let Some(overview_hwnd) = overview_hwnd {
+            // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
+            unsafe {
+                SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+            }
             repaint_overview(overview_hwnd);
         }
         return;
@@ -877,6 +1031,13 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
     }
     rebuild_open_overview_pages();
     refresh_bar_indicator();
+
+    if let Some(overview_hwnd) = overview_hwnd {
+        // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
+        unsafe {
+            SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+        }
+    }
 }
 
 /// Left/Right arrow keys while the overview is idle-`Open`: slide the
@@ -1193,7 +1354,37 @@ pub(crate) fn paint_overview(hwnd: HWND) {
             zoom_rect(r, anchor_x, anchor_y, zoom)
         };
 
+        // Hover glow: the card currently under the pointer while a real
+        // window drag is in progress, with its ease-in intensity —
+        // computed before `cards` below is shadowed by its transformed
+        // (page-less) form.
+        let hover_glow = st.window_drag.as_ref().and_then(|d| {
+            if d.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+                return None;
+            }
+            let page = d.hover_page?;
+            let card = cards.iter().find(|c| c.page == page)?;
+            let intensity = ease_out(progress_dur(d.hover_started, WINDOW_HOVER_GLOW_DURATION));
+            Some((place(card.rect, card.page), intensity))
+        });
+
         let cards = cards.iter().map(|c| place(c.rect, c.page)).collect::<Vec<_>>();
+        // A window mid-pop (pickup growing in, or drop-out shrinking
+        // away) is never rendered in its normal grid slot at the same
+        // time as its ghost — one or the other, never both. A window
+        // being dragged (past the click threshold) is excluded the
+        // same way, for the same reason.
+        let excluded_hwnd = st
+            .window_pop_anim
+            .as_ref()
+            .map(|p| p.hwnd)
+            .or_else(|| {
+                st.window_drag
+                    .as_ref()
+                    .filter(|d| d.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX)
+                    .map(|d| d.hwnd)
+            });
+
         // Every window preview is one of our snapshots (park-time for
         // parked windows, open-time for the current workspace's — see
         // `build_carousel_pages`); a title chip is the last-resort
@@ -1203,8 +1394,11 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         let mut snapshots: Vec<(RECT, i32, i32, isize)> = Vec::new();
         let mut placeholders: Vec<(RECT, String)> = Vec::new();
         for th in thumbs.iter() {
-            let rect = place(th.rect, th.page);
             let hwnd = th.hwnd.0 as isize;
+            if excluded_hwnd == Some(hwnd) {
+                continue;
+            }
+            let rect = place(th.rect, th.page);
             if window_snapshot(hwnd).is_some() {
                 snapshots.push((rect, th.rect.right - th.rect.left, th.rect.bottom - th.rect.top, hwnd));
             } else {
@@ -1213,15 +1407,43 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         }
         let icons = thumbs
             .iter()
+            .filter(|th| excluded_hwnd != Some(th.hwnd.0 as isize))
             .filter_map(|th| th.icon.map(|icon| (place(th.icon_rect, th.page), icon)))
             .collect::<Vec<_>>();
-        let ghost = st
+
+        // The ghost itself: a live drag follows the cursor at full size
+        // unless a pickup pop is still growing in (then it scales up
+        // from nothing); once the drag ends, a drop-out pop shrinks it
+        // back to nothing at the frozen release point. `None` once
+        // neither is active.
+        let ghost = if let Some(drag) = st
             .window_drag
             .as_ref()
             .filter(|d| d.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX)
-            .map(|d| (d.cur_x, d.cur_y, d.base_w, d.base_h, d.hwnd));
+        {
+            let scale = match &st.window_pop_anim {
+                Some(p) if p.growing && p.hwnd == drag.hwnd => {
+                    ease_out(progress_dur(p.started, WINDOW_POP_DURATION))
+                }
+                _ => 1.0,
+            };
+            Some((drag.cur_x, drag.cur_y, drag.base_w, drag.base_h, drag.hwnd, scale))
+        } else {
+            st.window_pop_anim.as_ref().filter(|p| !p.growing).and_then(|p| {
+                let (x, y) = p.at?;
+                let scale = 1.0 - ease_out(progress_dur(p.started, WINDOW_POP_DURATION));
+                Some((x, y, p.base_w, p.base_h, p.hwnd, scale))
+            })
+        };
+        // The plain (not-dragging) hover glow around whichever preview
+        // the pointer currently sits on, if any.
+        let thumb_hover_glow = st.hover_thumb.and_then(|(hovered_hwnd, started)| {
+            let th = thumbs.iter().find(|t| t.hwnd.0 as isize == hovered_hwnd)?;
+            let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
+            Some((place(th.rect, th.page), intensity))
+        });
         let search = (!st.search_query.is_empty()).then(|| st.search_query.clone());
-        Some((cards, snapshots, placeholders, icons, ghost, search))
+        Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, search))
     });
 
     // Double-buffered: everything is composed into a memory bitmap and
@@ -1249,7 +1471,7 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         FillRect(mem, &client, backdrop_brush);
         let _ = DeleteObject(backdrop_brush);
 
-        if let Some((cards, snapshots, placeholders, icons, ghost, search)) = content {
+        if let Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, search)) = content {
             let dpi = reference_dpi();
             let card_radius = scaled(CARD_CORNER_RADIUS, dpi);
             let thumb_radius = scaled(THUMB_CORNER_RADIUS, dpi);
@@ -1279,6 +1501,15 @@ pub(crate) fn paint_overview(hwnd: HWND) {
                 let _ = DeleteObject(clip);
             }
             let _ = DeleteObject(fallback_brush);
+
+            // Hover glow: a light-blue outline easing in around whatever
+            // card the pointer sits over while dragging a window (see
+            // `WindowDrag::hover_page`/`hover_started`).
+            if let Some((rect, intensity)) = hover_glow {
+                if intensity > 0.001 {
+                    draw_glow_border(mem, rect, card_radius, intensity);
+                }
+            }
 
             // Window previews: shadow, then the pre-scaled snapshot
             // (see `slot_scaled_snapshot` — per-frame stretching of
@@ -1357,6 +1588,15 @@ pub(crate) fn paint_overview(hwnd: HWND) {
                 let _ = DrawIconEx(mem, rect.left, rect.top, *icon, size, size, 0, None, DI_NORMAL);
             }
 
+            // Plain hover glow: just browsing, not dragging anything —
+            // a light-blue outline easing in around whatever preview
+            // the pointer currently sits on.
+            if let Some((rect, intensity)) = thumb_hover_glow {
+                if intensity > 0.001 {
+                    draw_glow_border(mem, rect, thumb_radius, intensity);
+                }
+            }
+
             // Type-to-search results panel, over everything else.
             if let Some(query) = &search {
                 let results = search_results(query);
@@ -1421,34 +1661,40 @@ pub(crate) fn paint_overview(hwnd: HWND) {
             }
 
             // The dragged window's ghost, last so it rides above all.
-            if let Some((cx, cy, base_w, base_h, drag_hwnd)) = ghost {
-                if let Some(bitmap) = slot_scaled_snapshot(drag_hwnd, base_w, base_h) {
-                    let gw = base_w * 3 / 5;
-                    let gh = base_h * 3 / 5;
-                    let rect = RECT {
-                        left: cx - gw / 2,
-                        top: cy - gh / 2,
-                        right: cx + gw / 2,
-                        bottom: cy + gh / 2,
-                    };
-                    draw_shadow(mem, rect, thumb_radius, 4);
-                    let src = CreateCompatibleDC(hdc);
-                    let previous_src = SelectObject(src, HBITMAP(bitmap as *mut c_void));
-                    let _ = StretchBlt(
-                        mem,
-                        rect.left,
-                        rect.top,
-                        gw,
-                        gh,
-                        src,
-                        0,
-                        0,
-                        base_w,
-                        base_h,
-                        SRCCOPY,
-                    );
-                    SelectObject(src, previous_src);
-                    let _ = DeleteDC(src);
+            // `scale` eases 0 -> 1 on pickup and 1 -> 0 on drop (see
+            // `WindowPopAnim`); the ghost's nominal size is 3/5 of its
+            // grid slot, so `scale` shrinks that further rather than
+            // ever exceeding it.
+            if let Some((cx, cy, base_w, base_h, drag_hwnd, scale)) = ghost {
+                if scale > 0.001 {
+                    if let Some(bitmap) = slot_scaled_snapshot(drag_hwnd, base_w, base_h) {
+                        let gw = ((base_w * 3 / 5) as f64 * scale).round() as i32;
+                        let gh = ((base_h * 3 / 5) as f64 * scale).round() as i32;
+                        let rect = RECT {
+                            left: cx - gw / 2,
+                            top: cy - gh / 2,
+                            right: cx + gw / 2,
+                            bottom: cy + gh / 2,
+                        };
+                        draw_shadow(mem, rect, thumb_radius, 4);
+                        let src = CreateCompatibleDC(hdc);
+                        let previous_src = SelectObject(src, HBITMAP(bitmap as *mut c_void));
+                        let _ = StretchBlt(
+                            mem,
+                            rect.left,
+                            rect.top,
+                            gw,
+                            gh,
+                            src,
+                            0,
+                            0,
+                            base_w,
+                            base_h,
+                            SRCCOPY,
+                        );
+                        SelectObject(src, previous_src);
+                        let _ = DeleteDC(src);
+                    }
                 }
             }
         }
@@ -1487,6 +1733,48 @@ unsafe fn draw_shadow(hdc: HDC, rect: RECT, radius: i32, layers: i32) {
             rect.top - spread + 3,
             rect.right + spread,
             rect.bottom + spread + 3,
+            (radius + spread) * 2,
+            (radius + spread) * 2,
+        );
+        SelectObject(hdc, previous_pen);
+        let _ = DeleteObject(pen);
+    }
+    SelectObject(hdc, previous_brush);
+}
+
+/// A light-blue glow ring just outside a card's edge, for the
+/// drag-hover highlight — the same hollow-rings trick as `draw_shadow`,
+/// but tinted blue and with `intensity` (0..1, the glow's ease-in
+/// progress) fading every ring toward the backdrop color instead of a
+/// fixed brightness, so the whole glow visibly grows in rather than
+/// snapping on at full strength.
+///
+/// SAFETY: `hdc` must be a valid memory DC currently being painted into.
+unsafe fn draw_glow_border(hdc: HDC, rect: RECT, radius: i32, intensity: f64) {
+    const LAYERS: i32 = 5;
+    let hollow_brush = GetStockObject(HOLLOW_BRUSH);
+    let previous_brush = SelectObject(hdc, hollow_brush);
+    for i in 0..LAYERS {
+        let spread = i + 1;
+        // Innermost ring brightest; backdrop gray (0x40) faded toward a
+        // light blue (0x60A8FF), then the whole ring's alpha-equivalent
+        // scaled by `intensity` by blending further back toward 0x40.
+        let t = 1.0 - (i as f64 / LAYERS as f64);
+        let mix = |backdrop: u32, full: u32| -> u32 {
+            let eased = backdrop as f64 + (full as f64 - backdrop as f64) * t * intensity;
+            eased.round().clamp(0.0, 255.0) as u32
+        };
+        let r = mix(0x40, 0x60);
+        let g = mix(0x40, 0xA8);
+        let b = mix(0x40, 0xFF);
+        let pen = CreatePen(PS_SOLID, 2, COLORREF(r | (g << 8) | (b << 16)));
+        let previous_pen = SelectObject(hdc, pen);
+        let _ = RoundRect(
+            hdc,
+            rect.left - spread,
+            rect.top - spread,
+            rect.right + spread,
+            rect.bottom + spread,
             (radius + spread) * 2,
             (radius + spread) * 2,
         );
@@ -1833,6 +2121,16 @@ pub(crate) fn on_animation_tick() {
             }
         }
 
+        // The window pop (pickup grow-in / drop shrink-out) just needs
+        // to expire once its duration elapses — `paint_overview` reads
+        // `started`/`growing` directly and computes the current scale
+        // itself, so there's nothing to advance here, only to clear.
+        if let Some(anim) = &state.window_pop_anim {
+            if progress_dur(anim.started, WINDOW_POP_DURATION) >= 1.0 {
+                state.window_pop_anim = None;
+            }
+        }
+
         let mode = std::mem::replace(&mut state.overview, OverviewMode::Closed);
         let (new_mode, fade_alpha, fade_running, completion) = match mode {
             OverviewMode::Opening { started, thumbs, cards } => {
@@ -1864,7 +2162,21 @@ pub(crate) fn on_animation_tick() {
         state.overview = new_mode;
 
         let carousel_close_after = if carousel_done { state.carousel_close_after.take() } else { None };
-        let keep_timer = fade_running || state.carousel_anim.is_some();
+        // Both hover glows (per-card while dragging a window, per-thumb
+        // while just browsing) ease in continuously, so the timer needs
+        // to keep running for those too, not just for the pop animation.
+        let card_hover_easing = state
+            .window_drag
+            .as_ref()
+            .is_some_and(|d| d.hover_page.is_some() && progress_dur(d.hover_started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
+        let thumb_hover_easing = state
+            .hover_thumb
+            .is_some_and(|(_, started)| progress_dur(started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
+        let keep_timer = fade_running
+            || state.carousel_anim.is_some()
+            || state.window_pop_anim.is_some()
+            || card_hover_easing
+            || thumb_hover_easing;
         Some((state.overview_hwnd, fade_alpha, completion, carousel_close_after, keep_timer))
     });
 

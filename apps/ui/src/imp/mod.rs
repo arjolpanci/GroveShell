@@ -40,8 +40,8 @@ use calendar::{hide_calendar, paint_calendar, CAL_HEIGHT, CAL_WIDTH};
 use monitors::{enumerate_monitors, monitor_index_for_center, monitors_sorted_by_x};
 use overview::{
     close_overview, on_animation_tick, on_overview_arrow, on_overview_char,
-    on_overview_drag_end, on_overview_drag_move, on_overview_drag_start, paint_overview,
-    repaint_overview, OverviewMode,
+    on_overview_drag_end, on_overview_drag_move, on_overview_drag_start, on_overview_hover,
+    paint_overview, repaint_overview, OverviewMode,
 };
 use quick_settings::{
     adjust_volume, hide_quick_settings, paint_quick_settings, toggle_mute, QS_HEIGHT,
@@ -374,6 +374,8 @@ pub fn main() -> Result<()> {
                 carousel_anim: None,
                 carousel_close_after: None,
                 window_drag: None,
+                window_pop_anim: None,
+                hover_thumb: None,
                 search_query: String::new(),
                 window_registry: WindowRegistry::new(),
             });
@@ -491,10 +493,12 @@ unsafe extern "system" fn wndproc(
         }
         WM_MOUSEMOVE => {
             if let Role::Overview = role {
+                let x = (lparam.0 & 0xFFFF) as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                 if wparam.0 & (MK_LBUTTON.0 as usize) != 0 {
-                    let x = (lparam.0 & 0xFFFF) as i32;
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     on_overview_drag_move(x, y);
+                } else {
+                    on_overview_hover(x, y);
                 }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)

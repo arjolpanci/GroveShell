@@ -3,13 +3,14 @@
 //! used to dispatch messages in `wndproc`.
 
 use std::cell::RefCell;
+use std::time::Instant;
 
 use windows::Win32::Foundation::{HWND, RECT};
 
 use groveshell_window_model::registry::WindowRegistry;
 use groveshell_window_model::workspace::WorkspaceTracker;
 
-use super::overview::{CarouselAnim, CarouselDrag, OverviewMode, WindowDrag};
+use super::overview::{CarouselAnim, CarouselDrag, OverviewMode, WindowDrag, WindowPopAnim};
 
 /// Half of the original 32px guess — the Windows taskbar itself is
 /// ~40px, but this shell is meant to feel closer to GNOME's slim bar;
@@ -103,6 +104,17 @@ pub(crate) struct AppState {
     /// A window preview being dragged between workspace cards (mutually
     /// exclusive with `carousel_drag` — whichever the press landed on).
     pub(crate) window_drag: Option<WindowDrag>,
+    /// The dragged window's pickup/drop pop animation — independent of
+    /// `window_drag` itself so the pop-out-on-drop animation can keep
+    /// playing for a moment after the drag has actually ended.
+    pub(crate) window_pop_anim: Option<WindowPopAnim>,
+    /// The window preview currently under the pointer while just
+    /// browsing (not dragging anything) — hwnd plus when hovering it
+    /// started, for the same ease-in glow used while dragging (see
+    /// `WINDOW_HOVER_GLOW_DURATION`). `None` when the pointer isn't
+    /// over any preview, or while a carousel/window drag is active
+    /// (those have their own hover feedback).
+    pub(crate) hover_thumb: Option<(isize, Instant)>,
     /// Live text of the overview's type-to-search; empty = search off.
     pub(crate) search_query: String,
     /// Stable identity across HWND reuse (see `registry`): consulted by
