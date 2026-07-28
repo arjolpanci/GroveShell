@@ -115,6 +115,7 @@ mod imp {
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
+    use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::SystemServices::MK_LBUTTON;
@@ -127,11 +128,14 @@ mod imp {
         VK_LEFT, VK_RIGHT,
     };
     use windows::Win32::UI::Shell::{
-        SHAppBarMessage, ABE_TOP, ABM_GETSTATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS,
-        ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA,
+        SHAppBarMessage, ShellExecuteW, ABE_TOP, ABM_GETSTATE, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE,
+        ABM_SETPOS, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA,
     };
     use windows::Win32::UI::WindowsAndMessaging::*;
 
+    use std::os::windows::ffi::OsStrExt;
+
+    use groveshell_window_model::registry::WindowRegistry;
     use groveshell_window_model::workspace::{WorkspaceId, WorkspaceTracker};
 
     /// Half of the original 32px guess — the Windows taskbar itself is
@@ -158,6 +162,18 @@ mod imp {
     const ANIM_TIMER_INTERVAL_MS: u32 = 16;
     /// Refreshes the primary bar's clock text once a second.
     const CLOCK_TIMER_ID: usize = 2;
+    /// One-shot debounce for WinEvent-driven window re-syncs: bursts of
+    /// create/destroy/show/hide events (an app opening ten windows, a
+    /// teardown cascade) collapse into a single `sync_workspaces` pass.
+    const SYNC_TIMER_ID: usize = 3;
+    const SYNC_DEBOUNCE_MS: u32 = 250;
+
+    /// Overview search: cap on rendered results, and 96-DPI layout metrics
+    /// for the results panel (see `search_layout`).
+    const SEARCH_MAX_RESULTS: usize = 8;
+    const SEARCH_PANEL_WIDTH: i32 = 640;
+    const SEARCH_ROW_HEIGHT: i32 = 36;
+    const SEARCH_PANEL_GAP: i32 = 14;
 
     const CAL_WIDTH: i32 = 320;
     const CAL_CALENDAR_HEIGHT: i32 = 300;
@@ -525,6 +541,42 @@ mod imp {
         /// (focusing this window) once it lands, rather than just
         /// re-centering on the target page.
         carousel_close_after: Option<HWND>,
+        /// A window preview being dragged between workspace cards (mutually
+        /// exclusive with `carousel_drag` — whichever the press landed on).
+        window_drag: Option<WindowDrag>,
+        /// Live text of the overview's type-to-search; empty = search off.
+        search_query: String,
+        /// Stable identity across HWND reuse (see `registry`): consulted by
+        /// `sync_workspaces` so a recycled handle doesn't inherit the dead
+        /// window's workspace assignment or snapshot.
+        window_registry: WindowRegistry,
+    }
+
+    /// One window preview being dragged between cards in the overview.
+    struct WindowDrag {
+        hwnd: isize,
+        from_page: usize,
+        start_x: i32,
+        start_y: i32,
+        cur_x: i32,
+        cur_y: i32,
+        /// Peak pointer travel, for the click-vs-drag threshold (same idea
+        /// as `CarouselDrag::max_delta`).
+        max_delta: i32,
+        /// Untransformed slot size — the key into the pre-scaled snapshot
+        /// cache used to paint the drag ghost.
+        base_w: i32,
+        base_h: i32,
+    }
+
+    /// One row in the overview's search results.
+    enum SearchResult {
+        /// An open window: activating switches to its workspace and
+        /// focuses it.
+        Window { hwnd: isize, title: String },
+        /// An installed application (a Start Menu shortcut): activating
+        /// launches it.
+        App { name: String, path: std::path::PathBuf },
     }
 
     thread_local! {
@@ -961,6 +1013,9 @@ mod imp {
                     carousel_drag: None,
                     carousel_anim: None,
                     carousel_close_after: None,
+                    window_drag: None,
+                    search_query: String::new(),
+                    window_registry: WindowRegistry::new(),
                 });
             });
 
@@ -995,6 +1050,8 @@ mod imp {
                 MOD_CONTROL | MOD_ALT | MOD_SHIFT,
                 VK_RIGHT.0 as u32,
             );
+
+            install_win_event_hooks();
 
             let mut msg = MSG::default();
             while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -1450,12 +1507,224 @@ mod imp {
         }
     }
 
-    /// Draws every workspace card (wallpaper-filled — see
-    /// `draw_wallpaper_into`) at its current carousel-shifted position,
-    /// then each window's grid-slot content: a placeholder chip with title
-    /// for anything without a live thumbnail (DWM draws live ones directly,
-    /// this process never touches their pixels), and every slot's icon
-    /// badge regardless of live/placeholder.
+    thread_local! {
+        /// Installed-application index for overview search: display name +
+        /// launchable path for every Start Menu `.lnk`, both per-user and
+        /// all-users. Built lazily on first search and kept for the process
+        /// lifetime — apps installed mid-session just don't show up until
+        /// restart, an acceptable staleness for a launcher.
+        static APP_INDEX: RefCell<Option<Vec<(String, std::path::PathBuf)>>> =
+            const { RefCell::new(None) };
+    }
+
+    fn collect_shortcuts(dir: &std::path::Path, out: &mut Vec<(String, std::path::PathBuf)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_shortcuts(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    out.push((stem.to_string(), path));
+                }
+            }
+        }
+    }
+
+    fn app_index_matches(query_lower: &str, limit: usize) -> Vec<(String, std::path::PathBuf)> {
+        APP_INDEX.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            let index = cache.get_or_insert_with(|| {
+                let mut apps = Vec::new();
+                for base in [
+                    std::env::var_os("APPDATA").map(std::path::PathBuf::from),
+                    std::env::var_os("ProgramData").map(std::path::PathBuf::from),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    collect_shortcuts(&base.join(r"Microsoft\Windows\Start Menu\Programs"), &mut apps);
+                }
+                apps.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+                apps.dedup_by(|a, b| a.0.eq_ignore_ascii_case(&b.0));
+                apps
+            });
+            index
+                .iter()
+                .filter(|(name, _)| name.to_lowercase().contains(query_lower))
+                .take(limit)
+                .cloned()
+                .collect()
+        })
+    }
+
+    /// Open windows whose title or exe matches, then installed apps whose
+    /// name matches — capped at `SEARCH_MAX_RESULTS`, windows first since
+    /// switching beats launching a duplicate.
+    fn search_results(query: &str) -> Vec<SearchResult> {
+        let q = query.to_lowercase();
+        let tracked: Vec<isize> = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| {
+                    st.workspaces
+                        .workspace_ids()
+                        .to_vec()
+                        .into_iter()
+                        .flat_map(|id| st.workspaces.windows_on(id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+
+        let mut results = Vec::new();
+        for hwnd in tracked {
+            let Some(record) = groveshell_window_model::describe(hwnd) else {
+                continue;
+            };
+            let title_match = record.title.to_lowercase().contains(&q);
+            let exe_match = record
+                .exe_name
+                .as_deref()
+                .is_some_and(|e| e.to_lowercase().contains(&q));
+            if title_match || exe_match {
+                results.push(SearchResult::Window { hwnd, title: record.title });
+            }
+            if results.len() >= SEARCH_MAX_RESULTS {
+                return results;
+            }
+        }
+        for (name, path) in app_index_matches(&q, SEARCH_MAX_RESULTS - results.len()) {
+            results.push(SearchResult::App { name, path });
+        }
+        results
+    }
+
+    /// The search panel's rects in overview-client coordinates: the panel
+    /// itself, then one rect per result row. Row 0 of `rows` is the header
+    /// line showing the query. Pure function of dpi + row count so painting
+    /// and click hit-testing can't disagree.
+    fn search_layout(dpi: u32, result_count: usize) -> (RECT, Vec<RECT>) {
+        let (card, _) = card_layout();
+        let width = scaled(SEARCH_PANEL_WIDTH, dpi);
+        let row_h = scaled(SEARCH_ROW_HEIGHT, dpi);
+        let left = (card.left + card.right) / 2 - width / 2;
+        let top = scaled(BAR_HEIGHT + SEARCH_PANEL_GAP, dpi);
+        let rows: Vec<RECT> = (0..result_count + 1)
+            .map(|i| RECT {
+                left,
+                top: top + row_h * i as i32,
+                right: left + width,
+                bottom: top + row_h * (i as i32 + 1),
+            })
+            .collect();
+        let panel = RECT {
+            left,
+            top,
+            right: left + width,
+            bottom: top + row_h * (result_count as i32 + 1),
+        };
+        (panel, rows)
+    }
+
+    fn activate_search_result(result: SearchResult) {
+        STATE.with(|s| {
+            if let Some(state) = s.borrow_mut().as_mut() {
+                state.search_query.clear();
+            }
+        });
+        match result {
+            SearchResult::Window { hwnd, .. } => {
+                let target = STATE.with(|s| {
+                    let state_ref = s.borrow();
+                    let st = state_ref.as_ref()?;
+                    let id = st.workspaces.workspace_of(hwnd)?;
+                    let page = st.workspaces.index_of(id)?;
+                    Some((page, st.workspaces.current_index()))
+                });
+                let handle = HWND(hwnd as *mut c_void);
+                match target {
+                    Some((page, current)) if page != current => snap_carousel_to(page, Some(handle)),
+                    _ => close_overview(Some(handle)),
+                }
+            }
+            SearchResult::App { path, .. } => {
+                let wide: Vec<u16> = path
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(std::iter::once(0))
+                    .collect();
+                // SAFETY: `wide` is nul-terminated and outlives the call;
+                // ShellExecuteW is fire-and-forget here.
+                unsafe {
+                    let _ = ShellExecuteW(
+                        HWND(std::ptr::null_mut()),
+                        w!("open"),
+                        PCWSTR(wide.as_ptr()),
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        SW_SHOWNORMAL,
+                    );
+                }
+                close_overview(None);
+            }
+        }
+    }
+
+    /// A printable keystroke (or backspace/Enter) while the overview is
+    /// open — GNOME-style type-to-search, no click into a box needed.
+    fn on_overview_char(ch: u32) {
+        enum Action {
+            Repaint,
+            ActivateFirst(String),
+            Nothing,
+        }
+        let (action, overview_hwnd) = STATE.with(|s| {
+            let mut state_ref = s.borrow_mut();
+            let Some(state) = state_ref.as_mut() else {
+                return (Action::Nothing, None);
+            };
+            if !matches!(state.overview, OverviewMode::Open { .. }) {
+                return (Action::Nothing, None);
+            }
+            let hwnd = state.overview_hwnd;
+            match ch {
+                0x08 => {
+                    state.search_query.pop();
+                    (Action::Repaint, Some(hwnd))
+                }
+                0x0D if !state.search_query.is_empty() => {
+                    (Action::ActivateFirst(state.search_query.clone()), Some(hwnd))
+                }
+                c => match char::from_u32(c).filter(|c| !c.is_control()) {
+                    Some(c) if state.search_query.chars().count() < 64 => {
+                        state.search_query.push(c);
+                        (Action::Repaint, Some(hwnd))
+                    }
+                    _ => (Action::Nothing, None),
+                },
+            }
+        });
+        match action {
+            Action::ActivateFirst(query) => {
+                if let Some(first) = search_results(&query).into_iter().next() {
+                    activate_search_result(first);
+                }
+                if let Some(overview_hwnd) = overview_hwnd {
+                    repaint_overview(overview_hwnd);
+                }
+            }
+            Action::Repaint => {
+                if let Some(overview_hwnd) = overview_hwnd {
+                    repaint_overview(overview_hwnd);
+                }
+            }
+            Action::Nothing => {}
+        }
+    }
+
     fn paint_overview(hwnd: HWND) {
         let content = STATE.with(|s| {
             let state = s.borrow();
@@ -1512,7 +1781,13 @@ mod imp {
                 .iter()
                 .filter_map(|th| th.icon.map(|icon| (place(th.icon_rect, th.page), icon)))
                 .collect::<Vec<_>>();
-            Some((cards, snapshots, placeholders, icons))
+            let ghost = st
+                .window_drag
+                .as_ref()
+                .filter(|d| d.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX)
+                .map(|d| (d.cur_x, d.cur_y, d.base_w, d.base_h, d.hwnd));
+            let search = (!st.search_query.is_empty()).then(|| st.search_query.clone());
+            Some((cards, snapshots, placeholders, icons, ghost, search))
         });
 
         // Double-buffered: everything is composed into a memory bitmap and
@@ -1540,7 +1815,7 @@ mod imp {
             FillRect(mem, &client, backdrop_brush);
             let _ = DeleteObject(backdrop_brush);
 
-            if let Some((cards, snapshots, placeholders, icons)) = content {
+            if let Some((cards, snapshots, placeholders, icons, ghost, search)) = content {
                 let dpi = reference_dpi();
                 let card_radius = scaled(CARD_CORNER_RADIUS, dpi);
                 let thumb_radius = scaled(THUMB_CORNER_RADIUS, dpi);
@@ -1646,6 +1921,104 @@ mod imp {
                 for (rect, icon) in &icons {
                     let size = rect.right - rect.left;
                     let _ = DrawIconEx(mem, rect.left, rect.top, *icon, size, size, 0, None, DI_NORMAL);
+                }
+
+                // Type-to-search results panel, over everything else.
+                if let Some(query) = &search {
+                    let results = search_results(query);
+                    let (panel, rows) = search_layout(dpi, results.len());
+                    draw_shadow(mem, panel, thumb_radius, 4);
+                    let panel_brush = CreateSolidBrush(COLORREF(0x002A2A2A));
+                    let null_pen = GetStockObject(NULL_PEN);
+                    let previous_brush = SelectObject(mem, panel_brush);
+                    let previous_pen = SelectObject(mem, null_pen);
+                    let _ = RoundRect(
+                        mem,
+                        panel.left,
+                        panel.top,
+                        panel.right,
+                        panel.bottom,
+                        thumb_radius * 2,
+                        thumb_radius * 2,
+                    );
+                    SelectObject(mem, previous_pen);
+                    SelectObject(mem, previous_brush);
+                    let _ = DeleteObject(panel_brush);
+
+                    // First result gets a highlight — it's what Enter runs.
+                    if !results.is_empty() {
+                        let hl_brush = CreateSolidBrush(COLORREF(0x003C3C3C));
+                        FillRect(mem, &rows[1], hl_brush);
+                        let _ = DeleteObject(hl_brush);
+                    }
+
+                    let font = bar_font(dpi);
+                    let previous_font = SelectObject(mem, font);
+                    SetBkMode(mem, TRANSPARENT);
+                    let pad = scaled(12, dpi);
+                    let inset = |r: &RECT| RECT {
+                        left: r.left + pad,
+                        top: r.top,
+                        right: r.right - pad,
+                        bottom: r.bottom,
+                    };
+                    SetTextColor(mem, COLORREF(0x00A0A0A0));
+                    draw_text_in(
+                        mem,
+                        inset(&rows[0]),
+                        &format!("Search: {query}"),
+                        DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                    );
+                    SetTextColor(mem, COLORREF(0x00E0E0E0));
+                    if results.is_empty() {
+                        // Nothing matched; the header row alone says why.
+                    }
+                    for (i, result) in results.iter().enumerate() {
+                        let label = match result {
+                            SearchResult::Window { title, .. } => title.clone(),
+                            SearchResult::App { name, .. } => format!("{name}  (launch)"),
+                        };
+                        draw_text_in(
+                            mem,
+                            inset(&rows[i + 1]),
+                            &label,
+                            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                        );
+                    }
+                    SelectObject(mem, previous_font);
+                    let _ = DeleteObject(font);
+                }
+
+                // The dragged window's ghost, last so it rides above all.
+                if let Some((cx, cy, base_w, base_h, drag_hwnd)) = ghost {
+                    if let Some(bitmap) = slot_scaled_snapshot(drag_hwnd, base_w, base_h) {
+                        let gw = base_w * 3 / 5;
+                        let gh = base_h * 3 / 5;
+                        let rect = RECT {
+                            left: cx - gw / 2,
+                            top: cy - gh / 2,
+                            right: cx + gw / 2,
+                            bottom: cy + gh / 2,
+                        };
+                        draw_shadow(mem, rect, thumb_radius, 4);
+                        let src = CreateCompatibleDC(hdc);
+                        let previous_src = SelectObject(src, HBITMAP(bitmap as *mut c_void));
+                        let _ = StretchBlt(
+                            mem,
+                            rect.left,
+                            rect.top,
+                            gw,
+                            gh,
+                            src,
+                            0,
+                            0,
+                            base_w,
+                            base_h,
+                            SRCCOPY,
+                        );
+                        SelectObject(src, previous_src);
+                        let _ = DeleteDC(src);
+                    }
                 }
             }
 
@@ -2217,12 +2590,138 @@ mod imp {
         }
     }
 
+    thread_local! {
+        /// Live WinEvent hook handles, kept only so `WM_DESTROY` can
+        /// unhook them explicitly (the OS would also drop them at process
+        /// exit; this keeps shutdown symmetrical with startup).
+        static WIN_EVENT_HOOKS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Live window tracking (Phase 1): out-of-context WinEvent hooks,
+    /// delivered as messages on this UI thread. Three hooks:
+    /// create/destroy/show/hide (one contiguous range), name changes, and
+    /// foreground changes. The first two just mark the window model dirty
+    /// (see `schedule_window_sync` — bursts coalesce into one re-sync);
+    /// foreground gets its own immediate handler so that activating a
+    /// parked window (taskbar-less Alt+Tab still exists) switches to its
+    /// workspace instead of focusing something invisible.
+    fn install_win_event_hooks() {
+        const EVENT_OBJECT_CREATE: u32 = 0x8000;
+        const EVENT_OBJECT_HIDE: u32 = 0x8003;
+        const EVENT_OBJECT_NAMECHANGE: u32 = 0x800C;
+        const EVENT_SYSTEM_FOREGROUND: u32 = 0x0003;
+        const WINEVENT_OUTOFCONTEXT: u32 = 0x0000;
+        const WINEVENT_SKIPOWNPROCESS: u32 = 0x0002;
+
+        let ranges = [
+            (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
+            (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
+            (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+        ];
+        for (min, max) in ranges {
+            // SAFETY: `win_event_proc` is a valid WINEVENTPROC for the
+            // process lifetime; out-of-context hooks deliver on this
+            // thread's message loop, so the callback shares thread-affine
+            // state safely.
+            let hook = unsafe {
+                SetWinEventHook(
+                    min,
+                    max,
+                    None,
+                    Some(win_event_proc),
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+                )
+            };
+            if !hook.is_invalid() {
+                WIN_EVENT_HOOKS.with(|h| h.borrow_mut().push(hook.0 as isize));
+            }
+        }
+    }
+
+    fn uninstall_win_event_hooks() {
+        let hooks = WIN_EVENT_HOOKS.with(|h| std::mem::take(&mut *h.borrow_mut()));
+        for hook in hooks {
+            // SAFETY: each handle came from `SetWinEventHook` above and is
+            // unhooked at most once.
+            unsafe {
+                let _ = UnhookWinEvent(HWINEVENTHOOK(hook as *mut c_void));
+            }
+        }
+    }
+
+    unsafe extern "system" fn win_event_proc(
+        _hook: HWINEVENTHOOK,
+        event: u32,
+        hwnd: HWND,
+        id_object: i32,
+        id_child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        // Only whole-window events for real windows; child-object noise
+        // (menus, scrollbars, accessibility subtrees) vastly outnumbers
+        // them. OBJID_WINDOW == 0, CHILDID_SELF == 0.
+        if hwnd.0.is_null() || id_object != 0 || id_child != 0 {
+            return;
+        }
+        if event == 0x0003 {
+            on_foreground_changed(hwnd);
+        } else {
+            schedule_window_sync();
+        }
+    }
+
+    /// Marks the window model dirty; the actual re-sync runs once the
+    /// event burst quiets down (`SYNC_TIMER_ID` in `wndproc` — re-setting
+    /// an existing timer restarts it, which is the debounce).
+    fn schedule_window_sync() {
+        let primary = STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
+        if let Some(primary) = primary {
+            // SAFETY: `primary` is a valid, process-lifetime window.
+            unsafe {
+                SetTimer(primary, SYNC_TIMER_ID, SYNC_DEBOUNCE_MS, None);
+            }
+        }
+    }
+
+    /// The debounced sync itself: reconcile the tracker, refresh the bar's
+    /// workspace dots (a new window can grow the dynamic tail), and rebuild
+    /// the overview's pages if it's open.
+    fn on_window_sync_timer(bar_hwnd: HWND) {
+        // SAFETY: `bar_hwnd` is the window whose timer just fired.
+        unsafe {
+            let _ = KillTimer(bar_hwnd, SYNC_TIMER_ID);
+        }
+        sync_workspaces();
+        refresh_bar_indicator();
+        rebuild_open_overview_pages();
+    }
+
+    /// A window from another process just became foreground. If it lives
+    /// on a non-current workspace (still reachable through Alt+Tab), follow
+    /// it there — its parked position would otherwise leave the user
+    /// staring at a focused window they can't see.
+    fn on_foreground_changed(hwnd: HWND) {
+        let target = STATE.with(|s| {
+            let state_ref = s.borrow();
+            let st = state_ref.as_ref()?;
+            let id = st.workspaces.workspace_of(hwnd.0 as isize)?;
+            let index = st.workspaces.index_of(id)?;
+            (index != st.workspaces.current_index()).then_some(index)
+        });
+        if let Some(index) = target {
+            commit_workspace_switch(index);
+        }
+    }
+
     /// Re-syncs the workspace tracker against reality — assigns any
     /// currently-visible-but-untracked window and drops assignments for
-    /// windows that no longer exist — since this process has no live
-    /// window-create/destroy event tracking yet (Phase 1's
-    /// `SetWinEventHook` follow-up); every workspace-changing action
-    /// re-syncs first instead.
+    /// windows that no longer exist. WinEvent hooks keep this fresh in the
+    /// background (see `install_win_event_hooks`); workspace-changing
+    /// actions still re-sync inline first so they never act on a stale
+    /// model, even mid-debounce.
     ///
     /// Assignment rule: a new window belongs to the workspace the user is
     /// actually looking at. When the current workspace is a dynamic one,
@@ -2242,6 +2741,14 @@ mod imp {
                 let current = state.workspaces.current_index();
                 let current_pinned = state.workspaces.is_pinned(current);
                 for window in &live {
+                    // Identity first: a recycled HWND (same handle, new
+                    // process) must not inherit the dead window's
+                    // assignment or park-time snapshot.
+                    let (_, reused) = state.window_registry.observe(window.hwnd, window.pid);
+                    if reused {
+                        state.workspaces.forget(window.hwnd);
+                        drop_window_snapshot(window.hwnd);
+                    }
                     if state.workspaces.workspace_of(window.hwnd).is_some() {
                         continue;
                     }
@@ -2255,6 +2762,7 @@ mod imp {
                     state.workspaces.assign_to_index(window.hwnd, index);
                 }
                 state.workspaces.prune(groveshell_window_model::is_alive);
+                state.window_registry.prune(groveshell_window_model::is_alive);
                 let tracked: Vec<isize> = state
                     .workspaces
                     .workspace_ids()
@@ -2483,11 +2991,13 @@ mod imp {
                         cards,
                         focus_after,
                     };
-                    // Any in-progress carousel drag/slide is moot once
-                    // we're fading back out.
+                    // Any in-progress drag/slide/search is moot once we're
+                    // fading back out.
                     state.carousel_drag = None;
                     state.carousel_anim = None;
                     state.carousel_close_after = None;
+                    state.window_drag = None;
+                    state.search_query.clear();
                     Some(state.overview_hwnd)
                 }
                 other => {
@@ -2585,6 +3095,43 @@ mod imp {
     /// current page, or missing everything, cancels — the pre-existing
     /// behavior.
     fn on_overview_click(x: i32, y: i32) {
+        // An active search owns clicks: a result row activates it, anywhere
+        // else dismisses the search (but not the overview).
+        let query = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .filter(|st| !st.search_query.is_empty())
+                .map(|st| st.search_query.clone())
+        });
+        if let Some(query) = query {
+            let results = search_results(&query);
+            let (_, rows) = search_layout(reference_dpi(), results.len());
+            let hit_index = rows
+                .iter()
+                .skip(1)
+                .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+            match hit_index {
+                Some(i) => {
+                    if let Some(result) = results.into_iter().nth(i) {
+                        activate_search_result(result);
+                    }
+                }
+                None => {
+                    STATE.with(|s| {
+                        if let Some(state) = s.borrow_mut().as_mut() {
+                            state.search_query.clear();
+                        }
+                    });
+                    let overview_hwnd =
+                        STATE.with(|s| s.borrow().as_ref().map(|st| st.overview_hwnd));
+                    if let Some(overview_hwnd) = overview_hwnd {
+                        repaint_overview(overview_hwnd);
+                    }
+                }
+            }
+            return;
+        }
+
         let (hit, current) = STATE.with(|s| {
             let state = s.borrow();
             let Some(st) = state.as_ref() else {
@@ -2618,35 +3165,88 @@ mod imp {
         }
     }
 
-    /// Starts tracking a possible carousel drag; only takes effect while
-    /// the overview is idle-`Open` (matching the existing hit-testing
-    /// gate — no dragging mid zoom-animation).
-    fn on_overview_drag_start(x: i32) {
+    /// Starts tracking a drag; only takes effect while the overview is
+    /// idle-`Open` (matching the existing hit-testing gate — no dragging
+    /// mid zoom-animation). A press that lands on a window preview begins
+    /// a *window* drag (move it to another workspace card); anywhere else
+    /// begins a carousel drag.
+    fn on_overview_drag_start(x: i32, y: i32) {
         // The click that starts this drag just re-activated (and re-raised)
         // the overview — put the bars back on top of it.
         raise_bars_topmost();
         STATE.with(|s| {
             if let Some(state) = s.borrow_mut().as_mut() {
-                if matches!(state.overview, OverviewMode::Open { .. }) {
-                    state.carousel_drag = Some(CarouselDrag {
-                        start_x: x,
-                        start_offset: state.carousel_offset,
-                        max_delta: 0,
-                    });
+                if !matches!(state.overview, OverviewMode::Open { .. }) {
+                    return;
+                }
+                // While searching, presses belong to the results panel
+                // (handled as clicks on release), not to dragging.
+                if !state.search_query.is_empty() {
+                    return;
+                }
+                let thumb = {
+                    let OverviewMode::Open { thumbs, .. } = &state.overview else {
+                        unreachable!()
+                    };
+                    let (card_rect, pitch) = card_layout();
+                    thumbs.iter().find_map(|th| {
+                        let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
+                        (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then(|| {
+                            (
+                                th.hwnd.0 as isize,
+                                th.page,
+                                th.rect.right - th.rect.left,
+                                th.rect.bottom - th.rect.top,
+                            )
+                        })
+                    })
+                };
+                match thumb {
+                    Some((hwnd, from_page, base_w, base_h)) => {
+                        state.window_drag = Some(WindowDrag {
+                            hwnd,
+                            from_page,
+                            start_x: x,
+                            start_y: y,
+                            cur_x: x,
+                            cur_y: y,
+                            max_delta: 0,
+                            base_w,
+                            base_h,
+                        });
+                    }
+                    None => {
+                        state.carousel_drag = Some(CarouselDrag {
+                            start_x: x,
+                            start_offset: state.carousel_offset,
+                            max_delta: 0,
+                        });
+                    }
                 }
             }
         });
     }
 
-    /// Follows the pointer while a carousel drag is active — content moves
-    /// with the cursor (dragging right reveals the *previous*, lower-index
-    /// workspace), at a fixed `CAROUSEL_DRAG_PAGE_DISTANCE_PX`-per-page
-    /// rate rather than the overview's actual (screen-spanning) pixel
-    /// width — see that constant's docs.
-    fn on_overview_drag_move(x: i32) {
+    /// Follows the pointer while a drag is active. A window drag just
+    /// tracks the cursor (the ghost is painted at the current position); a
+    /// carousel drag scrolls the content with the cursor (dragging right
+    /// reveals the *previous*, lower-index workspace), at a fixed
+    /// `CAROUSEL_DRAG_PAGE_DISTANCE_PX`-per-page rate rather than the
+    /// overview's actual (screen-spanning) pixel width — see that
+    /// constant's docs.
+    fn on_overview_drag_move(x: i32, y: i32) {
         let overview_hwnd = STATE.with(|s| {
             let mut state_ref = s.borrow_mut();
             let state = state_ref.as_mut()?;
+
+            if let Some(drag) = state.window_drag.as_mut() {
+                drag.cur_x = x;
+                drag.cur_y = y;
+                let travel = (x - drag.start_x).abs().max((y - drag.start_y).abs());
+                drag.max_delta = drag.max_delta.max(travel);
+                return Some(state.overview_hwnd);
+            }
+
             let workspace_count = state.workspaces.workspace_ids().len();
             let drag = state.carousel_drag.as_mut()?;
             let delta_px = x - drag.start_x;
@@ -2660,11 +3260,22 @@ mod imp {
         }
     }
 
-    /// Ends a carousel drag (or, if there wasn't one — the button went down
+    /// Ends whichever drag is active (or, if none — the button went down
     /// outside `Open`, or never moved past the click threshold — dispatches
-    /// a plain click instead). A real drag snaps to whichever page ended up
-    /// nearest the release point.
+    /// a plain click instead). A window drag released over a *different*
+    /// card moves the window to that workspace; a carousel drag snaps to
+    /// whichever page ended up nearest the release point.
     fn on_overview_drag_end(x: i32, y: i32) {
+        let window_drag = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.window_drag.take()));
+        if let Some(drag) = window_drag {
+            if drag.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+                on_overview_click(x, y);
+            } else {
+                on_window_drop(drag, x, y);
+            }
+            return;
+        }
+
         let drag = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.carousel_drag.take()));
         let Some(drag) = drag else {
             on_overview_click(x, y);
@@ -2694,6 +3305,49 @@ mod imp {
                 .unwrap_or(0)
         });
         snap_carousel_to(target, None);
+    }
+
+    /// A window preview was dragged and released at `(x, y)`: if that's
+    /// over a different workspace's card, reassign the window there and
+    /// park/unpark it to match (it physically belongs on screen only while
+    /// its workspace is current). Released anywhere else, the drag just
+    /// cancels — the ghost disappears and the preview stays put.
+    fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
+        let moved = STATE.with(|s| {
+            let mut state_ref = s.borrow_mut();
+            let state = state_ref.as_mut()?;
+            let OverviewMode::Open { cards, .. } = &state.overview else {
+                return None;
+            };
+            let (card_rect, pitch) = card_layout();
+            let target = cards.iter().find_map(|c| {
+                let r = displayed_rect(c.rect, c.page, state.carousel_offset, pitch, card_rect);
+                (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(c.page)
+            })?;
+            if target == drag.from_page {
+                return None;
+            }
+            state.workspaces.move_window_to_index(drag.hwnd, target)?;
+            Some((target, state.workspaces.current_index()))
+        });
+
+        let overview_hwnd = STATE.with(|s| s.borrow().as_ref().map(|st| st.overview_hwnd));
+        let Some((target, current)) = moved else {
+            // Cancelled: just erase the ghost.
+            if let Some(overview_hwnd) = overview_hwnd {
+                repaint_overview(overview_hwnd);
+            }
+            return;
+        };
+
+        let hwnd = HWND(drag.hwnd as *mut c_void);
+        if target == current {
+            unpark_window(hwnd);
+        } else {
+            park_window(hwnd);
+        }
+        rebuild_open_overview_pages();
+        refresh_bar_indicator();
     }
 
     /// Left/Right arrow keys while the overview is idle-`Open`: slide the
@@ -3266,7 +3920,8 @@ mod imp {
             WM_LBUTTONDOWN => {
                 if let Role::Overview = role {
                     let x = (lparam.0 & 0xFFFF) as i32;
-                    on_overview_drag_start(x);
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    on_overview_drag_start(x, y);
                     LRESULT(0)
                 } else {
                     DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -3276,7 +3931,8 @@ mod imp {
                 if let Role::Overview = role {
                     if wparam.0 & (MK_LBUTTON.0 as usize) != 0 {
                         let x = (lparam.0 & 0xFFFF) as i32;
-                        on_overview_drag_move(x);
+                        let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                        on_overview_drag_move(x, y);
                     }
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -3296,19 +3952,46 @@ mod imp {
                 }
                 LRESULT(0)
             }
+            WM_CHAR if role == Role::Overview => {
+                on_overview_char(wparam.0 as u32);
+                LRESULT(0)
+            }
             WM_KEYDOWN => {
                 if wparam.0 == VK_ESCAPE.0 as usize {
                     match role {
-                        Role::Overview => close_overview(None),
+                        Role::Overview => {
+                            // Escape backs out one layer: an active search
+                            // first, the overview itself second.
+                            let searching = STATE.with(|s| {
+                                s.borrow_mut()
+                                    .as_mut()
+                                    .map(|st| {
+                                        let searching = !st.search_query.is_empty();
+                                        st.search_query.clear();
+                                        searching
+                                    })
+                                    .unwrap_or(false)
+                            });
+                            if searching {
+                                repaint_overview(hwnd);
+                            } else {
+                                close_overview(None);
+                            }
+                        }
                         Role::Calendar => hide_calendar(true),
                         Role::QuickSettings => hide_quick_settings(true),
                         _ => {}
                     }
                 } else if role == Role::Overview {
-                    if wparam.0 == VK_LEFT.0 as usize {
-                        on_overview_arrow(-1);
-                    } else if wparam.0 == VK_RIGHT.0 as usize {
-                        on_overview_arrow(1);
+                    let searching = STATE
+                        .with(|s| s.borrow().as_ref().map(|st| !st.search_query.is_empty()))
+                        .unwrap_or(false);
+                    if !searching {
+                        if wparam.0 == VK_LEFT.0 as usize {
+                            on_overview_arrow(-1);
+                        } else if wparam.0 == VK_RIGHT.0 as usize {
+                            on_overview_arrow(1);
+                        }
                     }
                 }
                 LRESULT(0)
@@ -3355,6 +4038,7 @@ mod imp {
             WM_TIMER => {
                 match wparam.0 {
                     ANIM_TIMER_ID => on_animation_tick(),
+                    SYNC_TIMER_ID => on_window_sync_timer(hwnd),
                     CLOCK_TIMER_ID => {
                         let primary =
                             STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
@@ -3378,6 +4062,7 @@ mod imp {
                 if let Role::Bar { is_primary } = role {
                     unregister_appbar(hwnd);
                     if is_primary {
+                        uninstall_win_event_hooks();
                         let _ = UnregisterHotKey(hwnd, HOTKEY_WS_PREV);
                         let _ = UnregisterHotKey(hwnd, HOTKEY_WS_NEXT);
                         let _ = UnregisterHotKey(hwnd, HOTKEY_MOVE_WIN_PREV);

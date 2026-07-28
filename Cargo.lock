@@ -242,6 +242,7 @@ dependencies = [
  "clap",
  "groveshell-common",
  "groveshell-ipc",
+ "groveshell-window-model",
  "serde_json",
  "tracing",
 ]

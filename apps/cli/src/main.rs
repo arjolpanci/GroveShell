@@ -23,6 +23,10 @@ mod imp {
         Ping,
         /// Gracefully stops groveshell-host and groveshell-watchdog, in that order.
         Shutdown,
+        /// Lists eligible top-level windows (the same set the shell manages).
+        ListWindows,
+        /// Lists connected monitors with their bounds and work areas.
+        ListMonitors,
     }
 
     pub fn main() -> Result<()> {
@@ -32,7 +36,53 @@ mod imp {
         match cli.command {
             Command::Ping => ping(),
             Command::Shutdown => shutdown(),
+            Command::ListWindows => list_windows(),
+            Command::ListMonitors => list_monitors(),
         }
+    }
+
+    /// Enumerated directly in this process (no IPC round-trip to the shell
+    /// needed — `EnumWindows` sees the same session state from anywhere),
+    /// so this also works as a diagnostic when the shell isn't running.
+    fn list_windows() -> Result<()> {
+        groveshell_window_model::make_process_dpi_aware();
+        let windows = groveshell_window_model::snapshot();
+        println!("{:<12} {:<8} {:<24} {:<26} TITLE", "HWND", "PID", "EXE", "RECT");
+        for w in &windows {
+            let rect = format!(
+                "({},{})-({},{})",
+                w.rect.left, w.rect.top, w.rect.right, w.rect.bottom
+            );
+            println!(
+                "{:<12} {:<8} {:<24} {:<26} {}",
+                format!("{:#x}", w.hwnd),
+                w.pid,
+                w.exe_name.as_deref().unwrap_or("?"),
+                rect,
+                w.title
+            );
+        }
+        println!("{} eligible top-level window(s)", windows.len());
+        Ok(())
+    }
+
+    fn list_monitors() -> Result<()> {
+        groveshell_window_model::make_process_dpi_aware();
+        let monitors = groveshell_window_model::monitors();
+        println!("{:<8} {:<26} {:<26}", "PRIMARY", "BOUNDS", "WORK AREA");
+        for m in &monitors {
+            let bounds = format!(
+                "({},{})-({},{})",
+                m.rect.left, m.rect.top, m.rect.right, m.rect.bottom
+            );
+            let work = format!(
+                "({},{})-({},{})",
+                m.work.left, m.work.top, m.work.right, m.work.bottom
+            );
+            println!("{:<8} {:<26} {:<26}", if m.is_primary { "yes" } else { "no" }, bounds, work);
+        }
+        println!("{} monitor(s)", monitors.len());
+        Ok(())
     }
 
     fn ping() -> Result<()> {

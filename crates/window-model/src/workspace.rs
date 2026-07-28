@@ -171,6 +171,16 @@ impl WorkspaceTracker {
         self.compact();
     }
 
+    /// Drops a single window's assignment outright — used when the identity
+    /// registry detects that `hwnd` was recycled for an unrelated window
+    /// (see `registry::WindowRegistry::observe`), whose assignment must not
+    /// be inherited. The handle can be re-assigned as a new window after.
+    pub fn forget(&mut self, hwnd: isize) {
+        if self.assignments.remove(&hwnd).is_some() {
+            self.compact();
+        }
+    }
+
     /// Switches to the workspace at `index` (clamped to the valid range).
     /// Returns `(from_id, to_id)`, or `None` if that's already current.
     pub fn switch_to_index(&mut self, index: usize) -> Option<(WorkspaceId, WorkspaceId)> {
@@ -413,6 +423,18 @@ mod tests {
         let monitor1_id = t.workspace_ids()[1];
         t.assign_to_index(555, 1);
         assert_eq!(t.workspace_of(555), Some(monitor1_id));
+    }
+
+    #[test]
+    fn forget_drops_one_assignment_and_reapplies_the_tail_policy() {
+        let mut t = WorkspaceTracker::new();
+        // Occupy the trailing workspace so an extra one grows after it.
+        t.assign_to_index(10, 1);
+        let grown = t.workspace_ids().len();
+        assert!(grown > MIN_WORKSPACES);
+        t.forget(10);
+        assert_eq!(t.workspace_of(10), None);
+        assert!(t.workspace_ids().len() < grown);
     }
 
     #[test]
