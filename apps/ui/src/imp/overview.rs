@@ -160,6 +160,48 @@ pub(crate) struct CarouselAnim {
     pub(crate) to: f64,
 }
 
+/// Everything one monitor's Activities overview needs that isn't just
+/// "the window handle" — mirrors what used to be flat fields on
+/// `AppState` before each monitor got its own overview. One of these
+/// exists per currently-connected monitor, keyed by device name in
+/// `AppState.overviews`.
+pub(crate) struct OverviewInstance {
+    pub(crate) hwnd: HWND,
+    pub(crate) mode: OverviewMode,
+    /// Current horizontal scroll position through *this monitor's*
+    /// carousel, in page units. Only meaningful while `mode` isn't
+    /// `Closed`.
+    pub(crate) carousel_offset: f64,
+    pub(crate) carousel_drag: Option<CarouselDrag>,
+    pub(crate) carousel_anim: Option<CarouselAnim>,
+    pub(crate) carousel_close_after: Option<HWND>,
+    pub(crate) window_drag: Option<WindowDrag>,
+    pub(crate) window_pop_anim: Option<WindowPopAnim>,
+    pub(crate) hover_thumb: Option<(isize, std::time::Instant)>,
+    pub(crate) dock_apps: Vec<super::dock::DockApp>,
+    pub(crate) dock_hover: Option<(usize, std::time::Instant)>,
+    pub(crate) search_query: String,
+}
+
+impl OverviewInstance {
+    pub(crate) fn new(hwnd: HWND) -> Self {
+        Self {
+            hwnd,
+            mode: OverviewMode::Closed,
+            carousel_offset: 0.0,
+            carousel_drag: None,
+            carousel_anim: None,
+            carousel_close_after: None,
+            window_drag: None,
+            window_pop_anim: None,
+            hover_thumb: None,
+            dock_apps: Vec::new(),
+            dock_hover: None,
+            search_query: String::new(),
+        }
+    }
+}
+
 pub(crate) enum OverviewMode {
     Closed,
     /// Visible but still fading in (`SetLayeredWindowAttributes`); the
