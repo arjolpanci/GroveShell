@@ -6,21 +6,32 @@
 //! only tracks *which* window belongs to *which* workspace, so it can be
 //! exercised with plain unit tests instead of a live Windows session.
 //!
-//! Per the current MVP scope, all monitors share one set of workspaces
-//! (§8.3: "Define whether workspaces are global or per-monitor; start
-//! global for simplicity") — per-monitor workspace sets are a later,
-//! explicitly out-of-scope enhancement.
+//! Per the user's guidance, each currently-connected *monitor* gets its own
+//! fixed, always-present workspace slot — the "pinned prefix" of the list,
+//! `[0, pinned_prefix)` — plus the usual GNOME-style dynamic tail beyond
+//! it for genuinely virtual (hide/show-managed) workspaces. A monitor's
+//! workspace is never removed by the dynamic-workspace policy even if it's
+//! empty, since it represents real, always-visible screen space, not a
+//! virtual one. `groveshell-ui` is responsible for deciding *which* pinned
+//! index a window belongs to (by real screen position) and for only ever
+//! hiding/showing windows assigned to the tail (index >= pinned_prefix) —
+//! this module just protects the pinned range from the tail's
+//! grow/shrink/collapse bookkeeping. Full per-monitor *virtual* workspace
+//! sets (each monitor getting its own independent dynamic tail) are a
+//! later, explicitly out-of-scope enhancement; for now every monitor
+//! shares the one dynamic tail.
 //!
 //! Dynamic workspaces only ever grow or shrink at the *tail*: a new empty
 //! workspace appears once the last one is occupied, and redundant trailing
-//! empties collapse back down to one. A workspace that becomes empty in
-//! the middle of the list is left alone rather than auto-collapsed —
+//! empties collapse back down to one. A tail workspace that becomes empty
+//! in the middle of the list is left alone rather than auto-collapsed —
 //! removing it would silently renumber every workspace after it, which is
 //! more disorienting than a stray empty workspace is useful.
 
 use std::collections::BTreeMap;
 
-/// Never fewer than this many workspaces exist, even when all are empty —
+/// Never fewer than this many workspaces exist in total, even with no
+/// monitors seeded (`WorkspaceTracker::new`) and all of them empty —
 /// GNOME-style "you always start with (at least) two."
 pub const MIN_WORKSPACES: usize = 2;
 
@@ -37,10 +48,12 @@ pub type WorkspaceId = u32;
 #[derive(Debug, Clone)]
 pub struct WorkspaceTracker {
     /// Ordered ids; position in this list is the workspace's carousel/index
-    /// position.
+    /// position. `ids[..pinned_prefix]` are monitor workspaces and never
+    /// removed; anything beyond is the dynamic virtual tail.
     ids: Vec<WorkspaceId>,
     next_id: WorkspaceId,
     current: usize,
+    pinned_prefix: usize,
     /// hwnd -> workspace id. A window with no entry hasn't been observed
     /// yet (see [`Self::observe_active`]).
     assignments: BTreeMap<isize, WorkspaceId>,
@@ -53,14 +66,28 @@ impl Default for WorkspaceTracker {
 }
 
 impl WorkspaceTracker {
+    /// No monitor information available: falls back to the original
+    /// "just two dynamic workspaces" shape (`pinned_prefix` 0).
     pub fn new() -> Self {
-        let ids: Vec<WorkspaceId> = (0..MIN_WORKSPACES as WorkspaceId).collect();
-        Self {
+        Self::with_monitor_workspaces(0, 0)
+    }
+
+    /// One pinned, always-present workspace per currently-connected
+    /// monitor (`monitor_count`, ordered however the caller likes — in
+    /// practice left-to-right by screen position), plus the standard
+    /// dynamic virtual tail. `current_index` (typically the primary
+    /// monitor's position) is clamped into range.
+    pub fn with_monitor_workspaces(monitor_count: usize, current_index: usize) -> Self {
+        let ids: Vec<WorkspaceId> = (0..monitor_count as WorkspaceId).collect();
+        let mut tracker = Self {
             next_id: ids.len() as WorkspaceId,
             ids,
-            current: 0,
+            current: current_index.min(monitor_count.saturating_sub(1)),
+            pinned_prefix: monitor_count,
             assignments: BTreeMap::new(),
-        }
+        };
+        tracker.compact();
+        tracker
     }
 
     pub fn workspace_ids(&self) -> &[WorkspaceId] {
@@ -77,6 +104,17 @@ impl WorkspaceTracker {
 
     pub fn index_of(&self, id: WorkspaceId) -> Option<usize> {
         self.ids.iter().position(|&x| x == id)
+    }
+
+    /// Whether the workspace at `index` is a pinned monitor workspace
+    /// (always present, never hidden/shown, never removed) rather than a
+    /// dynamic virtual one.
+    pub fn is_pinned(&self, index: usize) -> bool {
+        index < self.pinned_prefix
+    }
+
+    pub fn pinned_count(&self) -> usize {
+        self.pinned_prefix
     }
 
     pub fn workspace_of(&self, hwnd: isize) -> Option<WorkspaceId> {
@@ -99,18 +137,30 @@ impl WorkspaceTracker {
     }
 
     /// Assigns any of `hwnds` not yet tracked to the *current* workspace.
-    /// Callers should only pass currently live/visible windows here (e.g.
-    /// from `window_model::snapshot()`) — by construction those are always
-    /// on the current workspace, since inactive-workspace windows are
-    /// hidden — so a brand-new window lands wherever the user is actually
-    /// looking, per Phase 3's "assign new windows to the current
-    /// workspace."
+    /// Only meaningful for the dynamic tail — callers seeding pinned
+    /// monitor workspaces should assign windows directly via
+    /// [`Self::move_window_to_index`] (called on a not-yet-tracked hwnd,
+    /// which also works as an initial assignment) based on real screen
+    /// position instead, since "current" isn't a meaningful home for a
+    /// window that's already visible on some other monitor. Re-applies the
+    /// dynamic-workspace policy afterward.
     pub fn observe_active<I: IntoIterator<Item = isize>>(&mut self, hwnds: I) {
         let current = self.current_id();
         for hwnd in hwnds {
             self.assignments.entry(hwnd).or_insert(current);
         }
         self.compact();
+    }
+
+    /// Assigns `hwnd` to the workspace at `index` outright, tracked or not
+    /// — unlike [`Self::move_window_to_index`], this doesn't require the
+    /// window to already be tracked. Used for initial per-monitor seeding.
+    pub fn assign_to_index(&mut self, hwnd: isize, index: usize) {
+        let index = index.min(self.ids.len().saturating_sub(1));
+        if let Some(&id) = self.ids.get(index) {
+            self.assignments.insert(hwnd, id);
+            self.compact();
+        }
     }
 
     /// Drops assignments for windows no longer alive (per the supplied
@@ -167,15 +217,25 @@ impl WorkspaceTracker {
         self.move_window_to_index(hwnd, target)
     }
 
-    /// Applies §8.3's dynamic-workspace policy at the tail only:
+    /// Applies §8.3's dynamic-workspace policy to the tail beyond
+    /// `pinned_prefix` (pinned monitor workspaces are never touched):
     /// - Trim redundant trailing empty workspaces (both the last and
     ///   second-last empty) down to one, never removing the current
-    ///   workspace and never dropping below [`MIN_WORKSPACES`].
-    /// - Append a new empty trailing workspace once the last one is
-    ///   occupied.
+    ///   workspace.
+    /// - Always keep at least one workspace beyond the pinned monitor
+    ///   slots — the "extra one that's always there" — appending a new
+    ///   empty one if the list currently ends exactly at the pinned
+    ///   prefix or its last entry is occupied.
+    /// - Never drop below [`MIN_WORKSPACES`] in total (only relevant when
+    ///   `pinned_prefix` is 0 — [`Self::new`]'s fallback shape).
     fn compact(&mut self) {
-        while self.ids.len() > MIN_WORKSPACES {
+        let floor = self.pinned_prefix.max(MIN_WORKSPACES);
+
+        while self.ids.len() > floor {
             let last_idx = self.ids.len() - 1;
+            if last_idx < self.pinned_prefix {
+                break;
+            }
             let last_empty = !self.is_occupied(self.ids[last_idx]);
             let second_last_empty = !self.is_occupied(self.ids[last_idx - 1]);
             if last_empty && second_last_empty && last_idx != self.current {
@@ -185,17 +245,18 @@ impl WorkspaceTracker {
             }
         }
 
+        let needs_extra_tail = self.ids.len() <= self.pinned_prefix;
         let last_occupied = self
             .ids
             .last()
             .map(|&id| self.is_occupied(id))
             .unwrap_or(true);
-        if last_occupied {
+        if needs_extra_tail || last_occupied {
             self.ids.push(self.next_id);
             self.next_id += 1;
         }
 
-        while self.ids.len() < MIN_WORKSPACES {
+        while self.ids.len() < floor {
             self.ids.push(self.next_id);
             self.next_id += 1;
         }
@@ -316,5 +377,48 @@ mod tests {
         assert_eq!(t.current_index(), 1);
         t.switch_relative(1);
         assert_eq!(t.current_index(), 1, "only 2 workspaces exist yet, can't go past the last");
+    }
+
+    #[test]
+    fn monitor_workspaces_start_with_one_extra_trailing_empty() {
+        // 2 monitors -> [monitor0, monitor1, extra-empty], matching the
+        // user's "laptop, external (current), extra" 3-workspace layout.
+        let t = WorkspaceTracker::with_monitor_workspaces(2, 1);
+        assert_eq!(t.workspace_ids().len(), 3);
+        assert_eq!(t.current_index(), 1);
+        assert!(t.is_pinned(0));
+        assert!(t.is_pinned(1));
+        assert!(!t.is_pinned(2));
+        assert_eq!(t.pinned_count(), 2);
+    }
+
+    #[test]
+    fn pinned_monitor_workspace_is_never_removed_even_if_empty() {
+        let mut t = WorkspaceTracker::with_monitor_workspaces(2, 0);
+        // Fill the extra tail, switch away from monitor 1, prune — a
+        // regular (non-pinned) empty middle workspace would be eligible
+        // for removal consideration, but a pinned one never is.
+        t.switch_to_index(2);
+        t.observe_active([1]);
+        assert_eq!(t.workspace_ids().len(), 4); // [m0, m1, ws(1), extra]
+        t.switch_to_index(0);
+        t.prune(|_| true);
+        assert!(t.is_pinned(1));
+        assert_eq!(t.workspace_ids().len(), 4, "monitor 1 stays even though it's empty");
+    }
+
+    #[test]
+    fn assign_to_index_seeds_a_window_directly() {
+        let mut t = WorkspaceTracker::with_monitor_workspaces(2, 0);
+        let monitor1_id = t.workspace_ids()[1];
+        t.assign_to_index(555, 1);
+        assert_eq!(t.workspace_of(555), Some(monitor1_id));
+    }
+
+    #[test]
+    fn fallback_new_has_no_pinned_workspaces() {
+        let t = WorkspaceTracker::new();
+        assert_eq!(t.pinned_count(), 0);
+        assert!(!t.is_pinned(0));
     }
 }

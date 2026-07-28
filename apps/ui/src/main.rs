@@ -41,34 +41,49 @@
 //!
 //! ## Workspaces (Phase 3 + part of Phase 5)
 //!
-//! This is `groveshell-window-model`'s `ManagedWorkspaceBackend` (ADR-005):
-//! GroveShell owns workspace membership itself and hides/shows real windows
-//! via `ShowWindow(SW_HIDE)`/`ShowWindow(SW_SHOWNA)` rather than delegating
-//! to Windows' own virtual desktops. Per §8.3, workspaces are dynamic and
-//! global across all monitors (not yet per-monitor — a later, explicitly
-//! out-of-scope enhancement): the app always starts with at least two, a
-//! new empty one appears once the last is occupied, and redundant trailing
-//! empties collapse back down to the floor of two. The pure
-//! assignment/growth logic lives in `groveshell_window_model::workspace`;
-//! this module only does the Windows-specific parts: hiding/showing real
-//! windows, and the Activities overview's *carousel* — one full page per
-//! workspace, laid out side by side, that you drag horizontally to switch
-//! (see `carousel_offset`/`CarouselDrag`/`CarouselAnim`). Only the current
-//! workspace's page ever gets live DWM thumbnails, since a window hidden on
-//! an inactive workspace has no live pixel content to preview; other pages
-//! render static title-only placeholder chips that upgrade to live
-//! thumbnails the moment `commit_workspace_switch` actually shows that
-//! workspace's windows again. Global hotkeys (`Ctrl+Alt+Left/Right` to
-//! switch, `+Shift` to also move the focused window) work whether or not
-//! the overview is open.
+//! This is `groveshell-window-model`'s `ManagedWorkspaceBackend` (ADR-005),
+//! with each currently-connected *monitor* additionally getting its own
+//! fixed, always-present workspace ("pinned" — see
+//! `groveshell_window_model::workspace`), ordered left-to-right by real
+//! screen position, plus the standard GNOME-style dynamic tail (starts at
+//! one extra empty workspace, grows/shrinks per §8.3) beyond the monitors.
+//! A monitor's own workspace is never really "switched away from" in the
+//! hide/show sense — its windows are already, always visible on that real
+//! screen — so `commit_workspace_switch` only ever hides/shows windows
+//! assigned to the dynamic (non-monitor) tail. "Current" mostly matters for
+//! which page the overview centers on and where a moved window ends up.
 //!
-//! Deliberately out of scope for this slice: *per-monitor* workspace sets,
-//! Windows' own Task View virtual desktops (a separate, unrelated
-//! mechanism — DWM already cloaks windows on an inactive one, and this
-//! shell's cloaked-window filter already excludes those from every
-//! workspace's page), hot corners, per-monitor DPI scaling, and live
-//! updates while the overview is open (a window opening/closing mid-session
-//! isn't picked up until the overview is reopened).
+//! The Activities overview is a GNOME-style *carousel*: one fixed-size card
+//! per workspace, wallpaper-filled, laid out side by side so the current
+//! one is centered with previous/next cards peeking at the edges (see
+//! `card_layout`); dragging horizontally slides between them (see
+//! `carousel_offset`/`CarouselDrag`/`CarouselAnim`). A workspace's open
+//! windows are arranged in a simple auto grid *within* its card — not at
+//! their real screen position/size — each with a small app-icon badge
+//! below it (see `layout_grid`). Every page's grid slots get live DWM
+//! thumbnails: windows on an inactive workspace are *parked off-screen*
+//! rather than hidden (see `park_window`), precisely because DWM renders
+//! nothing for a hidden window's thumbnail; a title-only placeholder chip
+//! remains only as the fallback when thumbnail registration fails.
+//! Global hotkeys (`Ctrl+Alt+Left/Right` to switch, `+Shift` to also move
+//! the focused window) work whether or not the overview is open. The top
+//! bar stays visually on top of the overview (`SetWindowPos`
+//! `HWND_TOPMOST` reassertion — see `open_overview`), and opening/closing
+//! is a simple whole-window fade (`SetLayeredWindowAttributes`) rather than
+//! per-window position animation, since windows no longer occupy their
+//! real position in this view at all.
+//!
+//! Deliberately out of scope for this slice: *per-monitor sets of virtual*
+//! workspaces (every monitor currently shares the one dynamic tail), moving
+//! a window directly between two monitors' pages (only "pinned page ->
+//! first dynamic page" is well-defined — see `move_focused_window_relative`),
+//! Windows' own Task View virtual desktops (a separate, unrelated mechanism
+//! — DWM already cloaks windows on an inactive one, and this shell's
+//! cloaked-window filter already excludes those from every workspace's
+//! page), hot corners, per-monitor DPI scaling, live wallpaper-change
+//! detection (loaded once per process), and live updates while the
+//! overview is open (a window opening/closing mid-session isn't picked up
+//! until the overview is reopened).
 
 #[cfg(windows)]
 mod imp {
@@ -84,19 +99,30 @@ mod imp {
         DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
     };
     use windows::Win32::Graphics::Gdi::{
-        BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint, EnumDisplayMonitors,
-        FillRect, GetMonitorInfoW, InvalidateRect, SelectObject, SetBkMode, SetTextColor,
-        DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, HDC, HMONITOR,
-        MONITORINFO, PAINTSTRUCT, TRANSPARENT,
+        BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+        CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint,
+        EnumDisplayMonitors, FillRect, GetDC, GetMonitorInfoW, InvalidateRect, ReleaseDC,
+        SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, CLEARTYPE_QUALITY,
+        CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DRAW_TEXT_FORMAT, DT_CENTER,
+        DT_END_ELLIPSIS, DT_SINGLELINE, DT_VCENTER, HALFTONE, HBITMAP, HDC, HMONITOR,
+        MONITORINFO, OUT_DEFAULT_PRECIS, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+    };
+    use windows::Win32::Graphics::GdiPlus::{
+        GdipCreateBitmapFromFile, GdipCreateFromHDC, GdipDeleteGraphics, GdipDrawImageRectI,
+        GdiplusStartup, GdiplusStartupInput, GpBitmap, GpGraphics, GpImage,
     };
     use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
     use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
     use windows::Win32::System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
     use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
     use windows::Win32::System::SystemInformation::GetLocalTime;
     use windows::Win32::System::SystemServices::MK_LBUTTON;
-    use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    use windows::Win32::UI::HiDpi::{
+        GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
+        DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
+    };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         RegisterHotKey, SetFocus, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, VK_ESCAPE,
         VK_LEFT, VK_RIGHT,
@@ -112,6 +138,12 @@ mod imp {
     /// ~40px, but this shell is meant to feel closer to GNOME's slim bar;
     /// 50% taller than the first cut (16px) to fit the clock and quick
     /// settings labels comfortably.
+    ///
+    /// Like every other layout constant in this module, this is a *96-DPI*
+    /// value: the process is per-monitor-DPI-aware, so all coordinates are
+    /// physical pixels and every use site must pass through [`scaled`]
+    /// with the relevant monitor/window DPI, or the bar comes out
+    /// physically 24px tall — visibly tiny on a 125%/150% laptop panel.
     const BAR_HEIGHT: i32 = 24;
     /// Hit-test region for the painted (not native controls — there isn't
     /// enough vertical room in the bar for real button chrome) bar labels.
@@ -121,10 +153,6 @@ mod imp {
     const QS_LABEL_WIDTH: i32 = 170;
     const QS_LABEL_MARGIN: i32 = 8;
 
-    /// How much of its own size a workspace card (and everything on it)
-    /// shrinks to in the Activities overview — GNOME-style "zoom out",
-    /// each monitor toward its own center.
-    const OVERVIEW_SCALE: f64 = 0.6;
     const ANIM_DURATION: Duration = Duration::from_millis(250);
     const ANIM_TIMER_ID: usize = 1;
     const ANIM_TIMER_INTERVAL_MS: u32 = 16;
@@ -163,6 +191,32 @@ mod imp {
     /// How long a released drag takes to snap to the nearest workspace page,
     /// or a keyboard/hotkey-triggered switch takes to slide into view.
     const CAROUSEL_SNAP_DURATION: Duration = Duration::from_millis(220);
+    /// How many pixels of pointer movement it takes to drag the carousel by
+    /// one full page. Deliberately independent of the actual page-to-page
+    /// pixel pitch (`card_layout`'s card width can be over a thousand
+    /// pixels on a large monitor) — this is a fixed, comfortable swipe
+    /// distance instead, same idea as a touch or trackpad paging gesture.
+    const CAROUSEL_DRAG_PAGE_DISTANCE_PX: f64 = 480.0;
+
+    /// A workspace card's width as a fraction of the overview's full
+    /// (virtual-screen) width — GNOME-style: big enough to read
+    /// comfortably, small enough that the previous/next cards visibly peek
+    /// in at the edges.
+    const CARD_WIDTH_FRACTION: f64 = 0.62;
+    /// Gap above a card, below the top bar — room for a future search box.
+    const CARD_MARGIN_TOP: i32 = 70;
+    /// Gap below a card — room for the future dock (not implemented yet).
+    const CARD_MARGIN_BOTTOM: i32 = 120;
+    /// Horizontal gap between adjacent cards; together with the card width
+    /// this sets the carousel's page-to-page pitch.
+    const CARD_GAP: i32 = 56;
+    /// Inset from a card's edges to where its window grid starts.
+    const CARD_CONTENT_PADDING: i32 = 28;
+    /// Gap between grid cells.
+    const THUMB_GAP: i32 = 20;
+    const THUMB_ICON_SIZE: i32 = 28;
+    /// Gap between a window thumbnail's bottom edge and its icon badge.
+    const THUMB_ICON_GAP: i32 = 8;
 
     #[derive(Clone, Copy)]
     struct MonitorInfo {
@@ -171,6 +225,30 @@ mod imp {
         /// to its left or above it has negative coordinates).
         rect: RECT,
         is_primary: bool,
+        /// Effective DPI of this monitor (96 = 100% scaling), used to
+        /// convert this module's 96-DPI layout constants to physical
+        /// pixels via [`scaled`].
+        dpi: u32,
+    }
+
+    /// Converts a 96-DPI layout value to physical pixels at `dpi`,
+    /// rounding to nearest.
+    fn scaled(v: i32, dpi: u32) -> i32 {
+        (v * dpi as i32 + 48) / 96
+    }
+
+    /// Effective DPI of the primary monitor (falling back to the first
+    /// enumerated one, then to 96) — the reference the overview's card
+    /// layout is scaled against, matching `card_layout` basing the card
+    /// geometry on the primary monitor.
+    fn reference_dpi() -> u32 {
+        let monitors = monitors_sorted_by_x();
+        monitors
+            .iter()
+            .find(|m| m.is_primary)
+            .or_else(|| monitors.first())
+            .map(|m| m.dpi)
+            .unwrap_or(96)
     }
 
     /// One monitor's top-level bar window plus the rect the AppBar system
@@ -181,47 +259,45 @@ mod imp {
         is_primary: bool,
     }
 
-    /// One window's overview preview plus its animation endpoints, all in
-    /// `overview_hwnd`-local, **page-local** (pre-carousel-shift) client-area
-    /// coordinates — the horizontal carousel offset is applied on top of
-    /// `current` at the moment a rect is pushed to DWM, painted, or
-    /// hit-tested (see `displayed_rect`), never baked into `current` itself.
+    /// One window's grid slot within its workspace's card — a fixed,
+    /// synthetic layout position (see `layout_grid`), *not* the window's
+    /// real screen position/size. All rects are `overview_hwnd`-local,
+    /// **page-local** (pre-carousel-shift) client-area coordinates — the
+    /// horizontal carousel offset is applied on top of `rect`/`icon_rect`
+    /// only at the moment they're pushed to DWM, painted, or hit-tested
+    /// (see `displayed_rect`).
     struct ThumbAnim {
         /// `Some` for a live DWM thumbnail; `None` renders as a static
-        /// title-only placeholder instead. Only the current workspace's
-        /// page ever starts with a live thumbnail — a window hidden on an
-        /// inactive workspace has no live pixel content to preview — but a
-        /// placeholder is upgraded to live the moment
-        /// `commit_workspace_switch` actually shows its window again.
+        /// title-only placeholder chip instead (the icon badge is drawn
+        /// either way). Every page's windows get live thumbnails — parked
+        /// off-screen, not hidden, exactly so DWM can still render them
+        /// (see `park_window`) — so `None` only happens when registration
+        /// fails (window died, or it's minimized-and-hidden).
         thumbnail: Option<isize>,
         hwnd: HWND,
         /// Used only for placeholder rendering.
         title: String,
+        /// The window/app icon drawn at `icon_rect`, if one could be
+        /// queried (`window_icon`) — owned by the window/class, never
+        /// destroyed by this shell.
+        icon: Option<HICON>,
         /// Which carousel page (workspace index, fixed for the lifetime of
         /// one overview session) this belongs to.
         page: usize,
-        /// Animation start rect for whichever transition is currently
-        /// running (real position when opening, scaled position when
-        /// closing); equal to `to` for every non-current page, since those
-        /// start already "zoomed out" with no opening animation of their
-        /// own.
-        from: RECT,
-        /// Animation end rect (the inverse of `from`).
-        to: RECT,
-        /// Last computed rect — while `Open`, this equals `to` from the
-        /// opening animation and is what's hit-tested against clicks (after
-        /// applying the current carousel shift).
-        current: RECT,
+        /// This window's grid-slot rect, aspect-fit within its cell.
+        rect: RECT,
+        /// Icon badge rect, directly below `rect`.
+        icon_rect: RECT,
     }
 
-    /// A monitor's "workspace card" background rect, animated the same way
-    /// as `ThumbAnim` but with no DWM handle — it's plain GDI fill, redrawn
-    /// via `InvalidateRect` on every animation tick.
+    /// One workspace's card background rect — fixed once built (`page`
+    /// only ever moves via the carousel shift, never animated in place;
+    /// see the module docs on why the old "zoom from real position"
+    /// animation no longer applies once windows are grid-arranged instead
+    /// of position-accurate).
     struct CardAnim {
         page: usize,
-        from: RECT,
-        to: RECT,
-        current: RECT,
+        rect: RECT,
     }
 
     /// An in-progress pointer drag through the carousel, started on
@@ -245,17 +321,22 @@ mod imp {
 
     enum OverviewMode {
         Closed,
+        /// Visible but still fading in (`SetLayeredWindowAttributes`); the
+        /// cards/thumbnails inside are already at their final layout the
+        /// whole time — only the window's overall alpha animates.
         Opening {
             started: Instant,
             thumbs: Vec<ThumbAnim>,
             cards: Vec<CardAnim>,
         },
-        /// Idle, fully zoomed out; `thumbs[].current` is stable and is what
-        /// clicks are hit-tested against.
+        /// Idle, fully visible; `thumbs[].rect`/`cards[].rect` are what
+        /// clicks are hit-tested against (after applying the current
+        /// carousel shift).
         Open {
             thumbs: Vec<ThumbAnim>,
             cards: Vec<CardAnim>,
         },
+        /// Fading out; see `Opening`.
         Closing {
             started: Instant,
             thumbs: Vec<ThumbAnim>,
@@ -376,9 +457,30 @@ mod imp {
                     bottom: h,
                 },
                 is_primary: true,
+                dpi: 96,
             });
         }
         monitors
+    }
+
+    /// Monitors ordered left-to-right by real screen position — the order
+    /// pinned monitor-workspaces are created in, so e.g. a laptop screen
+    /// physically to the left of an external monitor becomes workspace 0
+    /// with the external monitor as workspace 1, matching how the carousel
+    /// then peeks left/right from whichever is current.
+    fn monitors_sorted_by_x() -> Vec<MonitorInfo> {
+        let mut monitors = enumerate_monitors();
+        monitors.sort_by_key(|m| m.rect.left);
+        monitors
+    }
+
+    /// Which of `monitors` contains the point `(center_x, center_y)`, if
+    /// any — used to seed/assign a window to the workspace matching the
+    /// real monitor it's actually on.
+    fn monitor_index_for_center(monitors: &[MonitorInfo], center_x: i32, center_y: i32) -> Option<usize> {
+        monitors.iter().position(|m| {
+            center_x >= m.rect.left && center_x < m.rect.right && center_y >= m.rect.top && center_y < m.rect.bottom
+        })
     }
 
     unsafe extern "system" fn monitor_enum_proc(
@@ -397,9 +499,12 @@ mod imp {
             ..Default::default()
         };
         if GetMonitorInfoW(hmonitor, &mut info).as_bool() {
+            let (mut dpi_x, mut dpi_y) = (96u32, 96u32);
+            let _ = GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
             monitors.push(MonitorInfo {
                 rect: info.rcMonitor,
                 is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+                dpi: dpi_x.max(96),
             });
         }
         TRUE
@@ -438,6 +543,18 @@ mod imp {
         // "unavailable" via the `Option`-returning helpers below — it's not
         // fatal to the rest of the shell.
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+
+        // SAFETY: must run once, before any other `Gdip*` call — used to
+        // draw the real wallpaper into overview cards (`draw_wallpaper_into`).
+        // Never shut down: this process only ever exits via `PostQuitMessage`
+        // and normal process teardown, same as the window classes registered
+        // below are never unregistered.
+        let mut gdiplus_token: usize = 0;
+        let gdiplus_input = GdiplusStartupInput {
+            GdiplusVersion: 1,
+            ..Default::default()
+        };
+        let _ = unsafe { GdiplusStartup(&mut gdiplus_token, &gdiplus_input, std::ptr::null_mut()) };
 
         // SAFETY: every Win32 call below either has a call-site safety
         // comment or is a plain value/query with no aliasing or lifetime
@@ -478,6 +595,7 @@ mod imp {
             let mut bars = Vec::new();
             for monitor in &monitors {
                 let width = monitor.rect.right - monitor.rect.left;
+                let bar_height = scaled(BAR_HEIGHT, monitor.dpi);
                 let bar_hwnd = CreateWindowExW(
                     WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                     w!("GroveShellBar"),
@@ -486,7 +604,7 @@ mod imp {
                     monitor.rect.left,
                     monitor.rect.top,
                     width,
-                    BAR_HEIGHT,
+                    bar_height,
                     None,
                     None,
                     hinstance,
@@ -500,7 +618,7 @@ mod imp {
                 // has been monitor-aware since Windows 8, determined by
                 // which monitor the given rect falls on.
                 let bar_rect =
-                    register_appbar(bar_hwnd, monitor.rect.left, monitor.rect.top, width, BAR_HEIGHT);
+                    register_appbar(bar_hwnd, monitor.rect.left, monitor.rect.top, width, bar_height);
                 let _ = MoveWindow(
                     bar_hwnd,
                     bar_rect.left,
@@ -530,7 +648,7 @@ mod imp {
             let virtual_w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
             let virtual_h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
             let overview_hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                 w!("GroveShellOverview"),
                 w!("GroveShell Activities"),
                 WS_POPUP,
@@ -637,6 +755,22 @@ mod imp {
 
             let bar_hwnds: Vec<HWND> = bars.iter().map(|b| b.hwnd).collect();
 
+            // One pinned workspace per currently-connected monitor, ordered
+            // left-to-right by real screen position, with the primary
+            // monitor's slot starting as current — see the module docs.
+            // Seed each with whatever windows are already on that monitor
+            // right now so a fresh launch doesn't show every open window
+            // crammed onto workspace 0.
+            let sorted_monitors = monitors_sorted_by_x();
+            let primary_index = sorted_monitors.iter().position(|m| m.is_primary).unwrap_or(0);
+            let mut workspaces = WorkspaceTracker::with_monitor_workspaces(sorted_monitors.len(), primary_index);
+            for window in groveshell_window_model::snapshot() {
+                let center_x = (window.rect.left + window.rect.right) / 2;
+                let center_y = (window.rect.top + window.rect.bottom) / 2;
+                let index = monitor_index_for_center(&sorted_monitors, center_x, center_y).unwrap_or(primary_index);
+                workspaces.assign_to_index(window.hwnd, index);
+            }
+
             STATE.with(|s| {
                 *s.borrow_mut() = Some(AppState {
                     bars,
@@ -649,7 +783,7 @@ mod imp {
                     calendar_open: false,
                     quick_settings_open: false,
                     previous_foreground: HWND(std::ptr::null_mut()),
-                    workspaces: WorkspaceTracker::new(),
+                    workspaces,
                     carousel_offset: 0.0,
                     carousel_drag: None,
                     carousel_anim: None,
@@ -771,6 +905,31 @@ mod imp {
         Ok(())
     }
 
+    /// A Segoe UI font sized for the bar at `dpi` (caller owns the handle
+    /// and must `DeleteObject` it after deselecting).
+    fn bar_font(dpi: u32) -> windows::Win32::Graphics::Gdi::HFONT {
+        // SAFETY: plain object creation; no aliasing or lifetime
+        // preconditions.
+        unsafe {
+            CreateFontW(
+                -scaled(12, dpi),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0.into(),
+                OUT_DEFAULT_PRECIS.0.into(),
+                CLIP_DEFAULT_PRECIS.0.into(),
+                CLEARTYPE_QUALITY.0.into(),
+                DEFAULT_PITCH.0.into(),
+                w!("Segoe UI"),
+            )
+        }
+    }
+
     /// SAFETY: `hdc` must be a valid device context obtained from
     /// `BeginPaint` on the window currently handling `WM_PAINT`.
     unsafe fn draw_text_in(hdc: HDC, rect: RECT, text: &str, format: DRAW_TEXT_FORMAT) {
@@ -796,6 +955,8 @@ mod imp {
             let hdc = BeginPaint(hwnd, &mut ps);
 
             if is_primary {
+                let dpi = GetDpiForWindow(hwnd).max(96);
+                let bar_h = scaled(BAR_HEIGHT, dpi);
                 let bar_width = STATE
                     .with(|s| {
                         s.borrow()
@@ -806,15 +967,20 @@ mod imp {
 
                 SetBkMode(hdc, TRANSPARENT);
                 SetTextColor(hdc, COLORREF(0x00E0E0E0));
+                // The DC's default font is the fixed-size legacy "System"
+                // font, which neither scales with DPI nor matches the rest
+                // of the OS — use Segoe UI sized to the bar's monitor.
+                let font = bar_font(dpi);
+                let previous_font = SelectObject(hdc, font);
 
                 let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
                 draw_text_in(
                     hdc,
                     RECT {
-                        left: ACTIVITIES_LABEL_X,
+                        left: scaled(ACTIVITIES_LABEL_X, dpi),
                         top: 0,
-                        right: ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH,
-                        bottom: BAR_HEIGHT,
+                        right: scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi),
+                        bottom: bar_h,
                     },
                     "Activities",
                     format,
@@ -827,50 +993,55 @@ mod imp {
                             .map(|st| (st.workspaces.workspace_ids().len(), st.workspaces.current_index()))
                     })
                     .unwrap_or((0, 0));
-                let dot_mid_y = BAR_HEIGHT / 2;
+                let dot_mid_y = bar_h / 2;
+                let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
+                let dot_radius = scaled(WS_DOT_RADIUS, dpi);
                 let filled_brush = CreateSolidBrush(COLORREF(0x00E0E0E0));
                 let empty_brush = CreateSolidBrush(COLORREF(0x00606060));
                 for i in 0..workspace_count {
-                    let cx = WS_DOTS_X + i as i32 * WS_DOT_SLOT_WIDTH + WS_DOT_SLOT_WIDTH / 2;
+                    let cx = scaled(WS_DOTS_X, dpi) + i as i32 * dot_slot_w + dot_slot_w / 2;
                     let brush = if i == current_index { filled_brush } else { empty_brush };
                     let previous = SelectObject(hdc, brush);
                     let _ = Ellipse(
                         hdc,
-                        cx - WS_DOT_RADIUS,
-                        dot_mid_y - WS_DOT_RADIUS,
-                        cx + WS_DOT_RADIUS,
-                        dot_mid_y + WS_DOT_RADIUS,
+                        cx - dot_radius,
+                        dot_mid_y - dot_radius,
+                        cx + dot_radius,
+                        dot_mid_y + dot_radius,
                     );
                     SelectObject(hdc, previous);
                 }
                 let _ = DeleteObject(filled_brush);
                 let _ = DeleteObject(empty_brush);
 
-                let clock_x = bar_width / 2 - CLOCK_LABEL_WIDTH / 2;
+                let clock_x = bar_width / 2 - scaled(CLOCK_LABEL_WIDTH, dpi) / 2;
                 draw_text_in(
                     hdc,
                     RECT {
                         left: clock_x,
                         top: 0,
-                        right: clock_x + CLOCK_LABEL_WIDTH,
-                        bottom: BAR_HEIGHT,
+                        right: clock_x + scaled(CLOCK_LABEL_WIDTH, dpi),
+                        bottom: bar_h,
                     },
                     &clock_text(),
                     format,
                 );
 
-                let qs_x = bar_width - QS_LABEL_WIDTH - QS_LABEL_MARGIN;
+                let qs_x = bar_width - scaled(QS_LABEL_WIDTH + QS_LABEL_MARGIN, dpi);
                 draw_text_in(
                     hdc,
                     RECT {
                         left: qs_x,
                         top: 0,
-                        right: qs_x + QS_LABEL_WIDTH,
-                        bottom: BAR_HEIGHT,
+                        right: qs_x + scaled(QS_LABEL_WIDTH, dpi),
+                        bottom: bar_h,
                     },
                     &quick_settings_label_text(),
                     format,
                 );
+
+                SelectObject(hdc, previous_font);
+                let _ = DeleteObject(font);
             }
 
             let _ = EndPaint(hwnd, &ps);
@@ -1106,15 +1277,12 @@ mod imp {
         }
     }
 
-    /// Draws every workspace card at its current (possibly mid-animation)
-    /// rect. This is a flat placeholder "desktop" fill, not the real
-    /// wallpaper: reliably capturing it would mean decoding whatever
-    /// format/location Windows currently stores it in (JPEG/PNG, sometimes
-    /// per-monitor, sometimes a transcoded cache file), which needs GDI+/WIC
-    /// rather than classic GDI — left as a follow-up. This still fixes the
-    /// actual complaint it's standing in for: every card now has a fixed,
-    /// visible boundary, so a small window inside it doesn't look like it's
-    /// floating in empty space.
+    /// Draws every workspace card (wallpaper-filled — see
+    /// `draw_wallpaper_into`) at its current carousel-shifted position,
+    /// then each window's grid-slot content: a placeholder chip with title
+    /// for anything without a live thumbnail (DWM draws live ones directly,
+    /// this process never touches their pixels), and every slot's icon
+    /// badge regardless of live/placeholder.
     fn paint_overview(hwnd: HWND) {
         let content = STATE.with(|s| {
             let state = s.borrow();
@@ -1125,49 +1293,143 @@ mod imp {
                 | OverviewMode::Closing { cards, thumbs, .. } => (cards, thumbs),
                 OverviewMode::Closed => return None,
             };
-            let page_w = page_width();
+            let (_, pitch) = card_layout();
             let cards = cards
                 .iter()
-                .map(|c| displayed_rect(c.current, c.page, st.carousel_offset, page_w))
+                .map(|c| displayed_rect(c.rect, c.page, st.carousel_offset, pitch))
                 .collect::<Vec<_>>();
-            let placeholders = thumbs
+            // Slots without a live DWM thumbnail paint either the window's
+            // park-time snapshot (parked windows — see `WINDOW_SNAPSHOTS`)
+            // or, lacking even that, a title chip.
+            let mut snapshots: Vec<(RECT, (i32, i32, isize))> = Vec::new();
+            let mut placeholders: Vec<(RECT, String)> = Vec::new();
+            for th in thumbs.iter().filter(|th| th.thumbnail.is_none()) {
+                let rect = displayed_rect(th.rect, th.page, st.carousel_offset, pitch);
+                match window_snapshot(th.hwnd.0 as isize) {
+                    Some(snapshot) => snapshots.push((rect, snapshot)),
+                    None => placeholders.push((rect, th.title.clone())),
+                }
+            }
+            let icons = thumbs
                 .iter()
-                .filter(|th| th.thumbnail.is_none())
-                .map(|th| (displayed_rect(th.current, th.page, st.carousel_offset, page_w), th.title.clone()))
+                .filter_map(|th| {
+                    th.icon
+                        .map(|icon| (displayed_rect(th.icon_rect, th.page, st.carousel_offset, pitch), icon))
+                })
                 .collect::<Vec<_>>();
-            Some((cards, placeholders))
+            Some((cards, snapshots, placeholders, icons))
         });
 
-        // SAFETY: `hwnd` is the window currently processing `WM_PAINT`.
+        // Double-buffered: everything is composed into a memory bitmap and
+        // blitted to the screen in one `BitBlt`. Painting straight to the
+        // window DC drew the backdrop, wallpaper, chips, and icons as
+        // separately visible steps — flicker on every drag `WM_MOUSEMOVE`.
+        // The paired `WM_ERASEBKGND` handler returns nonzero for this
+        // window (see `wndproc`) since the backdrop fill happens here.
+        //
+        // SAFETY: `hwnd` is the window currently processing `WM_PAINT`;
+        // all GDI objects created here are torn down before returning.
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            if let Some((cards, placeholders)) = content {
-                let brush = CreateSolidBrush(COLORREF(0x00805030));
-                for rect in &cards {
-                    FillRect(hdc, rect, brush);
-                }
-                let _ = DeleteObject(brush);
 
-                // Placeholder chips: windows on a workspace that isn't
-                // current have no live pixel content (they're hidden), so
-                // this is just their last-known title, not a preview.
-                let chip_brush = CreateSolidBrush(COLORREF(0x00404040));
-                SetBkMode(hdc, TRANSPARENT);
-                SetTextColor(hdc, COLORREF(0x00E0E0E0));
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let (w, h) = (client.right.max(1), client.bottom.max(1));
+            let mem = CreateCompatibleDC(hdc);
+            let buffer = overview_back_buffer(hdc, w, h);
+            let previous = SelectObject(mem, buffer);
+
+            // Same backdrop color as the window class's brush.
+            let backdrop_brush = CreateSolidBrush(COLORREF(0x00404040));
+            FillRect(mem, &client, backdrop_brush);
+            let _ = DeleteObject(backdrop_brush);
+
+            if let Some((cards, snapshots, placeholders, icons)) = content {
+                // Flat fallback fill first, in case the wallpaper failed to
+                // load — a card should never look like a hole in the UI.
+                let fallback_brush = CreateSolidBrush(COLORREF(0x00302010));
+                for rect in &cards {
+                    FillRect(mem, rect, fallback_brush);
+                    draw_wallpaper_into(mem, *rect);
+                }
+                let _ = DeleteObject(fallback_brush);
+
+                // Park-time snapshots of parked windows, stretched into
+                // their (already aspect-fit — see `layout_grid`) slots.
+                if !snapshots.is_empty() {
+                    let src = CreateCompatibleDC(hdc);
+                    SetStretchBltMode(mem, HALFTONE);
+                    for (rect, (src_w, src_h, bitmap)) in &snapshots {
+                        let previous_src = SelectObject(src, HBITMAP(*bitmap as *mut c_void));
+                        let _ = StretchBlt(
+                            mem,
+                            rect.left,
+                            rect.top,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                            src,
+                            0,
+                            0,
+                            *src_w,
+                            *src_h,
+                            SRCCOPY,
+                        );
+                        SelectObject(src, previous_src);
+                    }
+                    let _ = DeleteDC(src);
+                }
+
+                // Placeholder chips: fallback for windows with neither a
+                // live thumbnail nor a snapshot (window died, or it's
+                // minimized-and-hidden) — just their last-known title.
+                let chip_brush = CreateSolidBrush(COLORREF(0x00303030));
+                SetBkMode(mem, TRANSPARENT);
+                SetTextColor(mem, COLORREF(0x00E0E0E0));
                 for (rect, title) in &placeholders {
-                    FillRect(hdc, rect, chip_brush);
+                    FillRect(mem, rect, chip_brush);
                     draw_text_in(
-                        hdc,
+                        mem,
                         *rect,
                         title,
                         DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS,
                     );
                 }
                 let _ = DeleteObject(chip_brush);
+
+                for (rect, icon) in &icons {
+                    let size = rect.right - rect.left;
+                    let _ = DrawIconEx(mem, rect.left, rect.top, *icon, size, size, 0, None, DI_NORMAL);
+                }
             }
+
+            let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, previous);
+            let _ = DeleteDC(mem);
             let _ = EndPaint(hwnd, &ps);
         }
+    }
+
+    thread_local! {
+        /// The overview's reusable back buffer (`(width, height, HBITMAP)`).
+        /// Allocating a fresh full-virtual-screen bitmap (tens of MB) on
+        /// every `WM_PAINT` was measurable jank at drag-repaint rates;
+        /// recreated only if the client size changes.
+        static OVERVIEW_BACK_BUFFER: RefCell<Option<(i32, i32, isize)>> = const { RefCell::new(None) };
+    }
+
+    /// SAFETY: `hdc` must be a valid device context; the returned HBITMAP
+    /// is owned by the cache and must not be deleted by the caller.
+    unsafe fn overview_back_buffer(hdc: HDC, w: i32, h: i32) -> HBITMAP {
+        if let Some((cw, ch, handle)) = OVERVIEW_BACK_BUFFER.with(|c| *c.borrow()) {
+            if cw == w && ch == h {
+                return HBITMAP(handle as *mut c_void);
+            }
+            let _ = DeleteObject(HBITMAP(handle as *mut c_void));
+        }
+        let buffer = CreateCompatibleBitmap(hdc, w, h);
+        OVERVIEW_BACK_BUFFER.with(|c| *c.borrow_mut() = Some((w, h, buffer.0 as isize)));
+        buffer
     }
 
     /// Acquires the default audio endpoint's volume control fresh for each
@@ -1218,43 +1480,6 @@ mod imp {
         1.0 - (1.0 - t).powi(3)
     }
 
-    fn lerp(a: i32, b: i32, t: f64) -> i32 {
-        (a as f64 + (b as f64 - a as f64) * t).round() as i32
-    }
-
-    fn lerp_rect(from: RECT, to: RECT, t: f64) -> RECT {
-        RECT {
-            left: lerp(from.left, to.left, t),
-            top: lerp(from.top, to.top, t),
-            right: lerp(from.right, to.right, t),
-            bottom: lerp(from.bottom, to.bottom, t),
-        }
-    }
-
-    /// Scales `r` toward `(pivot_x, pivot_y)` by factor `s` — the "zoom
-    /// out toward the center of its own workspace card" transform applied
-    /// uniformly to a card and everything on it, as a group, rather than
-    /// rearranging windows into a grid.
-    fn scale_about(r: RECT, pivot_x: i32, pivot_y: i32, s: f64) -> RECT {
-        let scale = |v: i32, pivot: i32| pivot + ((v - pivot) as f64 * s).round() as i32;
-        RECT {
-            left: scale(r.left, pivot_x),
-            top: scale(r.top, pivot_y),
-            right: scale(r.right, pivot_x),
-            bottom: scale(r.bottom, pivot_y),
-        }
-    }
-
-    /// The overview spans the full virtual screen (see `open_overview`), so
-    /// that's also each carousel page's width — pages sit side by side,
-    /// one virtual-screen-width apart. Recomputed on demand rather than
-    /// cached: cheap, and consistent with the rest of this module not
-    /// handling live display-topology changes.
-    fn page_width() -> i32 {
-        // SAFETY: no preconditions.
-        unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }
-    }
-
     fn shift_x(r: RECT, dx: i32) -> RECT {
         RECT {
             left: r.left + dx,
@@ -1265,14 +1490,286 @@ mod imp {
     }
 
     /// Translates a page-local rect by the carousel's current horizontal
-    /// scroll: page `page` sits at `(page - offset) * page_width` pixels
-    /// from its own local origin. Applied only at the moment a rect is
-    /// pushed to DWM, painted, or hit-tested — never baked back into
-    /// `ThumbAnim`/`CardAnim::current`, so the zoom animation math in
-    /// `tick_thumbs`/`tick_cards` never has to know about the carousel.
-    fn displayed_rect(base: RECT, page: usize, offset: f64, page_width: i32) -> RECT {
-        let dx = ((page as f64 - offset) * page_width as f64).round() as i32;
+    /// scroll: page `page` sits at `(page - offset) * pitch` pixels from
+    /// its own local origin (`pitch` is `card_layout`'s page-to-page
+    /// spacing). Applied only at the moment a rect is pushed to DWM,
+    /// painted, or hit-tested — never baked back into
+    /// `ThumbAnim`/`CardAnim::rect`.
+    fn displayed_rect(base: RECT, page: usize, offset: f64, pitch: i32) -> RECT {
+        let dx = ((page as f64 - offset) * pitch as f64).round() as i32;
         shift_x(base, dx)
+    }
+
+    /// The fixed, page-local rect every workspace's card occupies (GNOME-
+    /// style: a large card sized as a fraction of the *primary monitor's*
+    /// width — not the full multi-monitor virtual screen, which on a
+    /// multi-monitor setup is much wider than any one screen and would
+    /// produce a card spanning most of both monitors — vertically centered
+    /// in the space below the bar and above the future dock, horizontally
+    /// centered on the primary monitor specifically so the focused card
+    /// actually sits on the screen the user is looking at), plus the
+    /// page-to-page pitch (card width + gap) the carousel spaces pages
+    /// apart by. Recomputed on demand rather than cached: cheap, and
+    /// consistent with the rest of this module not handling live
+    /// display-topology changes.
+    fn card_layout() -> (RECT, i32) {
+        // SAFETY: no preconditions. The overview window's own top-left
+        // sits at exactly this point (see `open_overview`), so subtracting
+        // it converts a monitor's absolute virtual-screen rect into
+        // overview-client-local coordinates.
+        let (origin_x, client_h) = unsafe {
+            (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN))
+        };
+
+        let monitors = monitors_sorted_by_x();
+        let reference = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first());
+        let (ref_w, ref_aspect, ref_center_x_abs, dpi) = match reference {
+            Some(m) => {
+                let w = (m.rect.right - m.rect.left) as f64;
+                let h = (m.rect.bottom - m.rect.top).max(1) as f64;
+                (w, w / h, (m.rect.left + m.rect.right) / 2, m.dpi)
+            }
+            None => (1920.0, 16.0 / 9.0, origin_x + 960, 96),
+        };
+
+        let card_w = (ref_w * CARD_WIDTH_FRACTION).round() as i32;
+        let max_card_h =
+            (client_h - scaled(BAR_HEIGHT + CARD_MARGIN_TOP + CARD_MARGIN_BOTTOM, dpi)).max(1);
+        let card_h = ((card_w as f64 / ref_aspect).round() as i32).min(max_card_h).max(1);
+
+        let card_top = scaled(BAR_HEIGHT + CARD_MARGIN_TOP, dpi) + (max_card_h - card_h) / 2;
+        let card_left = (ref_center_x_abs - origin_x) - card_w / 2;
+        let rect = RECT {
+            left: card_left,
+            top: card_top,
+            right: card_left + card_w,
+            bottom: card_top + card_h,
+        };
+        (rect, card_w + scaled(CARD_GAP, dpi))
+    }
+
+    /// Arranges `windows` in a simple auto grid within `card` — GNOME-
+    /// style: their assigned slot, not their real screen position/size —
+    /// each slot aspect-fit (letterboxed, not stretched/distorted) within
+    /// its cell, with room left below for a small icon badge. Returns
+    /// `(thumbnail_slot_rect, icon_rect, window)` triples in the same
+    /// order as `windows`.
+    fn layout_grid(
+        card: RECT,
+        windows: Vec<groveshell_window_model::WindowRecord>,
+    ) -> Vec<(RECT, RECT, groveshell_window_model::WindowRecord)> {
+        if windows.is_empty() {
+            return Vec::new();
+        }
+
+        let dpi = reference_dpi();
+        let padding = scaled(CARD_CONTENT_PADDING, dpi);
+        let content = RECT {
+            left: card.left + padding,
+            top: card.top + padding,
+            right: card.right - padding,
+            bottom: card.bottom - padding,
+        };
+        let n = windows.len();
+        let cols = (n as f64).sqrt().ceil().max(1.0) as i32;
+        let rows = (n as i32 + cols - 1) / cols;
+
+        let icon_size = scaled(THUMB_ICON_SIZE, dpi);
+        let icon_gap = scaled(THUMB_ICON_GAP, dpi);
+        let thumb_gap = scaled(THUMB_GAP, dpi);
+        let cell_w = ((content.right - content.left).max(1)) / cols;
+        let cell_h = ((content.bottom - content.top).max(1)) / rows;
+        let icon_band_h = icon_size + icon_gap;
+        let slot_w = (cell_w - thumb_gap).max(1);
+        let slot_h = (cell_h - thumb_gap - icon_band_h).max(1);
+
+        windows
+            .into_iter()
+            .enumerate()
+            .map(|(i, window)| {
+                let col = i as i32 % cols;
+                let row = i as i32 / cols;
+                let cell_left = content.left + col * cell_w;
+                let cell_top = content.top + row * cell_h;
+
+                let src_w = (window.rect.right - window.rect.left).max(1) as f64;
+                let src_h = (window.rect.bottom - window.rect.top).max(1) as f64;
+                let src_aspect = src_w / src_h;
+                let slot_aspect = slot_w as f64 / slot_h as f64;
+                let (fit_w, fit_h) = if src_aspect > slot_aspect {
+                    (slot_w, ((slot_w as f64 / src_aspect).round() as i32).max(1))
+                } else {
+                    (((slot_h as f64 * src_aspect).round() as i32).max(1), slot_h)
+                };
+
+                let thumb_left = cell_left + (cell_w - fit_w) / 2;
+                let thumb_top = cell_top + (cell_h - icon_band_h - fit_h) / 2;
+                let thumb_rect = RECT {
+                    left: thumb_left,
+                    top: thumb_top,
+                    right: thumb_left + fit_w,
+                    bottom: thumb_top + fit_h,
+                };
+
+                let icon_left = cell_left + (cell_w - icon_size) / 2;
+                let icon_top = thumb_rect.bottom + icon_gap;
+                let icon_rect = RECT {
+                    left: icon_left,
+                    top: icon_top,
+                    right: icon_left + icon_size,
+                    bottom: icon_top + icon_size,
+                };
+
+                (thumb_rect, icon_rect, window)
+            })
+            .collect()
+    }
+
+    /// Best-effort small icon for `hwnd` — first the window's own current
+    /// icon (`WM_GETICON`, which reflects e.g. a per-document icon some
+    /// apps set), falling back to its window class's icon. Returned handles
+    /// are owned by the window/class itself and must never be destroyed
+    /// here.
+    fn window_icon(hwnd: HWND) -> Option<HICON> {
+        // SAFETY: `hwnd` is a live top-level window; both queries are
+        // synchronous and read-only.
+        unsafe {
+            let small = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_SMALL as usize), LPARAM(0));
+            if small.0 != 0 {
+                return Some(HICON(small.0 as *mut c_void));
+            }
+            let class_icon = GetClassLongPtrW(hwnd, GCLP_HICONSM);
+            if class_icon != 0 {
+                return Some(HICON(class_icon as *mut c_void));
+            }
+            None
+        }
+    }
+
+    thread_local! {
+        /// Cached wallpaper bitmap handle: `Some(0)` means "looked it up
+        /// already and there isn't one" (or GDI+ failed), distinct from
+        /// not-yet-looked-up (`None`).
+        static WALLPAPER_BITMAP: RefCell<Option<isize>> = const { RefCell::new(None) };
+    }
+
+    /// Lazily loads and caches the real desktop wallpaper via GDI+ (loaded
+    /// once per process — this module doesn't handle a live wallpaper
+    /// change). `None` if the wallpaper path lookup or GDI+ decode fails,
+    /// in which case callers fall back to a flat color.
+    fn wallpaper_bitmap() -> Option<*mut GpBitmap> {
+        if let Some(cached) = WALLPAPER_BITMAP.with(|c| *c.borrow()) {
+            return (cached != 0).then_some(cached as *mut GpBitmap);
+        }
+        let bitmap = load_wallpaper_bitmap();
+        WALLPAPER_BITMAP.with(|c| *c.borrow_mut() = Some(bitmap.map(|b| b as isize).unwrap_or(0)));
+        bitmap
+    }
+
+    fn load_wallpaper_bitmap() -> Option<*mut GpBitmap> {
+        let mut path_buf = [0u16; 260];
+        // SAFETY: `path_buf` is `MAX_PATH`-sized and outlives this
+        // synchronous call.
+        unsafe {
+            SystemParametersInfoW(
+                SPI_GETDESKWALLPAPER,
+                path_buf.len() as u32,
+                Some(path_buf.as_mut_ptr() as *mut c_void),
+                Default::default(),
+            )
+            .ok()?;
+        }
+        let len = path_buf.iter().position(|&c| c == 0).unwrap_or(0);
+        if len == 0 {
+            return None;
+        }
+
+        let mut bitmap: *mut GpBitmap = std::ptr::null_mut();
+        // SAFETY: `path_buf` is nul-terminated (already true within the
+        // first `len` characters via the position above; the buffer itself
+        // is nul-terminated at worst at its own end) for the duration of
+        // this call; `bitmap` is written by GDI+ only on success.
+        let status = unsafe { GdipCreateBitmapFromFile(PCWSTR(path_buf.as_ptr()), &mut bitmap) };
+        (status.0 == 0 && !bitmap.is_null()).then_some(bitmap)
+    }
+
+    thread_local! {
+        /// The wallpaper pre-scaled to card size as a plain GDI `HBITMAP`
+        /// (`(width, height, handle)`). GDI+'s interpolated rescale of a
+        /// multi-megapixel source is far too slow to run once per card per
+        /// paint — it made the overview visibly draw in vertical strips and
+        /// drop to a few fps while dragging — so it runs once per card
+        /// size here and every paint after that is a cheap `BitBlt`.
+        /// Every card shares one size (see `card_layout`), so a single
+        /// entry suffices; it's re-rendered only if the size changes.
+        static WALLPAPER_SCALED: RefCell<Option<(i32, i32, isize)>> = const { RefCell::new(None) };
+    }
+
+    fn scaled_wallpaper(width: i32, height: i32) -> Option<isize> {
+        if let Some((w, h, handle)) = WALLPAPER_SCALED.with(|c| *c.borrow()) {
+            if w == width && h == height {
+                return Some(handle);
+            }
+            // SAFETY: `handle` is an HBITMAP created below on this same
+            // thread and owned exclusively by this cache.
+            unsafe {
+                let _ = DeleteObject(windows::Win32::Graphics::Gdi::HBITMAP(handle as *mut c_void));
+            }
+            WALLPAPER_SCALED.with(|c| *c.borrow_mut() = None);
+        }
+
+        let source = wallpaper_bitmap()?;
+        // SAFETY: standard create-select-draw-restore GDI sequence on
+        // handles created and torn down entirely within this call (except
+        // `bitmap`, whose ownership moves into the cache); `source` was
+        // loaded once at startup and never freed/moved.
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, width, height);
+            let previous = SelectObject(mem, bitmap);
+
+            let mut graphics: *mut GpGraphics = std::ptr::null_mut();
+            let ok = GdipCreateFromHDC(mem, &mut graphics).0 == 0 && !graphics.is_null();
+            if ok {
+                let _ = GdipDrawImageRectI(graphics, source as *mut GpImage, 0, 0, width, height);
+                let _ = GdipDeleteGraphics(graphics);
+            }
+
+            SelectObject(mem, previous);
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+
+            if !ok {
+                let _ = DeleteObject(bitmap);
+                return None;
+            }
+            let handle = bitmap.0 as isize;
+            WALLPAPER_SCALED.with(|c| *c.borrow_mut() = Some((width, height, handle)));
+            Some(handle)
+        }
+    }
+
+    /// Blits the pre-scaled wallpaper (see `scaled_wallpaper`) to fill
+    /// `rect` exactly. No-op (leaves whatever fallback fill was already
+    /// painted there) if the wallpaper couldn't be loaded.
+    fn draw_wallpaper_into(hdc: HDC, rect: RECT) {
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        let Some(handle) = scaled_wallpaper(width, height) else {
+            return;
+        };
+        // SAFETY: `hdc` is a valid device context for the duration of this
+        // call; `handle` is the cache-owned HBITMAP, alive until the next
+        // size change.
+        unsafe {
+            let mem = CreateCompatibleDC(hdc);
+            let previous =
+                SelectObject(mem, windows::Win32::Graphics::Gdi::HBITMAP(handle as *mut c_void));
+            let _ = BitBlt(hdc, rect.left, rect.top, width, height, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, previous);
+            let _ = DeleteDC(mem);
+        }
     }
 
     fn set_thumb_rect(thumbnail: isize, rect: RECT) {
@@ -1419,31 +1916,152 @@ mod imp {
     }
 
     /// Re-syncs the workspace tracker against reality — assigns any
-    /// currently-visible-but-untracked window to the current workspace, and
-    /// drops assignments for windows that no longer exist — since this
-    /// process has no live window-create/destroy event tracking yet
-    /// (Phase 1's `SetWinEventHook` follow-up); every workspace-changing
-    /// action re-syncs first instead. Returns the live snapshot taken to do
-    /// this, for callers that also need it (building the current page).
+    /// currently-visible-but-untracked window and drops assignments for
+    /// windows that no longer exist — since this process has no live
+    /// window-create/destroy event tracking yet (Phase 1's
+    /// `SetWinEventHook` follow-up); every workspace-changing action
+    /// re-syncs first instead.
+    ///
+    /// Assignment rule: a new window belongs to the workspace the user is
+    /// actually looking at. When the current workspace is a dynamic one,
+    /// that's simply "current" — matching it against monitor position
+    /// instead would pull it onto the monitor's pinned workspace, which is
+    /// exactly the bug where a window opened on workspace 2 "jumped" back
+    /// to workspace 0 at the next sync. Only when the current workspace is
+    /// pinned (so every visible workspace is a real monitor) does screen
+    /// position decide *which* monitor's workspace it belongs to.
+    /// Returns the live snapshot taken to do this, for callers that also
+    /// need it (building overview pages).
     fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
         let live = groveshell_window_model::snapshot();
+        let monitors = monitors_sorted_by_x();
         STATE.with(|s| {
             if let Some(state) = s.borrow_mut().as_mut() {
-                state.workspaces.observe_active(live.iter().map(|w| w.hwnd));
+                let current = state.workspaces.current_index();
+                let current_pinned = state.workspaces.is_pinned(current);
+                for window in &live {
+                    if state.workspaces.workspace_of(window.hwnd).is_some() {
+                        continue;
+                    }
+                    let index = if current_pinned {
+                        let center_x = (window.rect.left + window.rect.right) / 2;
+                        let center_y = (window.rect.top + window.rect.bottom) / 2;
+                        monitor_index_for_center(&monitors, center_x, center_y).unwrap_or(current)
+                    } else {
+                        current
+                    };
+                    state.workspaces.assign_to_index(window.hwnd, index);
+                }
                 state.workspaces.prune(groveshell_window_model::is_alive);
+                let tracked: Vec<isize> = state
+                    .workspaces
+                    .workspace_ids()
+                    .to_vec()
+                    .into_iter()
+                    .flat_map(|id| state.workspaces.windows_on(id))
+                    .collect();
+                retain_window_snapshots(&tracked);
             }
         });
         live
     }
 
-    /// Starts the "zoom out" animation: for every workspace, for every
-    /// monitor, registers its workspace card (see module docs) and a
-    /// preview for every window assigned to it, then kicks off a timer to
-    /// animate the *current* workspace's page down to `OVERVIEW_SCALE`
-    /// around its own monitors' centers (every other page starts already
-    /// zoomed out, off to the side — see the module docs on the carousel).
-    /// No-op if the overview isn't currently `Closed` (already open or
-    /// mid-animation).
+    /// Re-syncs the workspace tracker (see `sync_workspaces`) and builds a
+    /// fresh `(cards, thumbs)` pair covering *every* current workspace's
+    /// page — one wallpaper-filled card each (see `card_layout`), each
+    /// with live thumbnails in its window grid (see `layout_grid`):
+    /// inactive workspaces' windows are parked off-screen rather than
+    /// hidden precisely so DWM can still render them here (see
+    /// `park_window`). Used both to open the overview and to refresh it in
+    /// place after a workspace switch changes which page is current, how
+    /// many workspaces exist, or which windows live where
+    /// (`commit_workspace_switch` calls this rather than patching the
+    /// previous session's pages piecemeal).
+    fn build_carousel_pages(overview_hwnd: HWND) -> (Vec<CardAnim>, Vec<ThumbAnim>, usize) {
+        let live = sync_workspaces();
+
+        let (workspace_ids, current_pos): (Vec<WorkspaceId>, usize) = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| (st.workspaces.workspace_ids().to_vec(), st.workspaces.current_index()))
+                .unwrap_or_default()
+        });
+
+        let (card_rect, pitch) = card_layout();
+        let mut cards = Vec::new();
+        let mut thumbs = Vec::new();
+
+        for (page, &ws_id) in workspace_ids.iter().enumerate() {
+            cards.push(CardAnim { page, rect: card_rect });
+
+            // A page's windows come from its workspace *assignments*, not
+            // from what's on screen — parked windows show up in the live
+            // snapshot too, so filtering by assignment is what keeps each
+            // window on its own page. The snapshot is just a lookup cache
+            // here; anything not in it (e.g. a minimized-and-hidden
+            // window) falls back to a direct re-inspection.
+            let assigned = STATE
+                .with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|st| st.workspaces.windows_on(ws_id))
+                        .unwrap_or_default()
+                });
+            let windows: Vec<groveshell_window_model::WindowRecord> = assigned
+                .into_iter()
+                .filter_map(|hwnd| {
+                    live.iter()
+                        .find(|w| w.hwnd == hwnd)
+                        .cloned()
+                        .or_else(|| groveshell_window_model::describe(hwnd))
+                })
+                .collect();
+
+            for (slot_rect, icon_rect, window) in layout_grid(card_rect, windows) {
+                let source = HWND(window.hwnd as *mut c_void);
+                let icon = window_icon(source);
+
+                // A parked window has a park-time snapshot that
+                // `paint_overview` draws directly — a live DWM thumbnail
+                // of it would go blank as soon as the app notices it's
+                // off-screen and stops rendering (see `WORKSPACE_PARK_DY`).
+                // Everything actually on screen (the current workspace,
+                // or another monitor's pinned page) gets a live DWM
+                // thumbnail; if that registration fails (window died),
+                // the slot paints as a title chip instead.
+                // SAFETY: `overview_hwnd` is a valid, process-lifetime
+                // window; a stale `source` simply makes this fail.
+                let thumbnail = if window_snapshot(window.hwnd).is_some() {
+                    None
+                } else {
+                    unsafe { DwmRegisterThumbnail(overview_hwnd, source) }.ok()
+                };
+                if let Some(handle) = thumbnail {
+                    set_thumb_rect(handle, displayed_rect(slot_rect, page, current_pos as f64, pitch));
+                }
+
+                thumbs.push(ThumbAnim {
+                    thumbnail,
+                    hwnd: source,
+                    title: window.title,
+                    icon,
+                    page,
+                    rect: slot_rect,
+                    icon_rect,
+                });
+            }
+        }
+
+        (cards, thumbs, current_pos)
+    }
+
+    /// Shows the overview and fades it in (see the module docs on why
+    /// there's no per-window position animation anymore): builds every
+    /// workspace's page (`build_carousel_pages`), keeps the bars visually
+    /// on top of it (`HWND_TOPMOST` reassertion — the overview is topmost
+    /// too, and would otherwise win the z-order fight since it's shown
+    /// after them), and kicks off the fade timer. No-op if the overview
+    /// isn't currently `Closed` (already open or mid-animation).
     fn open_overview() {
         let overview_hwnd = STATE.with(|s| {
             s.borrow().as_ref().and_then(|st| {
@@ -1460,142 +2078,7 @@ mod imp {
         hide_calendar(false);
         hide_quick_settings(false);
 
-        let live = sync_workspaces();
-
-        // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
-        let mut overview_screen_rect = RECT::default();
-        unsafe {
-            let _ = GetWindowRect(overview_hwnd, &mut overview_screen_rect);
-        }
-        let origin_x = overview_screen_rect.left;
-        let origin_y = overview_screen_rect.top;
-
-        struct MonitorCard {
-            /// This monitor's desktop area (below its own bar), in
-            /// overview-local coordinates.
-            rect: RECT,
-            pivot: (i32, i32),
-        }
-        let monitor_cards: Vec<MonitorCard> = enumerate_monitors()
-            .iter()
-            .map(|m| {
-                let local = RECT {
-                    left: m.rect.left - origin_x,
-                    top: m.rect.top - origin_y + BAR_HEIGHT,
-                    right: m.rect.right - origin_x,
-                    bottom: m.rect.bottom - origin_y,
-                };
-                let pivot = ((local.left + local.right) / 2, (local.top + local.bottom) / 2);
-                MonitorCard { rect: local, pivot }
-            })
-            .collect();
-
-        let (workspace_ids, current_pos): (Vec<WorkspaceId>, usize) = STATE.with(|s| {
-            s.borrow()
-                .as_ref()
-                .map(|st| (st.workspaces.workspace_ids().to_vec(), st.workspaces.current_index()))
-                .unwrap_or_default()
-        });
-
-        let page_w = page_width();
-        let mut cards = Vec::new();
-        let mut thumbs = Vec::new();
-        let mut live_opt = Some(live);
-
-        for (page, &ws_id) in workspace_ids.iter().enumerate() {
-            let is_current_page = page == current_pos;
-
-            for mc in &monitor_cards {
-                let to = scale_about(mc.rect, mc.pivot.0, mc.pivot.1, OVERVIEW_SCALE);
-                let from = if is_current_page { mc.rect } else { to };
-                cards.push(CardAnim { page, from, to, current: from });
-            }
-
-            // Only the current workspace's windows are ever actually
-            // visible (everything else is workspace-hidden); reuse the
-            // snapshot already taken by `sync_workspaces` for it rather
-            // than re-enumerating.
-            let windows: Vec<groveshell_window_model::WindowRecord> = if is_current_page {
-                live_opt.take().unwrap_or_default()
-            } else {
-                STATE
-                    .with(|s| {
-                        s.borrow()
-                            .as_ref()
-                            .map(|st| st.workspaces.windows_on(ws_id))
-                            .unwrap_or_default()
-                    })
-                    .into_iter()
-                    .filter_map(groveshell_window_model::describe)
-                    .collect()
-            };
-
-            for window in windows {
-                let source = HWND(window.hwnd as *mut c_void);
-                let from_real = RECT {
-                    left: window.rect.left - origin_x,
-                    top: window.rect.top - origin_y,
-                    right: window.rect.right - origin_x,
-                    bottom: window.rect.bottom - origin_y,
-                };
-
-                // Scale this window in lockstep with whichever monitor's
-                // card contains its center — not one shared pivot for the
-                // whole multi-monitor span, which would make two monitors'
-                // windows collide toward a single point somewhere between
-                // them. Falls back to the first monitor if the center is
-                // somehow outside all of them (e.g. a monitor was just
-                // disconnected).
-                let center_x = (from_real.left + from_real.right) / 2;
-                let center_y = (from_real.top + from_real.bottom) / 2;
-                let owner = monitor_cards
-                    .iter()
-                    .find(|mc| {
-                        center_x >= mc.rect.left
-                            && center_x < mc.rect.right
-                            && center_y >= mc.rect.top
-                            && center_y < mc.rect.bottom
-                    })
-                    .unwrap_or(&monitor_cards[0]);
-                let zoomed = scale_about(from_real, owner.pivot.0, owner.pivot.1, OVERVIEW_SCALE);
-
-                let (from, initial) = if is_current_page {
-                    (from_real, from_real)
-                } else {
-                    (zoomed, zoomed)
-                };
-
-                // A hidden (inactive-workspace) window has no live pixel
-                // content to preview — see the module docs — so only the
-                // current page ever gets a real DWM thumbnail here.
-                // SAFETY: `overview_hwnd` and `source` are both live
-                // windows; `source` was enumerated moments ago and may
-                // have closed since, in which case this simply fails.
-                let thumbnail = if is_current_page {
-                    unsafe { DwmRegisterThumbnail(overview_hwnd, source) }.ok()
-                } else {
-                    None
-                };
-
-                if let Some(handle) = thumbnail {
-                    // Show it immediately at "from" — exactly where the
-                    // real window currently sits — so the animation reads
-                    // as that window shrinking away, not popping in from
-                    // nowhere.
-                    set_thumb_rect(handle, displayed_rect(initial, page, current_pos as f64, page_w));
-                }
-
-                thumbs.push(ThumbAnim {
-                    thumbnail,
-                    hwnd: source,
-                    title: window.title,
-                    page,
-                    from,
-                    to: zoomed,
-                    current: initial,
-                });
-            }
-        }
+        let (cards, thumbs, current_pos) = build_carousel_pages(overview_hwnd);
 
         // SAFETY: no preconditions.
         let previous_foreground = unsafe { GetForegroundWindow() };
@@ -1617,19 +2100,99 @@ mod imp {
 
         // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
         unsafe {
+            let _ = SetLayeredWindowAttributes(overview_hwnd, COLORREF(0), 0, LWA_ALPHA);
             let _ = ShowWindow(overview_hwnd, SW_SHOW);
             let _ = SetForegroundWindow(overview_hwnd);
             let _ = SetFocus(overview_hwnd);
+            raise_bars_topmost();
             SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
         }
     }
 
-    /// Starts the reverse animation from wherever the thumbnails/cards
-    /// currently are back to their real positions, then hides the overview
-    /// and focuses `focus_after` (or restores whatever was focused before
-    /// Activities was opened, if `None`). Works whether the overview is
-    /// currently `Open` (idle) or still `Opening` (interrupts it smoothly
-    /// from its current position — no-op only if already `Closed` or
+    /// Puts every bar back above the overview within the topmost band.
+    /// Needed once at open (the overview is shown and activated *after*
+    /// the bars) and again every time the overview is clicked — mouse
+    /// activation re-raises the overview above its topmost siblings, which
+    /// is exactly how the bar "stopped rendering" the moment a drag
+    /// started.
+    fn raise_bars_topmost() {
+        let bar_hwnds: Vec<HWND> = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| st.bars.iter().map(|b| b.hwnd).collect())
+                .unwrap_or_default()
+        });
+        // SAFETY: every bar hwnd is a valid, process-lifetime window.
+        unsafe {
+            for bar_hwnd in bar_hwnds {
+                let _ = SetWindowPos(
+                    bar_hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+
+    /// Refreshes every page's cards/thumbnails in place (see
+    /// `build_carousel_pages`) without touching `carousel_offset` or
+    /// replaying the open animation — used after `commit_workspace_switch`
+    /// while the overview is already `Open`, since that can change which
+    /// workspace is current, how many workspaces exist (the dynamic-
+    /// workspace policy grows/shrinks the trailing empty one), and which
+    /// windows live where, all at once. Re-registers live thumbnails from
+    /// scratch, so this does cause a brief flicker on the current page —
+    /// an acceptable cost for always being correct rather than patching
+    /// three kinds of drift piecemeal. No-op if the overview isn't `Open`.
+    fn rebuild_open_overview_pages() {
+        let overview_hwnd = STATE.with(|s| {
+            s.borrow().as_ref().and_then(|st| {
+                matches!(st.overview, OverviewMode::Open { .. }).then_some(st.overview_hwnd)
+            })
+        });
+        let Some(overview_hwnd) = overview_hwnd else {
+            return;
+        };
+
+        let old_thumbnails: Vec<isize> = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .map(|st| match &st.overview {
+                    OverviewMode::Open { thumbs, .. } => thumbs.iter().filter_map(|t| t.thumbnail).collect(),
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default()
+        });
+        for handle in old_thumbnails {
+            // SAFETY: registered by an earlier `build_carousel_pages` call
+            // and not yet unregistered.
+            unsafe {
+                let _ = DwmUnregisterThumbnail(handle);
+            }
+        }
+
+        let (cards, thumbs, _current_pos) = build_carousel_pages(overview_hwnd);
+
+        STATE.with(|s| {
+            if let Some(state) = s.borrow_mut().as_mut() {
+                if matches!(state.overview, OverviewMode::Open { .. }) {
+                    state.overview = OverviewMode::Open { thumbs, cards };
+                }
+            }
+        });
+
+        push_carousel_positions(overview_hwnd);
+    }
+
+    /// Starts the fade-out, then hides the overview and focuses
+    /// `focus_after` (or restores whatever was focused before Activities
+    /// was opened, if `None`) once it finishes. Works whether the overview
+    /// is currently `Open` (idle) or still `Opening` (interrupts it
+    /// smoothly from its current alpha — no-op only if already `Closed` or
     /// already `Closing`).
     fn close_overview(focus_after: Option<HWND>) {
         let overview_hwnd = STATE.with(|s| {
@@ -1641,24 +2204,6 @@ mod imp {
             let mode = std::mem::replace(&mut state.overview, OverviewMode::Closed);
             match mode {
                 OverviewMode::Open { thumbs, cards } | OverviewMode::Opening { thumbs, cards, .. } => {
-                    let thumbs = thumbs
-                        .into_iter()
-                        .map(|th| ThumbAnim {
-                            from: th.current,
-                            to: th.from,
-                            current: th.current,
-                            ..th
-                        })
-                        .collect();
-                    let cards = cards
-                        .into_iter()
-                        .map(|c| CardAnim {
-                            from: c.current,
-                            to: c.from,
-                            current: c.current,
-                            ..c
-                        })
-                        .collect();
                     state.overview = OverviewMode::Closing {
                         started: Instant::now(),
                         thumbs,
@@ -1666,7 +2211,7 @@ mod imp {
                         focus_after,
                     };
                     // Any in-progress carousel drag/slide is moot once
-                    // we're zooming back out.
+                    // we're fading back out.
                     state.carousel_drag = None;
                     state.carousel_anim = None;
                     state.carousel_close_after = None;
@@ -1690,8 +2235,11 @@ mod imp {
     }
 
     /// Dispatches a click on the primary bar to whichever of its three
-    /// painted regions it landed in (see `paint_bar` for the same layout).
-    fn on_bar_click(x: i32) {
+    /// painted regions it landed in (see `paint_bar` for the same layout,
+    /// including the DPI scaling both must agree on).
+    fn on_bar_click(hwnd: HWND, x: i32) {
+        // SAFETY: `hwnd` is the bar window currently handling this click.
+        let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
         let bar_width = STATE.with(|s| {
             s.borrow()
                 .as_ref()
@@ -1701,7 +2249,9 @@ mod imp {
             return;
         };
 
-        if (ACTIVITIES_LABEL_X..ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH).contains(&x) {
+        if (scaled(ACTIVITIES_LABEL_X, dpi)..scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi))
+            .contains(&x)
+        {
             let is_closed = STATE.with(|s| {
                 s.borrow()
                     .as_ref()
@@ -1718,9 +2268,11 @@ mod imp {
         let workspace_count = STATE
             .with(|s| s.borrow().as_ref().map(|st| st.workspaces.workspace_ids().len()))
             .unwrap_or(0);
-        let dots_width = workspace_count as i32 * WS_DOT_SLOT_WIDTH;
-        if (WS_DOTS_X..WS_DOTS_X + dots_width).contains(&x) {
-            let index = ((x - WS_DOTS_X) / WS_DOT_SLOT_WIDTH) as usize;
+        let dots_x = scaled(WS_DOTS_X, dpi);
+        let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
+        let dots_width = workspace_count as i32 * dot_slot_w;
+        if (dots_x..dots_x + dots_width).contains(&x) {
+            let index = ((x - dots_x) / dot_slot_w) as usize;
             let overview_open = STATE
                 .with(|s| s.borrow().as_ref().map(|st| matches!(st.overview, OverviewMode::Open { .. })))
                 .unwrap_or(false);
@@ -1732,14 +2284,15 @@ mod imp {
             return;
         }
 
-        let clock_x = bar_width / 2 - CLOCK_LABEL_WIDTH / 2;
-        if (clock_x..clock_x + CLOCK_LABEL_WIDTH).contains(&x) {
+        let clock_w = scaled(CLOCK_LABEL_WIDTH, dpi);
+        let clock_x = bar_width / 2 - clock_w / 2;
+        if (clock_x..clock_x + clock_w).contains(&x) {
             toggle_calendar();
             return;
         }
 
-        let qs_x = bar_width - QS_LABEL_WIDTH - QS_LABEL_MARGIN;
-        if (qs_x..bar_width - QS_LABEL_MARGIN).contains(&x) {
+        let qs_x = bar_width - scaled(QS_LABEL_WIDTH + QS_LABEL_MARGIN, dpi);
+        if (qs_x..bar_width - scaled(QS_LABEL_MARGIN, dpi)).contains(&x) {
             toggle_quick_settings();
         }
     }
@@ -1768,15 +2321,15 @@ mod imp {
             let OverviewMode::Open { thumbs, cards } = &st.overview else {
                 return (None, current);
             };
-            let page_w = page_width();
+            let (_, pitch) = card_layout();
             let thumb_hit = thumbs.iter().find_map(|th| {
-                let r = displayed_rect(th.current, th.page, st.carousel_offset, page_w);
+                let r = displayed_rect(th.rect, th.page, st.carousel_offset, pitch);
                 (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
                     .then_some(OverviewHit::Window { page: th.page, hwnd: th.hwnd })
             });
             let hit = thumb_hit.or_else(|| {
                 cards.iter().find_map(|c| {
-                    let r = displayed_rect(c.current, c.page, st.carousel_offset, page_w);
+                    let r = displayed_rect(c.rect, c.page, st.carousel_offset, pitch);
                     (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
                         .then_some(OverviewHit::EmptyPage { page: c.page })
                 })
@@ -1796,6 +2349,9 @@ mod imp {
     /// the overview is idle-`Open` (matching the existing hit-testing
     /// gate — no dragging mid zoom-animation).
     fn on_overview_drag_start(x: i32) {
+        // The click that starts this drag just re-activated (and re-raised)
+        // the overview — put the bars back on top of it.
+        raise_bars_topmost();
         STATE.with(|s| {
             if let Some(state) = s.borrow_mut().as_mut() {
                 if matches!(state.overview, OverviewMode::Open { .. }) {
@@ -1809,10 +2365,11 @@ mod imp {
         });
     }
 
-    /// Follows the pointer 1:1 while a carousel drag is active — content
-    /// moves with the cursor, so dragging right reveals the *previous*
-    /// (lower-index) workspace, matching how a touch/trackpad carousel
-    /// feels.
+    /// Follows the pointer while a carousel drag is active — content moves
+    /// with the cursor (dragging right reveals the *previous*, lower-index
+    /// workspace), at a fixed `CAROUSEL_DRAG_PAGE_DISTANCE_PX`-per-page
+    /// rate rather than the overview's actual (screen-spanning) pixel
+    /// width — see that constant's docs.
     fn on_overview_drag_move(x: i32) {
         let overview_hwnd = STATE.with(|s| {
             let mut state_ref = s.borrow_mut();
@@ -1821,8 +2378,7 @@ mod imp {
             let drag = state.carousel_drag.as_mut()?;
             let delta_px = x - drag.start_x;
             drag.max_delta = drag.max_delta.max(delta_px.abs());
-            let page_w = page_width().max(1);
-            let raw_offset = drag.start_offset - delta_px as f64 / page_w as f64;
+            let raw_offset = drag.start_offset - delta_px as f64 / CAROUSEL_DRAG_PAGE_DISTANCE_PX;
             state.carousel_offset = raw_offset.clamp(0.0, (workspace_count.max(1) - 1) as f64);
             Some(state.overview_hwnd)
         });
@@ -1882,94 +2438,213 @@ mod imp {
         }
     }
 
-    /// Commits to the workspace at `target_index`: a real `ShowWindow`
-    /// hide/show swap, so the desktop actually reflects the new current
-    /// workspace immediately, even if the overview stays open — GNOME
-    /// switches live as soon as you land on a workspace in the overview
-    /// too, rather than waiting for it to close. No-op if `target_index` is
-    /// already current.
+    /// How far below its real position a window is moved when its
+    /// workspace stops being current. Parked off-screen rather than
+    /// `SW_HIDE`-hidden deliberately: DWM renders *nothing* for a hidden
+    /// window's thumbnail — an off-screen window at least stays a real,
+    /// visible window. Far enough down to clear any plausible monitor
+    /// arrangement, small enough to stay well inside the ±32767 coordinate
+    /// space, and vertical so the window's nearest monitor (and therefore
+    /// its DPI) doesn't change.
+    ///
+    /// Off-screen alone isn't enough for previews, though: many apps
+    /// (browsers, UWP) detect they're fully occluded/off-screen and stop
+    /// producing frames, and DWM can evict their surface entirely — which
+    /// made parked windows' live thumbnails go blank shortly after
+    /// parking. That's why `park_window` also captures a static snapshot
+    /// first (see `WINDOW_SNAPSHOTS`); the overview paints that instead of
+    /// a live thumbnail for parked windows.
+    const WORKSPACE_PARK_DY: i32 = 20000;
+
+    thread_local! {
+        /// Per-window `PrintWindow` captures taken at park time, keyed by
+        /// hwnd: `(width, height, HBITMAP)`. A parked window's snapshot is
+        /// exactly its last on-screen appearance, so painting it in the
+        /// overview is indistinguishable from a live thumbnail until the
+        /// app would have next repainted anyway. Dropped (and the bitmap
+        /// destroyed) on unpark, on prune of a dead window, and never
+        /// duplicated — a re-capture replaces the old entry.
+        static WINDOW_SNAPSHOTS: RefCell<std::collections::BTreeMap<isize, (i32, i32, isize)>> =
+            const { RefCell::new(std::collections::BTreeMap::new()) };
+    }
+
+    fn window_snapshot(hwnd: isize) -> Option<(i32, i32, isize)> {
+        WINDOW_SNAPSHOTS.with(|s| s.borrow().get(&hwnd).copied())
+    }
+
+    fn drop_window_snapshot(hwnd: isize) {
+        if let Some((_, _, bitmap)) = WINDOW_SNAPSHOTS.with(|s| s.borrow_mut().remove(&hwnd)) {
+            // SAFETY: the handle was created by `capture_window_snapshot`
+            // on this thread and is owned exclusively by the map.
+            unsafe {
+                let _ = DeleteObject(HBITMAP(bitmap as *mut c_void));
+            }
+        }
+    }
+
+    /// Drops snapshots for every window not in `tracked` — dead windows
+    /// are pruned from the workspace tracker without passing through
+    /// `unpark_window`, so their bitmaps would otherwise leak.
+    fn retain_window_snapshots(tracked: &[isize]) {
+        let stale: Vec<isize> = WINDOW_SNAPSHOTS.with(|s| {
+            s.borrow()
+                .keys()
+                .filter(|hwnd| !tracked.contains(hwnd))
+                .copied()
+                .collect()
+        });
+        for hwnd in stale {
+            drop_window_snapshot(hwnd);
+        }
+    }
+
+    /// Captures `hwnd`'s current on-screen appearance into the snapshot
+    /// store. Must run *before* the window is parked — `PrintWindow` with
+    /// `PW_RENDERFULLCONTENT` (undocumented-but-stable flag 2, the one
+    /// that goes through DWM and so handles D3D/DComp-rendered content)
+    /// asks the app/DWM for current pixels, which is exactly what stops
+    /// being available once the window is off-screen. Best-effort: on any
+    /// failure the window simply has no snapshot and its overview slot
+    /// falls back to a live-thumbnail attempt or a title chip.
+    fn capture_window_snapshot(hwnd: HWND) {
+        // SAFETY: create-select-print-restore on locally created GDI
+        // handles; `bitmap`'s ownership moves into the store on success.
+        unsafe {
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                return;
+            }
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            if w <= 0 || h <= 0 {
+                return;
+            }
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(screen);
+            let bitmap = CreateCompatibleBitmap(screen, w, h);
+            let previous = SelectObject(mem, bitmap);
+            let ok = PrintWindow(hwnd, mem, PRINT_WINDOW_FLAGS(2)).as_bool();
+            SelectObject(mem, previous);
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+
+            if !ok {
+                let _ = DeleteObject(bitmap);
+                return;
+            }
+            drop_window_snapshot(hwnd.0 as isize);
+            WINDOW_SNAPSHOTS.with(|s| {
+                s.borrow_mut().insert(hwnd.0 as isize, (w, h, bitmap.0 as isize));
+            });
+        }
+    }
+
+    /// Moves `hwnd` to its parked (off-screen) position. Skips minimized
+    /// windows — their on-screen rect is a `-32000` placeholder whose
+    /// restore position Windows manages separately, and they have no live
+    /// pixels to keep renderable anyway. The `top` guard makes parking
+    /// idempotent (and keeps a window left parked by a crashed previous
+    /// run from being pushed further out).
+    fn park_window(hwnd: HWND) {
+        // SAFETY: `hwnd` was tracked as a real window; if it has since
+        // closed every call here documented-fails harmlessly.
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return;
+            }
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() || rect.top >= WORKSPACE_PARK_DY / 2 {
+                return;
+            }
+            capture_window_snapshot(hwnd);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND(std::ptr::null_mut()),
+                rect.left,
+                rect.top + WORKSPACE_PARK_DY,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Inverse of [`park_window`]: returns `hwnd` to its real position (a
+    /// fixed offset, so no per-window bookkeeping to drift out of date)
+    /// and retires its park-time snapshot — the live window is preview
+    /// material again.
+    fn unpark_window(hwnd: HWND) {
+        drop_window_snapshot(hwnd.0 as isize);
+        // SAFETY: same as `park_window`.
+        unsafe {
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_SHOWNA);
+                return;
+            }
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() || rect.top < WORKSPACE_PARK_DY / 2 {
+                // Not parked — e.g. it was minimized (and hidden) at park
+                // time; make sure it's shown either way.
+                let _ = ShowWindow(hwnd, SW_SHOWNA);
+                return;
+            }
+            let _ = SetWindowPos(
+                hwnd,
+                HWND(std::ptr::null_mut()),
+                rect.left,
+                rect.top - WORKSPACE_PARK_DY,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Commits to the workspace at `target_index`: parks the outgoing
+    /// workspace's windows off-screen and unparks the incoming ones (see
+    /// `park_window` for why this isn't a `ShowWindow` hide/show swap), so
+    /// the desktop actually reflects the new current workspace
+    /// immediately, even if the overview stays open — GNOME switches live
+    /// as soon as you land on a workspace in the overview too, rather than
+    /// waiting for it to close. No-op if `target_index` is already
+    /// current.
     fn commit_workspace_switch(target_index: usize) {
         let switch = STATE.with(|s| {
             let mut state_ref = s.borrow_mut();
             let state = state_ref.as_mut()?;
+            let from_pinned = state.workspaces.is_pinned(state.workspaces.current_index());
+            let to_pinned = state.workspaces.is_pinned(target_index);
             let (from_id, to_id) = state.workspaces.switch_to_index(target_index)?;
-            Some((state.workspaces.windows_on(from_id), state.workspaces.windows_on(to_id)))
+            // Two pinned workspaces are two physical monitors, both already
+            // on screen — switching between them is purely a focus/indicator
+            // change, nothing to hide or show. Any other pair shares screen
+            // space (a dynamic workspace displays over the monitor being
+            // left), so the outgoing windows must actually hide and the
+            // incoming ones actually show — with a single monitor, its one
+            // pinned workspace included, or switching does nothing visible.
+            let both_pinned = from_pinned && to_pinned;
+            let hide = if both_pinned { Vec::new() } else { state.workspaces.windows_on(from_id) };
+            let show = if both_pinned { Vec::new() } else { state.workspaces.windows_on(to_id) };
+            Some((hide, show))
         });
         let Some((hide, show)) = switch else {
             return;
         };
 
-        // SAFETY: each hwnd was tracked as a real, previously-eligible
-        // window; if it's since closed these are documented no-ops.
-        unsafe {
-            for hwnd in &hide {
-                let _ = ShowWindow(HWND(*hwnd as *mut c_void), SW_HIDE);
-            }
-            for hwnd in &show {
-                let _ = ShowWindow(HWND(*hwnd as *mut c_void), SW_SHOWNA);
-            }
+        for hwnd in &hide {
+            park_window(HWND(*hwnd as *mut c_void));
+        }
+        for hwnd in &show {
+            unpark_window(HWND(*hwnd as *mut c_void));
         }
 
-        upgrade_placeholder_thumbnails(&show);
+        // Rebuild the overview's pages from scratch if it's open: a
+        // workspace switch can change which page is current, how many
+        // workspaces exist at all (dynamic growth/shrink), and which
+        // windows live where, so patching the previous session's pages
+        // piecemeal was a correctness trap — see `rebuild_open_overview_pages`.
+        rebuild_open_overview_pages();
         refresh_bar_indicator();
-    }
-
-    /// Upgrades any overview placeholder chip whose window is in
-    /// `now_visible` to a live DWM thumbnail, now that
-    /// `commit_workspace_switch` has actually shown it again. No-op if the
-    /// overview isn't open.
-    fn upgrade_placeholder_thumbnails(now_visible: &[isize]) {
-        let (overview_hwnd, page_w, offset, upgrades) = STATE.with(|s| {
-            let state_ref = s.borrow();
-            let none = (HWND(std::ptr::null_mut()), 0, 0.0, Vec::new());
-            let Some(st) = state_ref.as_ref() else {
-                return none;
-            };
-            let thumbs = match &st.overview {
-                OverviewMode::Opening { thumbs, .. }
-                | OverviewMode::Open { thumbs, .. }
-                | OverviewMode::Closing { thumbs, .. } => thumbs,
-                OverviewMode::Closed => return none,
-            };
-            let upgrades = thumbs
-                .iter()
-                .enumerate()
-                .filter(|(_, th)| th.thumbnail.is_none() && now_visible.contains(&(th.hwnd.0 as isize)))
-                .map(|(i, th)| (i, th.hwnd, th.page, th.current))
-                .collect::<Vec<_>>();
-            (st.overview_hwnd, page_width(), st.carousel_offset, upgrades)
-        });
-
-        if upgrades.is_empty() {
-            return;
-        }
-
-        for (index, hwnd, page, current_rect) in upgrades {
-            // SAFETY: `overview_hwnd` is a valid, process-lifetime window;
-            // `hwnd` was just made visible by `commit_workspace_switch`.
-            let Ok(handle) = (unsafe { DwmRegisterThumbnail(overview_hwnd, hwnd) }) else {
-                continue;
-            };
-            set_thumb_rect(handle, displayed_rect(current_rect, page, offset, page_w));
-            STATE.with(|s| {
-                if let Some(state) = s.borrow_mut().as_mut() {
-                    let thumbs = match &mut state.overview {
-                        OverviewMode::Opening { thumbs, .. }
-                        | OverviewMode::Open { thumbs, .. }
-                        | OverviewMode::Closing { thumbs, .. } => Some(thumbs),
-                        OverviewMode::Closed => None,
-                    };
-                    if let Some(th) = thumbs.and_then(|t| t.get_mut(index)) {
-                        th.thumbnail = Some(handle);
-                    }
-                }
-            });
-        }
-
-        // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
-        unsafe {
-            let _ = InvalidateRect(overview_hwnd, None, true);
-        }
     }
 
     /// Commits to `target_index` immediately and starts a smooth visual
@@ -2023,21 +2698,26 @@ mod imp {
                 | OverviewMode::Closing { thumbs, .. } => thumbs,
                 OverviewMode::Closed => return Vec::new(),
             };
-            let page_w = page_width();
+            let (_, pitch) = card_layout();
             thumbs
                 .iter()
                 .filter_map(|th| {
                     th.thumbnail
-                        .map(|h| (h, displayed_rect(th.current, th.page, st.carousel_offset, page_w)))
+                        .map(|h| (h, displayed_rect(th.rect, th.page, st.carousel_offset, pitch)))
                 })
                 .collect()
         });
         for (thumbnail, rect) in updates {
             set_thumb_rect(thumbnail, rect);
         }
+        // `erase = false`: this fires on every drag `WM_MOUSEMOVE`, far more
+        // often than the 16ms animation timer, and `paint_overview` already
+        // fully repaints every card/placeholder rect each time — erasing
+        // first just added a background flash before that repaint landed,
+        // visible as flicker while dragging.
         // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
         unsafe {
-            let _ = InvalidateRect(overview_hwnd, None, true);
+            let _ = InvalidateRect(overview_hwnd, None, false);
         }
     }
 
@@ -2075,11 +2755,17 @@ mod imp {
         }
     }
 
-    /// `Ctrl+Alt+Shift+Left/Right` — moves the foreground window to the
-    /// adjacent workspace and hides it immediately (the user stays on the
-    /// current workspace; only the window leaves). No-op if nothing
-    /// eligible is focused (including any of this shell's own windows).
+    /// `Ctrl+Alt+Shift+Left/Right` — sends the foreground window away into
+    /// the dynamic (non-monitor) tail and parks it immediately (the user
+    /// stays on their current monitor; only the window leaves). `delta`'s
+    /// *sign* doesn't actually matter: a focused window can only ever be on
+    /// a pinned monitor workspace (it has to be visible to be focused, and
+    /// only monitor workspaces are ever really visible), and there's no
+    /// meaningful "direction" for leaving a monitor — it always lands on
+    /// the first dynamic workspace either way. No-op if nothing eligible is
+    /// focused (including any of this shell's own windows).
     fn move_focused_window_relative(delta: i32) {
+        let _ = delta;
         // SAFETY: no preconditions.
         let fg = unsafe { GetForegroundWindow() };
         if fg.0.is_null() || role_of(fg) != Role::Other {
@@ -2087,27 +2773,23 @@ mod imp {
         }
         sync_workspaces();
         let hwnd = fg.0 as isize;
-        let moved_away = STATE.with(|s| {
+        let moved = STATE.with(|s| {
             let mut state_ref = s.borrow_mut();
             let state = state_ref.as_mut()?;
-            let current = state.workspaces.current_id();
-            let new_id = state.workspaces.move_window_relative(hwnd, delta)?;
-            Some(new_id != current)
+            let target = state.workspaces.pinned_count();
+            state.workspaces.move_window_to_index(hwnd, target)
         });
-        if moved_away == Some(true) {
-            // SAFETY: `fg` was just confirmed live via `GetForegroundWindow`.
-            unsafe {
-                let _ = ShowWindow(fg, SW_HIDE);
-            }
+        if moved.is_some() {
+            park_window(fg);
         }
         refresh_bar_indicator();
     }
 
-    /// Advances whichever animation (`Opening`/`Closing` zoom, and/or an
-    /// independent in-flight carousel slide — these can run at the same
-    /// time, or a carousel slide can run on its own while the overview
-    /// just sits `Open`) by one tick, or finalizes it once it reaches the
-    /// end.
+    /// Advances whichever animation is in flight by one tick: the
+    /// `Opening`/`Closing` whole-window fade, and/or an independent
+    /// in-flight carousel slide (these can run at the same time, or a
+    /// carousel slide can run on its own while the overview just sits
+    /// `Open`) — or finalizes either once it reaches the end.
     fn on_animation_tick() {
         enum Completion {
             Opened,
@@ -2133,59 +2815,54 @@ mod imp {
             }
 
             let mode = std::mem::replace(&mut state.overview, OverviewMode::Closed);
-            let (new_mode, zoom_running, completion) = match mode {
-                OverviewMode::Opening {
-                    started,
-                    mut thumbs,
-                    mut cards,
-                } => {
+            let (new_mode, fade_alpha, fade_running, completion) = match mode {
+                OverviewMode::Opening { started, thumbs, cards } => {
                     let t = progress(started);
-                    let eased = ease_out(t);
-                    tick_thumbs(&mut thumbs, eased);
-                    tick_cards(&mut cards, eased);
+                    let alpha = (ease_out(t) * 255.0).round() as u8;
                     if t >= 1.0 {
-                        (OverviewMode::Open { thumbs, cards }, false, Some(Completion::Opened))
+                        (OverviewMode::Open { thumbs, cards }, Some(255u8), false, Some(Completion::Opened))
                     } else {
-                        (OverviewMode::Opening { started, thumbs, cards }, true, None)
+                        (OverviewMode::Opening { started, thumbs, cards }, Some(alpha), true, None)
                     }
                 }
-                OverviewMode::Closing {
-                    started,
-                    mut thumbs,
-                    mut cards,
-                    focus_after,
-                } => {
+                OverviewMode::Closing { started, thumbs, cards, focus_after } => {
                     let t = progress(started);
-                    let eased = ease_out(t);
-                    tick_thumbs(&mut thumbs, eased);
-                    tick_cards(&mut cards, eased);
+                    let alpha = ((1.0 - ease_out(t)) * 255.0).round() as u8;
                     if t >= 1.0 {
-                        (OverviewMode::Closed, false, Some(Completion::Closed { focus_after, thumbs }))
+                        (OverviewMode::Closed, None, false, Some(Completion::Closed { focus_after, thumbs }))
                     } else {
                         (
                             OverviewMode::Closing { started, thumbs, cards, focus_after },
+                            Some(alpha),
                             true,
                             None,
                         )
                     }
                 }
-                other => (other, false, None),
+                other => (other, None, false, None),
             };
             state.overview = new_mode;
 
             let carousel_close_after = if carousel_done { state.carousel_close_after.take() } else { None };
-            let keep_timer = zoom_running || state.carousel_anim.is_some();
-            Some((state.overview_hwnd, completion, carousel_close_after, keep_timer))
+            let keep_timer = fade_running || state.carousel_anim.is_some();
+            Some((state.overview_hwnd, fade_alpha, completion, carousel_close_after, keep_timer))
         });
 
-        let Some((overview_hwnd, completion, carousel_close_after, keep_timer)) = result else {
+        let Some((overview_hwnd, fade_alpha, completion, carousel_close_after, keep_timer)) = result else {
             return;
         };
 
+        if let Some(alpha) = fade_alpha {
+            // SAFETY: `overview_hwnd` is a valid, process-lifetime window
+            // already created with `WS_EX_LAYERED`.
+            unsafe {
+                let _ = SetLayeredWindowAttributes(overview_hwnd, COLORREF(0), alpha, LWA_ALPHA);
+            }
+        }
+
         // Pushes every live thumbnail's rect (carousel-shifted, using
         // whatever `carousel_offset` ended up at above) and repaints for
-        // the cards/placeholders, whether or not anything about the zoom
-        // animation changed this tick.
+        // the cards/placeholders, whether or not the fade changed this tick.
         push_carousel_positions(overview_hwnd);
 
         if !keep_timer {
@@ -2201,9 +2878,8 @@ mod imp {
                 Completion::Closed { focus_after, thumbs } => {
                     for th in &thumbs {
                         if let Some(handle) = th.thumbnail {
-                            // SAFETY: registered in `open_overview` or
-                            // `upgrade_placeholder_thumbnails` and not yet
-                            // unregistered.
+                            // SAFETY: registered by `build_carousel_pages`
+                            // and not yet unregistered.
                             unsafe {
                                 let _ = DwmUnregisterThumbnail(handle);
                             }
@@ -2253,18 +2929,6 @@ mod imp {
         progress_dur(started, ANIM_DURATION)
     }
 
-    fn tick_thumbs(thumbs: &mut [ThumbAnim], t: f64) {
-        for th in thumbs.iter_mut() {
-            th.current = lerp_rect(th.from, th.to, t);
-        }
-    }
-
-    fn tick_cards(cards: &mut [CardAnim], t: f64) {
-        for card in cards.iter_mut() {
-            card.current = lerp_rect(card.from, card.to, t);
-        }
-    }
-
     unsafe extern "system" fn wndproc(
         hwnd: HWND,
         msg: u32,
@@ -2293,6 +2957,11 @@ mod imp {
                 }
                 Role::Other => DefWindowProcW(hwnd, msg, wparam, lparam),
             },
+            // The overview paints its own backdrop into a back buffer (see
+            // `paint_overview`), so the class-brush erase pass is both
+            // redundant and the source of a visible background flash
+            // between erase and repaint while dragging — claim it handled.
+            WM_ERASEBKGND if role == Role::Overview => LRESULT(1),
             WM_LBUTTONDOWN => {
                 if let Role::Overview = role {
                     let x = (lparam.0 & 0xFFFF) as i32;
@@ -2315,7 +2984,7 @@ mod imp {
                 match role {
                     Role::Bar { is_primary: true } => {
                         let x = (lparam.0 & 0xFFFF) as i32;
-                        on_bar_click(x);
+                        on_bar_click(hwnd, x);
                     }
                     Role::Overview => {
                         let x = (lparam.0 & 0xFFFF) as i32;
@@ -2404,6 +3073,28 @@ mod imp {
                         let _ = UnregisterHotKey(hwnd, HOTKEY_WS_NEXT);
                         let _ = UnregisterHotKey(hwnd, HOTKEY_MOVE_WIN_PREV);
                         let _ = UnregisterHotKey(hwnd, HOTKEY_MOVE_WIN_NEXT);
+                        // Without a workspace manager running, "parked
+                        // off-screen" just means "stranded off-screen" —
+                        // bring every tracked window back before going
+                        // away. (A hard kill still strands them; the
+                        // `top` guard in `park_window`/`unpark_window`
+                        // lets the next run recover those.)
+                        let tracked: Vec<isize> = STATE.with(|s| {
+                            s.borrow()
+                                .as_ref()
+                                .map(|st| {
+                                    st.workspaces
+                                        .workspace_ids()
+                                        .to_vec()
+                                        .into_iter()
+                                        .flat_map(|id| st.workspaces.windows_on(id))
+                                        .collect()
+                                })
+                                .unwrap_or_default()
+                        });
+                        for tracked_hwnd in tracked {
+                            unpark_window(HWND(tracked_hwnd as *mut c_void));
+                        }
                     }
                 }
                 PostQuitMessage(0);
