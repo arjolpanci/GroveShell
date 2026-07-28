@@ -5,10 +5,12 @@
 mod bar;
 mod calendar;
 mod dock;
+mod icons;
 mod monitors;
 mod movesize;
 mod overview;
 mod quick_settings;
+mod radios;
 mod state;
 mod taskbar;
 mod theme;

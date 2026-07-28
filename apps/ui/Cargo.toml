@@ -16,6 +16,8 @@ tracing = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
+  "Devices_Radios",
+  "Foundation_Collections",
   "Win32_Foundation",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Gdi",

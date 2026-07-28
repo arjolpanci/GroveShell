@@ -17,11 +17,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SetWindowPos,
 };
 
+use super::icons::{battery_icon, draw_icon, volume_icon, Icon};
 use super::overview::{close_overview, open_overview, snap_carousel_to};
-use super::quick_settings::{battery_status, get_mute, toggle_quick_settings};
+use super::quick_settings::{battery_status, get_mute, get_volume_percent, toggle_quick_settings};
 use super::overview::OverviewMode;
 use super::state::{scaled, STATE};
-use super::util::{bar_font, draw_text_in, draw_battery_glyph, draw_volume_glyph, draw_wifi_glyph, blend_toward_white};
+use super::util::{bar_font, draw_text_in, blend_toward_white};
 use super::wifi::wifi_radio_on;
 use super::workspaces::commit_workspace_switch;
 use super::calendar::clock_text;
@@ -228,11 +229,14 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool) {
             }
 
             let glyph_color = COLORREF(0x00E0E0E0);
-            let wifi_on = wifi_radio_on();
-            draw_wifi_glyph(hdc, slots[0], glyph_color, wifi_on.unwrap_or(false));
-            draw_volume_glyph(hdc, slots[1], glyph_color, get_mute().unwrap_or(false));
-            let percent = battery_status().map(|(pct, _)| pct).unwrap_or(100);
-            draw_battery_glyph(hdc, slots[2], glyph_color, percent);
+            let wifi_icon = if wifi_radio_on().unwrap_or(false) { Icon::Wifi } else { Icon::WifiOff };
+            draw_icon(hdc, slots[0], wifi_icon, glyph_color);
+
+            let vol_icon = volume_icon(get_mute().unwrap_or(false), get_volume_percent().unwrap_or(0));
+            draw_icon(hdc, slots[1], vol_icon, glyph_color);
+
+            let (pct, charging) = battery_status().unwrap_or((100, false));
+            draw_icon(hdc, slots[2], battery_icon(pct, charging), glyph_color);
 
             SelectObject(hdc, previous_font);
             let _ = DeleteObject(font);
