@@ -18,13 +18,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::icons::{battery_icon, draw_icon, volume_icon, Icon};
-use super::overview::{close_overview, open_overview, snap_carousel_to};
 use super::quick_settings::{battery_status, get_mute, get_volume_percent, toggle_quick_settings};
 use super::overview::OverviewMode;
 use super::state::{scaled, STATE};
 use super::util::{bar_font, draw_text_in, blend_toward_white};
 use super::wifi::wifi_radio_on;
-use super::workspaces::commit_workspace_switch;
 use super::calendar::clock_text;
 use super::calendar::toggle_calendar;
 
@@ -127,15 +125,15 @@ pub(crate) unsafe fn unregister_appbar(bar_hwnd: HWND) {
     SHAppBarMessage(ABM_REMOVE, &mut abd);
 }
 
-/// Paints a bar. Non-primary bars are just the plain class-brush
-/// background (still validated via `BeginPaint`/`EndPaint` so Windows
-/// doesn't keep re-queuing `WM_PAINT`) — only the primary monitor
-/// carries Activities/clock/Quick Settings (per
-/// `docs/PROJECT_PLAN.md` §10.1). There are no native `BUTTON`
-/// controls for these — at this bar height a real push button's chrome
-/// leaves no room for legible text, so this is flat painted text
-/// hit-tested in `WM_LBUTTONUP` instead (see `on_bar_click`).
-pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool) {
+/// Paints a bar. Activities + workspace dots now paint on every
+/// monitor's bar, each reading its own monitor's `WorkspaceTracker` via
+/// `st.workspaces.get(monitor)`; the clock and Quick Settings status
+/// pill remain primary-bar-only (per `docs/PROJECT_PLAN.md` §10.1).
+/// There are no native `BUTTON` controls for any of these — at this bar
+/// height a real push button's chrome leaves no room for legible text,
+/// so this is flat painted text hit-tested in `WM_LBUTTONUP` instead
+/// (see `on_bar_click`).
+pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
     // SAFETY: `hwnd` is the window currently processing `WM_PAINT`, so
     // it's guaranteed valid for the duration of this call; `ps` is a
     // local that outlives the paired `BeginPaint`/`EndPaint` call.
@@ -143,75 +141,67 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool) {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
 
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
+        let bar_width = STATE
+            .with(|s| {
+                s.borrow().as_ref().and_then(|st| {
+                    st.bars.iter().find(|b| b.hwnd == hwnd).map(|b| b.rect.right - b.rect.left)
+                })
+            })
+            .unwrap_or(0);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, COLORREF(0x00E0E0E0));
+        // The DC's default font is the fixed-size legacy "System"
+        // font, which neither scales with DPI nor matches the rest
+        // of the OS — use Segoe UI sized to the bar's monitor.
+        let font = bar_font(dpi);
+        let previous_font = SelectObject(hdc, font);
+        let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
+
+        // Activities button + workspace dots: every monitor's bar now,
+        // each reading its own monitor's tracker.
+        draw_text_in(
+            hdc,
+            RECT {
+                left: scaled(ACTIVITIES_LABEL_X, dpi),
+                top: 0,
+                right: scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi),
+                bottom: bar_h,
+            },
+            "Activities",
+            format,
+        );
+
+        let (workspace_count, current_index) = STATE
+            .with(|s| {
+                s.borrow()
+                    .as_ref()
+                    .and_then(|st| st.workspaces.get(monitor))
+                    .map(|t| (t.workspace_ids().len(), t.current_index()))
+            })
+            .unwrap_or((0, 0));
+        let dot_mid_y = bar_h / 2;
+        let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
+        let dot_radius = scaled(WS_DOT_RADIUS, dpi);
+        let filled_brush = CreateSolidBrush(COLORREF(0x00E0E0E0));
+        let empty_brush = CreateSolidBrush(COLORREF(0x00606060));
+        for i in 0..workspace_count {
+            let cx = scaled(WS_DOTS_X, dpi) + i as i32 * dot_slot_w + dot_slot_w / 2;
+            let brush = if i == current_index { filled_brush } else { empty_brush };
+            let previous = SelectObject(hdc, brush);
+            let _ = Ellipse(hdc, cx - dot_radius, dot_mid_y - dot_radius, cx + dot_radius, dot_mid_y + dot_radius);
+            SelectObject(hdc, previous);
+        }
+        let _ = DeleteObject(filled_brush);
+        let _ = DeleteObject(empty_brush);
+
         if is_primary {
-            let dpi = GetDpiForWindow(hwnd).max(96);
-            let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
-            let bar_width = STATE
-                .with(|s| {
-                    s.borrow()
-                        .as_ref()
-                        .map(|st| st.primary_bar_rect.right - st.primary_bar_rect.left)
-                })
-                .unwrap_or(0);
-
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(0x00E0E0E0));
-            // The DC's default font is the fixed-size legacy "System"
-            // font, which neither scales with DPI nor matches the rest
-            // of the OS — use Segoe UI sized to the bar's monitor.
-            let font = bar_font(dpi);
-            let previous_font = SelectObject(hdc, font);
-
-            let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
-            draw_text_in(
-                hdc,
-                RECT {
-                    left: scaled(ACTIVITIES_LABEL_X, dpi),
-                    top: 0,
-                    right: scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi),
-                    bottom: bar_h,
-                },
-                "Activities",
-                format,
-            );
-
-            let (workspace_count, current_index) = STATE
-                .with(|s| {
-                    s.borrow()
-                        .as_ref()
-                        .map(|st| (st.workspaces.workspace_ids().len(), st.workspaces.current_index()))
-                })
-                .unwrap_or((0, 0));
-            let dot_mid_y = bar_h / 2;
-            let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
-            let dot_radius = scaled(WS_DOT_RADIUS, dpi);
-            let filled_brush = CreateSolidBrush(COLORREF(0x00E0E0E0));
-            let empty_brush = CreateSolidBrush(COLORREF(0x00606060));
-            for i in 0..workspace_count {
-                let cx = scaled(WS_DOTS_X, dpi) + i as i32 * dot_slot_w + dot_slot_w / 2;
-                let brush = if i == current_index { filled_brush } else { empty_brush };
-                let previous = SelectObject(hdc, brush);
-                let _ = Ellipse(
-                    hdc,
-                    cx - dot_radius,
-                    dot_mid_y - dot_radius,
-                    cx + dot_radius,
-                    dot_mid_y + dot_radius,
-                );
-                SelectObject(hdc, previous);
-            }
-            let _ = DeleteObject(filled_brush);
-            let _ = DeleteObject(empty_brush);
-
             let clock_x = bar_width / 2 - scaled(CLOCK_LABEL_WIDTH, dpi) / 2;
             draw_text_in(
                 hdc,
-                RECT {
-                    left: clock_x,
-                    top: 0,
-                    right: clock_x + scaled(CLOCK_LABEL_WIDTH, dpi),
-                    bottom: bar_h,
-                },
+                RECT { left: clock_x, top: 0, right: clock_x + scaled(CLOCK_LABEL_WIDTH, dpi), bottom: bar_h },
                 &clock_text(),
                 format,
             );
@@ -231,54 +221,41 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool) {
             let glyph_color = COLORREF(0x00E0E0E0);
             let wifi_icon = if wifi_radio_on().unwrap_or(false) { Icon::Wifi } else { Icon::WifiOff };
             draw_icon(hdc, slots[0], wifi_icon, glyph_color);
-
             let vol_icon = volume_icon(get_mute().unwrap_or(false), get_volume_percent().unwrap_or(0));
             draw_icon(hdc, slots[1], vol_icon, glyph_color);
-
             let (pct, charging) = battery_status().unwrap_or((100, false));
             draw_icon(hdc, slots[2], battery_icon(pct, charging), glyph_color);
-
-            SelectObject(hdc, previous_font);
-            let _ = DeleteObject(font);
         }
 
+        SelectObject(hdc, previous_font);
+        let _ = DeleteObject(font);
         let _ = EndPaint(hwnd, &ps);
     }
 }
 
-/// Dispatches a click on the primary bar to whichever of its three
-/// painted regions it landed in (see `paint_bar` for the same layout,
-/// including the DPI scaling both must agree on).
-pub(crate) fn on_bar_click(hwnd: HWND, x: i32) {
-    // SAFETY: `hwnd` is the bar window currently handling this click.
+/// Dispatches a click on a bar to whichever painted region it landed
+/// in (see `paint_bar` for the same layout, including the DPI scaling
+/// both must agree on). Activities + workspace dots are handled on
+/// every monitor's bar; the clock and Quick Settings pill remain
+/// primary-bar-only.
+pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) {
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let bar_width = STATE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|st| st.primary_bar_rect.right - st.primary_bar_rect.left)
+        s.borrow().as_ref().and_then(|st| {
+            st.bars.iter().find(|b| b.hwnd == hwnd).map(|b| b.rect.right - b.rect.left)
+        })
     });
     let Some(bar_width) = bar_width else {
         return;
     };
 
-    if (scaled(ACTIVITIES_LABEL_X, dpi)..scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi))
-        .contains(&x)
-    {
-        let is_closed = STATE.with(|s| {
-            s.borrow()
-                .as_ref()
-                .map(|st| matches!(st.overview, OverviewMode::Closed))
-        });
-        match is_closed {
-            Some(true) => open_overview(),
-            Some(false) => close_overview(None),
-            None => {}
-        }
+    if (scaled(ACTIVITIES_LABEL_X, dpi)..scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi)).contains(&x) {
+        super::overview::toggle_overview_for(monitor);
         return;
     }
 
     let workspace_count = STATE
-        .with(|s| s.borrow().as_ref().map(|st| st.workspaces.workspace_ids().len()))
+        .with(|s| s.borrow().as_ref().and_then(|st| st.workspaces.get(monitor)).map(|t| t.workspace_ids().len()))
         .unwrap_or(0);
     let dots_x = scaled(WS_DOTS_X, dpi);
     let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
@@ -286,13 +263,20 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32) {
     if (dots_x..dots_x + dots_width).contains(&x) {
         let index = ((x - dots_x) / dot_slot_w) as usize;
         let overview_open = STATE
-            .with(|s| s.borrow().as_ref().map(|st| matches!(st.overview, OverviewMode::Open { .. })))
+            .with(|s| {
+                s.borrow().as_ref().and_then(|st| st.overviews.get(monitor))
+                    .map(|ov| matches!(ov.mode, OverviewMode::Open { .. }))
+            })
             .unwrap_or(false);
         if overview_open {
-            snap_carousel_to(index, None);
+            super::overview::snap_carousel_to(monitor, index, None);
         } else {
-            commit_workspace_switch(index);
+            super::workspaces::commit_workspace_switch(monitor, index);
         }
+        return;
+    }
+
+    if !is_primary {
         return;
     }
 
@@ -314,8 +298,13 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32) {
 /// pill, for the hover highlight in `paint_bar`. `TrackMouseEvent`
 /// arms a one-shot `WM_MOUSELEAVE` so the highlight clears the instant
 /// the pointer leaves the bar entirely, not just when it moves to
-/// another spot on the bar.
-pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, _y: i32) {
+/// another spot on the bar. The status pill only exists on the primary
+/// bar (Quick Settings stays primary-only), so non-primary bars early
+/// return.
+pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, _y: i32, is_primary: bool) {
+    if !is_primary {
+        return;
+    }
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let bar_width = STATE.with(|s| {
         s.borrow()
