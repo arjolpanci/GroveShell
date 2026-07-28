@@ -28,10 +28,10 @@ use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DrawIconEx, FindWindowW, GetClassLongPtrW, GetClientRect, GetForegroundWindow, GetSystemMetrics,
+    DrawIconEx, FindWindowW, GetClassLongPtrW, GetClientRect, GetForegroundWindow,
     IsIconic, KillTimer, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
     ShowWindow, DI_NORMAL, GCLP_HICONSM, HICON, ICON_SMALL, LWA_ALPHA,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SPI_GETDESKWALLPAPER,
+    SPI_GETDESKWALLPAPER,
     SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SystemParametersInfoW, WM_GETICON,
 };
 
@@ -305,27 +305,28 @@ enum OverviewHit {
 /// apart by. Recomputed on demand rather than cached: cheap, and
 /// consistent with the rest of this module not handling live
 /// display-topology changes.
-pub(crate) fn card_layout() -> (RECT, i32) {
-    // SAFETY: no preconditions. The overview window's own top-left
-    // sits at exactly this point (see `open_overview`), so subtracting
-    // it converts a monitor's absolute virtual-screen rect into
-    // overview-client-local coordinates.
-    let (origin_x, client_h) = unsafe {
-        (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN))
-    };
-
+pub(crate) fn card_layout(monitor: &str) -> (RECT, i32) {
     let monitors = monitors_sorted_by_x();
-    let reference = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first());
-    let (ref_w, ref_aspect, ref_center_x_abs, dpi) = match reference {
-        Some(m) => {
-            let w = (m.rect.right - m.rect.left) as f64;
-            let h = (m.rect.bottom - m.rect.top).max(1) as f64;
-            (w, w / h, (m.rect.left + m.rect.right) / 2, m.dpi)
-        }
-        None => (1920.0, 16.0 / 9.0, origin_x + 960, 96),
+    let Some(this_monitor) = super::monitors::monitor_by_device_name(&monitors, monitor) else {
+        // Monitor vanished mid-frame (hotplug race) — degrade to a
+        // primary-anchored guess rather than panicking; the overview
+        // is about to be torn down for this monitor anyway (Task 10).
+        return card_layout_fallback(&monitors);
     };
 
-    let card_w = (ref_w * CARD_WIDTH_FRACTION).round() as i32;
+    // The overview window is now sized to exactly this monitor's rect
+    // (Task 4), so the window's own top-left *is* this monitor's
+    // top-left — `origin_x`/`client_h` come straight from the monitor's
+    // rect, no `GetSystemMetrics(SM_*VIRTUALSCREEN)` needed.
+    let origin_x = this_monitor.rect.left;
+    let client_h = this_monitor.rect.bottom - this_monitor.rect.top;
+    let dpi = this_monitor.dpi;
+    let w = (this_monitor.rect.right - this_monitor.rect.left) as f64;
+    let h = (this_monitor.rect.bottom - this_monitor.rect.top).max(1) as f64;
+    let ref_aspect = w / h;
+    let ref_center_x_abs = (this_monitor.rect.left + this_monitor.rect.right) / 2;
+
+    let card_w = (w * CARD_WIDTH_FRACTION).round() as i32;
     let max_card_h =
         (client_h - scaled(BAR_HEIGHT + CARD_MARGIN_TOP + CARD_MARGIN_BOTTOM, dpi)).max(1);
     let card_h = ((card_w as f64 / ref_aspect).round() as i32).min(max_card_h).max(1);
@@ -339,6 +340,21 @@ pub(crate) fn card_layout() -> (RECT, i32) {
         bottom: card_top + card_h,
     };
     (rect, card_w + scaled(CARD_GAP, dpi))
+}
+
+/// Fallback for `card_layout` when the requested monitor has already
+/// vanished (hotplug race): re-anchor to the primary (or first) monitor
+/// so the last frame before this monitor's overview is torn down still
+/// produces a sane layout instead of panicking.
+fn card_layout_fallback(monitors: &[super::monitors::MonitorInfo]) -> (RECT, i32) {
+    let reference = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first());
+    match reference {
+        Some(m) => {
+            let device_name = m.device_name.clone();
+            card_layout(&device_name)
+        }
+        None => (RECT { left: 0, top: 0, right: 1920, bottom: 1080 }, 1920),
+    }
 }
 
 /// Arranges `windows` in a simple auto grid within `card` — GNOME-
@@ -492,18 +508,19 @@ fn zoom_rect(r: RECT, anchor_x: f64, anchor_y: f64, s: f64) -> RECT {
 /// to refresh it in place after a workspace switch
 /// (`workspaces::commit_workspace_switch` calls this rather than
 /// patching the previous session's pages piecemeal).
-pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize, Vec<super::dock::DockApp>) {
+pub(crate) fn build_carousel_pages(monitor: &str) -> (Vec<CardAnim>, Vec<ThumbAnim>, usize, Vec<super::dock::DockApp>) {
     let live = super::workspaces::sync_workspaces();
 
     let (workspace_ids, current_pos): (Vec<groveshell_window_model::workspace::WorkspaceId>, usize) =
         STATE.with(|s| {
             s.borrow()
                 .as_ref()
-                .map(|st| (st.workspaces.workspace_ids().to_vec(), st.workspaces.current_index()))
+                .and_then(|st| st.workspaces.get(monitor))
+                .map(|t| (t.workspace_ids().to_vec(), t.current_index()))
                 .unwrap_or_default()
         });
 
-    let (card_rect, _) = card_layout();
+    let (card_rect, _) = card_layout(monitor);
     let mut cards = Vec::new();
     let mut thumbs = Vec::new();
     // Every tracked window across every workspace, parked or not — the
@@ -525,7 +542,8 @@ pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize, V
             .with(|s| {
                 s.borrow()
                     .as_ref()
-                    .map(|st| st.workspaces.windows_on(ws_id))
+                    .and_then(|st| st.workspaces.get(monitor))
+                    .map(|t| t.windows_on(ws_id))
                     .unwrap_or_default()
             });
         let windows: Vec<groveshell_window_model::WindowRecord> = assigned
@@ -574,11 +592,13 @@ pub(crate) fn build_carousel_pages() -> (Vec<CardAnim>, Vec<ThumbAnim>, usize, V
 /// too, and would otherwise win the z-order fight since it's shown
 /// after them), and kicks off the fade timer. No-op if the overview
 /// isn't currently `Closed` (already open or mid-animation).
-pub(crate) fn open_overview() {
+pub(crate) fn open_overview(monitor: &str) {
     let overview_hwnd = STATE.with(|s| {
-        s.borrow().as_ref().and_then(|st| {
-            matches!(st.overview, OverviewMode::Closed).then_some(st.overview_hwnd)
-        })
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.overviews.get(monitor))
+            .filter(|ov| matches!(ov.mode, OverviewMode::Closed))
+            .map(|ov| ov.hwnd)
     });
     let Some(overview_hwnd) = overview_hwnd else {
         return;
@@ -590,7 +610,7 @@ pub(crate) fn open_overview() {
     hide_calendar(false);
     hide_quick_settings(false);
 
-    let (cards, thumbs, current_pos, dock_apps) = build_carousel_pages();
+    let (cards, thumbs, current_pos, dock_apps) = build_carousel_pages(monitor);
 
     // SAFETY: no preconditions.
     let previous_foreground = unsafe { GetForegroundWindow() };
@@ -598,17 +618,19 @@ pub(crate) fn open_overview() {
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
             state.previous_foreground = previous_foreground;
-            state.carousel_offset = current_pos as f64;
-            state.carousel_drag = None;
-            state.carousel_anim = None;
-            state.carousel_close_after = None;
-            state.dock_apps = dock_apps;
-            state.dock_hover = None;
-            state.overview = OverviewMode::Opening {
-                started: Instant::now(),
-                thumbs,
-                cards,
-            };
+            if let Some(ov) = state.overviews.get_mut(monitor) {
+                ov.carousel_offset = current_pos as f64;
+                ov.carousel_drag = None;
+                ov.carousel_anim = None;
+                ov.carousel_close_after = None;
+                ov.dock_apps = dock_apps;
+                ov.dock_hover = None;
+                ov.mode = OverviewMode::Opening {
+                    started: Instant::now(),
+                    thumbs,
+                    cards,
+                };
+            }
         }
     });
 
@@ -632,23 +654,27 @@ pub(crate) fn open_overview() {
 /// windows live where, all at once. Re-registers live thumbnails from
 /// scratch rather than patching three kinds of drift piecemeal.
 /// No-op if the overview isn't `Open`.
-pub(crate) fn rebuild_open_overview_pages() {
+pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
     let overview_hwnd = STATE.with(|s| {
-        s.borrow().as_ref().and_then(|st| {
-            matches!(st.overview, OverviewMode::Open { .. }).then_some(st.overview_hwnd)
-        })
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.overviews.get(monitor))
+            .filter(|ov| matches!(ov.mode, OverviewMode::Open { .. }))
+            .map(|ov| ov.hwnd)
     });
     let Some(overview_hwnd) = overview_hwnd else {
         return;
     };
 
-    let (cards, thumbs, _current_pos, dock_apps) = build_carousel_pages();
+    let (cards, thumbs, _current_pos, dock_apps) = build_carousel_pages(monitor);
 
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
-            if matches!(state.overview, OverviewMode::Open { .. }) {
-                state.overview = OverviewMode::Open { thumbs, cards };
-                state.dock_apps = dock_apps;
+            if let Some(ov) = state.overviews.get_mut(monitor) {
+                if matches!(ov.mode, OverviewMode::Open { .. }) {
+                    ov.mode = OverviewMode::Open { thumbs, cards };
+                    ov.dock_apps = dock_apps;
+                }
             }
         }
     });
@@ -662,17 +688,16 @@ pub(crate) fn rebuild_open_overview_pages() {
 /// is currently `Open` (idle) or still `Opening` (interrupts it
 /// smoothly from its current alpha — no-op only if already `Closed` or
 /// already `Closing`).
-pub(crate) fn close_overview(focus_after: Option<HWND>) {
+pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
-        let Some(state) = state_ref.as_mut() else {
-            return None;
-        };
+        let state = state_ref.as_mut()?;
+        let ov = state.overviews.get_mut(monitor)?;
 
-        let mode = std::mem::replace(&mut state.overview, OverviewMode::Closed);
+        let mode = std::mem::replace(&mut ov.mode, OverviewMode::Closed);
         match mode {
             OverviewMode::Open { thumbs, cards } | OverviewMode::Opening { thumbs, cards, .. } => {
-                state.overview = OverviewMode::Closing {
+                ov.mode = OverviewMode::Closing {
                     started: Instant::now(),
                     thumbs,
                     cards,
@@ -680,18 +705,18 @@ pub(crate) fn close_overview(focus_after: Option<HWND>) {
                 };
                 // Any in-progress drag/slide/search is moot once we're
                 // fading back out.
-                state.carousel_drag = None;
-                state.carousel_anim = None;
-                state.carousel_close_after = None;
-                state.window_drag = None;
-                state.window_pop_anim = None;
-                state.hover_thumb = None;
-                state.dock_hover = None;
-                state.search_query.clear();
-                Some(state.overview_hwnd)
+                ov.carousel_drag = None;
+                ov.carousel_anim = None;
+                ov.carousel_close_after = None;
+                ov.window_drag = None;
+                ov.window_pop_anim = None;
+                ov.hover_thumb = None;
+                ov.dock_hover = None;
+                ov.search_query.clear();
+                Some(ov.hwnd)
             }
             other => {
-                state.overview = other;
+                ov.mode = other;
                 None
             }
         }
@@ -707,6 +732,24 @@ pub(crate) fn close_overview(focus_after: Option<HWND>) {
     }
 }
 
+/// Toggles `monitor`'s Activities overview open/closed — the single
+/// entry point the bar's Activities click, the Win-key tap, and hot
+/// corners all call through. No-op if that monitor has no overview
+/// instance (mid-teardown during hotplug, Task 10).
+pub(crate) fn toggle_overview_for(monitor: &str) {
+    let is_closed = STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.overviews.get(monitor))
+            .map(|ov| matches!(ov.mode, OverviewMode::Closed))
+    });
+    match is_closed {
+        Some(true) => open_overview(monitor),
+        Some(false) => close_overview(monitor, None),
+        None => {}
+    }
+}
+
 /// Hit-tests a click against the overview's current thumbnail/card
 /// rects across *every* carousel page (only meaningful while `Open`),
 /// applying each page's current carousel shift first. Clicking a
@@ -716,18 +759,19 @@ pub(crate) fn close_overview(focus_after: Option<HWND>) {
 /// in GNOME) without closing the overview. Clicking empty space on the
 /// current page, or missing everything, cancels — the pre-existing
 /// behavior.
-pub(crate) fn on_overview_click(x: i32, y: i32) {
+pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
     // An active search owns clicks: a result row activates it, anywhere
     // else dismisses the search (but not the overview).
     let query = STATE.with(|s| {
         s.borrow()
             .as_ref()
-            .filter(|st| !st.search_query.is_empty())
-            .map(|st| st.search_query.clone())
+            .and_then(|st| st.overviews.get(monitor))
+            .filter(|ov| !ov.search_query.is_empty())
+            .map(|ov| ov.search_query.clone())
     });
     if let Some(query) = query {
-        let results = search_results(&query);
-        let (_, rows) = search_layout(reference_dpi(), results.len());
+        let results = search_results(monitor, &query);
+        let (_, rows) = search_layout(monitor, reference_dpi(), results.len());
         let hit_index = rows
             .iter()
             .skip(1)
@@ -735,17 +779,20 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
         match hit_index {
             Some(i) => {
                 if let Some(result) = results.into_iter().nth(i) {
-                    activate_search_result(result);
+                    activate_search_result(monitor, result);
                 }
             }
             None => {
                 STATE.with(|s| {
                     if let Some(state) = s.borrow_mut().as_mut() {
-                        state.search_query.clear();
+                        if let Some(ov) = state.overviews.get_mut(monitor) {
+                            ov.search_query.clear();
+                        }
                     }
                 });
-                let overview_hwnd =
-                    STATE.with(|s| s.borrow().as_ref().map(|st| st.overview_hwnd));
+                let overview_hwnd = STATE.with(|s| {
+                    s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).map(|ov| ov.hwnd)
+                });
                 if let Some(overview_hwnd) = overview_hwnd {
                     repaint_overview(overview_hwnd);
                 }
@@ -761,10 +808,11 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
     let dock_hit = STATE.with(|s| {
         let state = s.borrow();
         let st = state.as_ref()?;
-        if !matches!(st.overview, OverviewMode::Open { .. }) {
+        let ov = st.overviews.get(monitor)?;
+        if !matches!(ov.mode, OverviewMode::Open { .. }) {
             return None;
         }
-        let (_, slots) = super::dock::dock_layout(st.dock_apps.len());
+        let (_, slots) = super::dock::dock_layout(ov.dock_apps.len());
         slots
             .iter()
             .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
@@ -779,13 +827,16 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
         let Some(st) = state.as_ref() else {
             return (None, 0);
         };
-        let current = st.workspaces.current_index();
-        let OverviewMode::Open { thumbs, cards } = &st.overview else {
+        let current = st.workspaces.get(monitor).map(|t| t.current_index()).unwrap_or(0);
+        let Some(ov) = st.overviews.get(monitor) else {
             return (None, current);
         };
-        let (card_rect, pitch) = card_layout();
+        let OverviewMode::Open { thumbs, cards } = &ov.mode else {
+            return (None, current);
+        };
+        let (card_rect, pitch) = card_layout(monitor);
         let thumb_hit = thumbs.iter().find_map(|th| {
-            let r = displayed_rect(th.rect, th.page, st.carousel_offset, pitch, card_rect);
+            let r = displayed_rect(th.rect, th.page, ov.carousel_offset, pitch, card_rect);
             (x >= r.left && x < r.right && y >= r.top && y < r.bottom)
                 .then_some(OverviewHit::Window { page: th.page, hwnd: th.hwnd })
         });
@@ -802,8 +853,13 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
         let hit = thumb_hit.or_else(|| {
             if !cards.is_empty() && y >= card_rect.top && y < card_rect.bottom {
                 let card_center_x = (card_rect.left + card_rect.right) / 2;
-                let approx_offset = st.carousel_offset + (x - card_center_x) as f64 / pitch as f64;
-                let max_page = st.workspaces.workspace_ids().len().saturating_sub(1);
+                let approx_offset = ov.carousel_offset + (x - card_center_x) as f64 / pitch as f64;
+                let max_page = st
+                    .workspaces
+                    .get(monitor)
+                    .map(|t| t.workspace_ids().len())
+                    .unwrap_or(0)
+                    .saturating_sub(1);
                 let page = approx_offset.round().clamp(0.0, max_page as f64) as usize;
                 ((approx_offset - page as f64).abs() <= 0.5).then_some(OverviewHit::EmptyPage { page })
             } else {
@@ -814,10 +870,10 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
     });
 
     match hit {
-        Some(OverviewHit::Window { page, hwnd }) if page == current => close_overview(Some(hwnd)),
-        Some(OverviewHit::Window { page, hwnd }) => snap_carousel_to(page, Some(hwnd)),
-        Some(OverviewHit::EmptyPage { page }) if page != current => snap_carousel_to(page, None),
-        _ => close_overview(None),
+        Some(OverviewHit::Window { page, hwnd }) if page == current => close_overview(monitor, Some(hwnd)),
+        Some(OverviewHit::Window { page, hwnd }) => snap_carousel_to(monitor, page, Some(hwnd)),
+        Some(OverviewHit::EmptyPage { page }) if page != current => snap_carousel_to(monitor, page, None),
+        _ => close_overview(monitor, None),
     }
 }
 
@@ -826,35 +882,36 @@ pub(crate) fn on_overview_click(x: i32, y: i32) {
 /// mid zoom-animation). A press that lands on a window preview begins
 /// a *window* drag (move it to another workspace card); anywhere else
 /// begins a carousel drag.
-pub(crate) fn on_overview_drag_start(x: i32, y: i32) {
+pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
     // The click that starts this drag just re-activated (and re-raised)
     // the overview — put the bars back on top of it.
     raise_bars_topmost();
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
-        if !matches!(state.overview, OverviewMode::Open { .. }) {
+        let ov = state.overviews.get_mut(monitor)?;
+        if !matches!(ov.mode, OverviewMode::Open { .. }) {
             return None;
         }
         // While searching, presses belong to the results panel
         // (handled as clicks on release), not to dragging.
-        if !state.search_query.is_empty() {
+        if !ov.search_query.is_empty() {
             return None;
         }
         // The dock has no drag behavior — a press on it is handled
         // entirely as a click on release (see `on_overview_click`), so
         // just don't start any drag for it.
-        let (_, dock_slots) = super::dock::dock_layout(state.dock_apps.len());
+        let (_, dock_slots) = super::dock::dock_layout(ov.dock_apps.len());
         if dock_slots.iter().any(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
             return None;
         }
         let thumb = {
-            let OverviewMode::Open { thumbs, .. } = &state.overview else {
+            let OverviewMode::Open { thumbs, .. } = &ov.mode else {
                 unreachable!()
             };
-            let (card_rect, pitch) = card_layout();
+            let (card_rect, pitch) = card_layout(monitor);
             thumbs.iter().find_map(|th| {
-                let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
+                let r = displayed_rect(th.rect, th.page, ov.carousel_offset, pitch, card_rect);
                 (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then(|| {
                     (
                         th.hwnd.0 as isize,
@@ -867,10 +924,10 @@ pub(crate) fn on_overview_drag_start(x: i32, y: i32) {
         };
         // Either kind of drag replaces the plain-hover glow with its
         // own hover feedback (per-window ghost/pop, or per-card glow).
-        state.hover_thumb = None;
+        ov.hover_thumb = None;
         match thumb {
             Some((hwnd, from_page, base_w, base_h)) => {
-                state.window_drag = Some(WindowDrag {
+                ov.window_drag = Some(WindowDrag {
                     hwnd,
                     from_page,
                     start_x: x,
@@ -886,7 +943,7 @@ pub(crate) fn on_overview_drag_start(x: i32, y: i32) {
                 // Pop the ghost into being rather than having it appear
                 // at full size instantly — the "snaps out of the
                 // workspace" feel the drag was missing.
-                state.window_pop_anim = Some(WindowPopAnim {
+                ov.window_pop_anim = Some(WindowPopAnim {
                     started: Instant::now(),
                     hwnd,
                     base_w,
@@ -894,12 +951,12 @@ pub(crate) fn on_overview_drag_start(x: i32, y: i32) {
                     at: None,
                     growing: true,
                 });
-                Some(state.overview_hwnd)
+                Some(ov.hwnd)
             }
             None => {
-                state.carousel_drag = Some(CarouselDrag {
+                ov.carousel_drag = Some(CarouselDrag {
                     start_x: x,
-                    start_offset: state.carousel_offset,
+                    start_offset: ov.carousel_offset,
                     max_delta: 0,
                 });
                 None
@@ -924,30 +981,36 @@ pub(crate) fn on_overview_drag_start(x: i32, y: i32) {
 /// `CAROUSEL_DRAG_PAGE_DISTANCE_PX`-per-page rate rather than the
 /// overview's actual (screen-spanning) pixel width — see that
 /// constant's docs.
-pub(crate) fn on_overview_drag_move(x: i32, y: i32) {
+pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
+        let workspace_count = state
+            .workspaces
+            .get(monitor)
+            .map(|t| t.workspace_ids().len())
+            .unwrap_or(0);
+        let ov = state.overviews.get_mut(monitor)?;
 
-        if state.window_drag.is_some() {
+        if ov.window_drag.is_some() {
             // Hit-test which card (if any) the pointer sits over now,
             // before taking `window_drag` mutably — needed for the
             // hover glow's ease-in, which resets whenever the hovered
-            // card changes. Read-only pass over `state.overview`/
-            // `state.carousel_offset` first to avoid borrowing `state`
+            // card changes. Read-only pass over `ov.mode`/
+            // `ov.carousel_offset` first to avoid borrowing `ov`
             // both ways at once.
-            let hovered = match &state.overview {
+            let hovered = match &ov.mode {
                 OverviewMode::Open { cards, .. } => {
-                    let (card_rect, pitch) = card_layout();
+                    let (card_rect, pitch) = card_layout(monitor);
                     cards.iter().find_map(|c| {
-                        let r = displayed_rect(c.rect, c.page, state.carousel_offset, pitch, card_rect);
+                        let r = displayed_rect(c.rect, c.page, ov.carousel_offset, pitch, card_rect);
                         (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(c.page)
                     })
                 }
                 _ => None,
             };
 
-            let Some(drag) = state.window_drag.as_mut() else {
+            let Some(drag) = ov.window_drag.as_mut() else {
                 unreachable!("just checked window_drag.is_some() above");
             };
             drag.cur_x = x;
@@ -958,11 +1021,10 @@ pub(crate) fn on_overview_drag_move(x: i32, y: i32) {
                 drag.hover_page = hovered;
                 drag.hover_started = Instant::now();
             }
-            return Some(state.overview_hwnd);
+            return Some(ov.hwnd);
         }
 
-        let workspace_count = state.workspaces.workspace_ids().len();
-        let drag = state.carousel_drag.as_mut()?;
+        let drag = ov.carousel_drag.as_mut()?;
         let delta_px = x - drag.start_x;
         drag.max_delta = drag.max_delta.max(delta_px.abs());
         // `x`/`delta_px` are physical pixels (the overview is per-monitor
@@ -972,8 +1034,8 @@ pub(crate) fn on_overview_drag_move(x: i32, y: i32) {
         // travel produces more raw pixels there.
         let page_distance_px = scaled(CAROUSEL_DRAG_PAGE_DISTANCE_PX as i32, reference_dpi()) as f64;
         let raw_offset = drag.start_offset - delta_px as f64 / page_distance_px;
-        state.carousel_offset = raw_offset.clamp(0.0, (workspace_count.max(1) - 1) as f64);
-        Some(state.overview_hwnd)
+        ov.carousel_offset = raw_offset.clamp(0.0, (workspace_count.max(1) - 1) as f64);
+        Some(ov.hwnd)
     });
     if let Some(overview_hwnd) = overview_hwnd {
         repaint_overview(overview_hwnd);
@@ -985,20 +1047,21 @@ pub(crate) fn on_overview_drag_move(x: i32, y: i32) {
 /// ease-in glow as the drag-hover highlight, just so you can see what
 /// you're about to click. A no-op while a carousel or window drag is
 /// in progress — those already show their own hover feedback.
-pub(crate) fn on_overview_hover(x: i32, y: i32) {
+pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
-        if state.carousel_drag.is_some() || state.window_drag.is_some() {
+        let ov = state.overviews.get_mut(monitor)?;
+        if ov.carousel_drag.is_some() || ov.window_drag.is_some() {
             return None;
         }
-        let OverviewMode::Open { thumbs, .. } = &state.overview else {
+        let OverviewMode::Open { thumbs, .. } = &ov.mode else {
             return None;
         };
 
         // Dock icons take priority: a dock slot is never also a window
         // preview, so at most one of `hovered`/`dock_hit` is ever Some.
-        let (_, dock_slots) = super::dock::dock_layout(state.dock_apps.len());
+        let (_, dock_slots) = super::dock::dock_layout(ov.dock_apps.len());
         let dock_hit = dock_slots
             .iter()
             .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
@@ -1006,24 +1069,24 @@ pub(crate) fn on_overview_hover(x: i32, y: i32) {
         let hovered = if dock_hit.is_some() {
             None
         } else {
-            let (card_rect, pitch) = card_layout();
+            let (card_rect, pitch) = card_layout(monitor);
             thumbs.iter().find_map(|th| {
-                let r = displayed_rect(th.rect, th.page, state.carousel_offset, pitch, card_rect);
+                let r = displayed_rect(th.rect, th.page, ov.carousel_offset, pitch, card_rect);
                 (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(th.hwnd.0 as isize)
             })
         };
 
         let mut changed = false;
-        if state.hover_thumb.map(|(hwnd, _)| hwnd) != hovered {
-            state.hover_thumb = hovered.map(|hwnd| (hwnd, Instant::now()));
+        if ov.hover_thumb.map(|(hwnd, _)| hwnd) != hovered {
+            ov.hover_thumb = hovered.map(|hwnd| (hwnd, Instant::now()));
             changed = true;
         }
-        if state.dock_hover.map(|(i, _)| i) != dock_hit {
-            state.dock_hover = dock_hit.map(|i| (i, Instant::now()));
+        if ov.dock_hover.map(|(i, _)| i) != dock_hit {
+            ov.dock_hover = dock_hit.map(|i| (i, Instant::now()));
             changed = true;
         }
         if changed {
-            Some(state.overview_hwnd)
+            Some(ov.hwnd)
         } else {
             None
         }
@@ -1044,27 +1107,39 @@ pub(crate) fn on_overview_hover(x: i32, y: i32) {
 /// a plain click instead). A window drag released over a *different*
 /// card moves the window to that workspace; a carousel drag snaps to
 /// whichever page ended up nearest the release point.
-pub(crate) fn on_overview_drag_end(x: i32, y: i32) {
-    let window_drag = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.window_drag.take()));
+pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
+    let window_drag = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|st| st.overviews.get_mut(monitor))
+            .and_then(|ov| ov.window_drag.take())
+    });
     if let Some(drag) = window_drag {
         if drag.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
             // Never actually became a visible drag — clear the pickup
             // pop before it has a chance to flash on screen.
             STATE.with(|s| {
                 if let Some(state) = s.borrow_mut().as_mut() {
-                    state.window_pop_anim = None;
+                    if let Some(ov) = state.overviews.get_mut(monitor) {
+                        ov.window_pop_anim = None;
+                    }
                 }
             });
-            on_overview_click(x, y);
+            on_overview_click(monitor, x, y);
         } else {
-            on_window_drop(drag, x, y);
+            on_window_drop(monitor, drag, x, y);
         }
         return;
     }
 
-    let drag = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.carousel_drag.take()));
+    let drag = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|st| st.overviews.get_mut(monitor))
+            .and_then(|ov| ov.carousel_drag.take())
+    });
     let Some(drag) = drag else {
-        on_overview_click(x, y);
+        on_overview_click(monitor, x, y);
         return;
     };
 
@@ -1074,23 +1149,30 @@ pub(crate) fn on_overview_drag_end(x: i32, y: i32) {
         // before treating this as an ordinary click.
         STATE.with(|s| {
             if let Some(state) = s.borrow_mut().as_mut() {
-                state.carousel_offset = drag.start_offset;
+                if let Some(ov) = state.overviews.get_mut(monitor) {
+                    ov.carousel_offset = drag.start_offset;
+                }
             }
         });
-        on_overview_click(x, y);
+        on_overview_click(monitor, x, y);
         return;
     }
 
     let target = STATE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|st| {
-                let max_index = st.workspaces.workspace_ids().len().saturating_sub(1);
-                st.carousel_offset.round().clamp(0.0, max_index as f64) as usize
-            })
+        let state = s.borrow();
+        let Some(st) = state.as_ref() else {
+            return 0;
+        };
+        let max_index = st
+            .workspaces
+            .get(monitor)
+            .map(|t| t.workspace_ids().len())
             .unwrap_or(0)
+            .saturating_sub(1);
+        let offset = st.overviews.get(monitor).map(|ov| ov.carousel_offset).unwrap_or(0.0);
+        offset.round().clamp(0.0, max_index as f64) as usize
     });
-    snap_carousel_to(target, None);
+    snap_carousel_to(monitor, target, None);
 }
 
 /// A window preview was dragged and released at `(x, y)`: if that's
@@ -1098,24 +1180,31 @@ pub(crate) fn on_overview_drag_end(x: i32, y: i32) {
 /// park/unpark it to match (it physically belongs on screen only while
 /// its workspace is current). Released anywhere else, the drag just
 /// cancels — the ghost disappears and the preview stays put.
-fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
+fn on_window_drop(monitor: &str, drag: WindowDrag, x: i32, y: i32) {
     let moved = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
-        let OverviewMode::Open { cards, .. } = &state.overview else {
-            return None;
-        };
-        let (card_rect, pitch) = card_layout();
+        let (card_rect, pitch) = card_layout(monitor);
         // Same nearest-page snapping as `on_overview_click`, and for the
         // same reason — a release aimed at a thin sliver of a neighbor
         // card shouldn't silently cancel just for landing in the gap
-        // next to it instead of exactly on it.
-        if cards.is_empty() || y < card_rect.top || y >= card_rect.bottom {
-            return None;
-        }
+        // next to it instead of exactly on it. Read the overview's mode
+        // and offset first (immutable), releasing that borrow before the
+        // workspace tracker is taken mutably below.
+        let offset = {
+            let ov = state.overviews.get(monitor)?;
+            let OverviewMode::Open { cards, .. } = &ov.mode else {
+                return None;
+            };
+            if cards.is_empty() || y < card_rect.top || y >= card_rect.bottom {
+                return None;
+            }
+            ov.carousel_offset
+        };
         let card_center_x = (card_rect.left + card_rect.right) / 2;
-        let approx_offset = state.carousel_offset + (x - card_center_x) as f64 / pitch as f64;
-        let max_page = state.workspaces.workspace_ids().len().saturating_sub(1);
+        let approx_offset = offset + (x - card_center_x) as f64 / pitch as f64;
+        let tracker = state.workspaces.get_mut(monitor)?;
+        let max_page = tracker.workspace_ids().len().saturating_sub(1);
         let target = approx_offset.round().clamp(0.0, max_page as f64) as usize;
         if (approx_offset - target as f64).abs() > 0.5 {
             return None;
@@ -1123,8 +1212,8 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
         if target == drag.from_page {
             return None;
         }
-        state.workspaces.move_window_to_index(drag.hwnd, target)?;
-        Some((target, state.workspaces.current_index()))
+        tracker.move_window_to_index(drag.hwnd, target)?;
+        Some((target, tracker.current_index()))
     });
 
     // Either way — landed on a new workspace or cancelled back onto its
@@ -1133,7 +1222,8 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
-        state.window_pop_anim = Some(WindowPopAnim {
+        let ov = state.overviews.get_mut(monitor)?;
+        ov.window_pop_anim = Some(WindowPopAnim {
             started: Instant::now(),
             hwnd: drag.hwnd,
             base_w: drag.base_w,
@@ -1141,7 +1231,7 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
             at: Some((x, y)),
             growing: false,
         });
-        Some(state.overview_hwnd)
+        Some(ov.hwnd)
     });
 
     let Some((target, current)) = moved else {
@@ -1162,7 +1252,7 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
     } else {
         super::workspaces::park_window(hwnd);
     }
-    rebuild_open_overview_pages();
+    rebuild_open_overview_pages(monitor);
     refresh_bar_indicator();
 
     if let Some(overview_hwnd) = overview_hwnd {
@@ -1176,15 +1266,19 @@ fn on_window_drop(drag: WindowDrag, x: i32, y: i32) {
 /// Left/Right arrow keys while the overview is idle-`Open`: slide the
 /// carousel by one workspace, same as the global hotkeys but without
 /// leaving the overview.
-pub(crate) fn on_overview_arrow(delta: i32) {
+pub(crate) fn on_overview_arrow(monitor: &str, delta: i32) {
     let target = STATE.with(|s| {
-        s.borrow().as_ref().and_then(|st| {
-            matches!(st.overview, OverviewMode::Open { .. })
-                .then(|| st.workspaces.clamped_relative_index(delta))
-        })
+        let state = s.borrow();
+        let st = state.as_ref()?;
+        let ov = st.overviews.get(monitor)?;
+        if !matches!(ov.mode, OverviewMode::Open { .. }) {
+            return None;
+        }
+        let tracker = st.workspaces.get(monitor)?;
+        Some(tracker.clamped_relative_index(delta))
     });
     if let Some(target) = target {
-        snap_carousel_to(target, None);
+        snap_carousel_to(monitor, target, None);
     }
 }
 
@@ -1193,25 +1287,26 @@ pub(crate) fn on_overview_arrow(delta: i32) {
 /// idle-`Open`; otherwise the switch still happens, just with nothing
 /// to animate). If `close_after` is `Some`, the overview closes
 /// (focusing that window) once the slide lands.
-pub(crate) fn snap_carousel_to(target_index: usize, close_after: Option<HWND>) {
-    commit_workspace_switch(target_index);
+pub(crate) fn snap_carousel_to(monitor: &str, target_index: usize, close_after: Option<HWND>) {
+    commit_workspace_switch(monitor, target_index);
 
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
-        if !matches!(state.overview, OverviewMode::Open { .. }) {
+        let ov = state.overviews.get_mut(monitor)?;
+        if !matches!(ov.mode, OverviewMode::Open { .. }) {
             return None;
         }
-        let from = state.carousel_offset;
+        let from = ov.carousel_offset;
         let to = target_index as f64;
-        state.carousel_drag = None;
+        ov.carousel_drag = None;
         if (from - to).abs() < 0.001 && close_after.is_none() {
-            state.carousel_anim = None;
+            ov.carousel_anim = None;
             return None;
         }
-        state.carousel_anim = Some(CarouselAnim { started: Instant::now(), from, to });
-        state.carousel_close_after = close_after;
-        Some(state.overview_hwnd)
+        ov.carousel_anim = Some(CarouselAnim { started: Instant::now(), from, to });
+        ov.carousel_close_after = close_after;
+        Some(ov.hwnd)
     });
 
     if let Some(overview_hwnd) = overview_hwnd {
@@ -1291,17 +1386,17 @@ fn app_index_matches(query_lower: &str, limit: usize) -> Vec<(String, std::path:
 /// Open windows whose title or exe matches, then installed apps whose
 /// name matches — capped at `SEARCH_MAX_RESULTS`, windows first since
 /// switching beats launching a duplicate.
-fn search_results(query: &str) -> Vec<SearchResult> {
+fn search_results(monitor: &str, query: &str) -> Vec<SearchResult> {
     let q = query.to_lowercase();
     let tracked: Vec<isize> = STATE.with(|s| {
         s.borrow()
             .as_ref()
-            .map(|st| {
-                st.workspaces
-                    .workspace_ids()
+            .and_then(|st| st.workspaces.get(monitor))
+            .map(|t| {
+                t.workspace_ids()
                     .to_vec()
                     .into_iter()
-                    .flat_map(|id| st.workspaces.windows_on(id))
+                    .flat_map(|id| t.windows_on(id))
                     .collect()
             })
             .unwrap_or_default()
@@ -1334,8 +1429,8 @@ fn search_results(query: &str) -> Vec<SearchResult> {
 /// itself, then one rect per result row. Row 0 of `rows` is the header
 /// line showing the query. Pure function of dpi + row count so painting
 /// and click hit-testing can't disagree.
-fn search_layout(dpi: u32, result_count: usize) -> (RECT, Vec<RECT>) {
-    let (card, _) = card_layout();
+fn search_layout(monitor: &str, dpi: u32, result_count: usize) -> (RECT, Vec<RECT>) {
+    let (card, _) = card_layout(monitor);
     let width = scaled(SEARCH_PANEL_WIDTH, dpi);
     let row_h = scaled(SEARCH_ROW_HEIGHT, dpi);
     let left = (card.left + card.right) / 2 - width / 2;
@@ -1357,10 +1452,12 @@ fn search_layout(dpi: u32, result_count: usize) -> (RECT, Vec<RECT>) {
     (panel, rows)
 }
 
-fn activate_search_result(result: SearchResult) {
+fn activate_search_result(monitor: &str, result: SearchResult) {
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
-            state.search_query.clear();
+            if let Some(ov) = state.overviews.get_mut(monitor) {
+                ov.search_query.clear();
+            }
         }
     });
     match result {
@@ -1368,14 +1465,15 @@ fn activate_search_result(result: SearchResult) {
             let target = STATE.with(|s| {
                 let state_ref = s.borrow();
                 let st = state_ref.as_ref()?;
-                let id = st.workspaces.workspace_of(hwnd)?;
-                let page = st.workspaces.index_of(id)?;
-                Some((page, st.workspaces.current_index()))
+                let tracker = st.workspaces.get(monitor)?;
+                let id = tracker.workspace_of(hwnd)?;
+                let page = tracker.index_of(id)?;
+                Some((page, tracker.current_index()))
             });
             let handle = HWND(hwnd as *mut c_void);
             match target {
-                Some((page, current)) if page != current => snap_carousel_to(page, Some(handle)),
-                _ => close_overview(Some(handle)),
+                Some((page, current)) if page != current => snap_carousel_to(monitor, page, Some(handle)),
+                _ => close_overview(monitor, Some(handle)),
             }
         }
         SearchResult::App { path, .. } => {
@@ -1396,14 +1494,14 @@ fn activate_search_result(result: SearchResult) {
                     SW_SHOWNORMAL,
                 );
             }
-            close_overview(None);
+            close_overview(monitor, None);
         }
     }
 }
 
 /// A printable keystroke (or backspace/Enter) while the overview is
 /// open — GNOME-style type-to-search, no click into a box needed.
-pub(crate) fn on_overview_char(ch: u32) {
+pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
     enum Action {
         Repaint,
         ActivateFirst(String),
@@ -1414,21 +1512,24 @@ pub(crate) fn on_overview_char(ch: u32) {
         let Some(state) = state_ref.as_mut() else {
             return (Action::Nothing, None);
         };
-        if !matches!(state.overview, OverviewMode::Open { .. }) {
+        let Some(ov) = state.overviews.get_mut(monitor) else {
+            return (Action::Nothing, None);
+        };
+        if !matches!(ov.mode, OverviewMode::Open { .. }) {
             return (Action::Nothing, None);
         }
-        let hwnd = state.overview_hwnd;
+        let hwnd = ov.hwnd;
         match ch {
             0x08 => {
-                state.search_query.pop();
+                ov.search_query.pop();
                 (Action::Repaint, Some(hwnd))
             }
-            0x0D if !state.search_query.is_empty() => {
-                (Action::ActivateFirst(state.search_query.clone()), Some(hwnd))
+            0x0D if !ov.search_query.is_empty() => {
+                (Action::ActivateFirst(ov.search_query.clone()), Some(hwnd))
             }
             c => match char::from_u32(c).filter(|c| !c.is_control()) {
-                Some(c) if state.search_query.chars().count() < 64 => {
-                    state.search_query.push(c);
+                Some(c) if ov.search_query.chars().count() < 64 => {
+                    ov.search_query.push(c);
                     (Action::Repaint, Some(hwnd))
                 }
                 _ => (Action::Nothing, None),
@@ -1437,8 +1538,8 @@ pub(crate) fn on_overview_char(ch: u32) {
     });
     match action {
         Action::ActivateFirst(query) => {
-            if let Some(first) = search_results(&query).into_iter().next() {
-                activate_search_result(first);
+            if let Some(first) = search_results(monitor, &query).into_iter().next() {
+                activate_search_result(monitor, first);
             }
             if let Some(overview_hwnd) = overview_hwnd {
                 repaint_overview(overview_hwnd);
@@ -1453,23 +1554,24 @@ pub(crate) fn on_overview_char(ch: u32) {
     }
 }
 
-pub(crate) fn paint_overview(hwnd: HWND) {
+pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
     let content = STATE.with(|s| {
         let state = s.borrow();
         let st = state.as_ref()?;
-        let (cards, thumbs) = match &st.overview {
+        let ov = st.overviews.get(monitor)?;
+        let (cards, thumbs) = match &ov.mode {
             OverviewMode::Opening { cards, thumbs, .. }
             | OverviewMode::Open { cards, thumbs }
             | OverviewMode::Closing { cards, thumbs, .. } => (cards, thumbs),
             OverviewMode::Closed => return None,
         };
-        let (card_rect, pitch) = card_layout();
+        let (card_rect, pitch) = card_layout(monitor);
 
         // Open/close zoom: everything scales about the focused card's
         // center, from "current card blown up to monitor size" at the
         // closed end of the animation to normal carousel size when
         // fully open. Fully `Open` paints with no zoom (s == 1).
-        let zoom = match &st.overview {
+        let zoom = match &ov.mode {
             OverviewMode::Opening { started, .. } => {
                 let t = ease_out(progress(*started));
                 OVERVIEW_ZOOM_MAX + (1.0 - OVERVIEW_ZOOM_MAX) * t
@@ -1483,7 +1585,7 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         let anchor_x = (card_rect.left + card_rect.right) as f64 / 2.0;
         let anchor_y = (card_rect.top + card_rect.bottom) as f64 / 2.0;
         let place = |base: RECT, page: usize| {
-            let r = displayed_rect(base, page, st.carousel_offset, pitch, card_rect);
+            let r = displayed_rect(base, page, ov.carousel_offset, pitch, card_rect);
             zoom_rect(r, anchor_x, anchor_y, zoom)
         };
 
@@ -1491,7 +1593,7 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         // window drag is in progress, with its ease-in intensity —
         // computed before `cards` below is shadowed by its transformed
         // (page-less) form.
-        let hover_glow = st.window_drag.as_ref().and_then(|d| {
+        let hover_glow = ov.window_drag.as_ref().and_then(|d| {
             if d.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
                 return None;
             }
@@ -1507,12 +1609,12 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         // time as its ghost — one or the other, never both. A window
         // being dragged (past the click threshold) is excluded the
         // same way, for the same reason.
-        let excluded_hwnd = st
+        let excluded_hwnd = ov
             .window_pop_anim
             .as_ref()
             .map(|p| p.hwnd)
             .or_else(|| {
-                st.window_drag
+                ov.window_drag
                     .as_ref()
                     .filter(|d| d.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX)
                     .map(|d| d.hwnd)
@@ -1549,12 +1651,12 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         // from nothing); once the drag ends, a drop-out pop shrinks it
         // back to nothing at the frozen release point. `None` once
         // neither is active.
-        let ghost = if let Some(drag) = st
+        let ghost = if let Some(drag) = ov
             .window_drag
             .as_ref()
             .filter(|d| d.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX)
         {
-            let scale = match &st.window_pop_anim {
+            let scale = match &ov.window_pop_anim {
                 Some(p) if p.growing && p.hwnd == drag.hwnd => {
                     ease_out(progress_dur(p.started, WINDOW_POP_DURATION))
                 }
@@ -1562,7 +1664,7 @@ pub(crate) fn paint_overview(hwnd: HWND) {
             };
             Some((drag.cur_x, drag.cur_y, drag.base_w, drag.base_h, drag.hwnd, scale))
         } else {
-            st.window_pop_anim.as_ref().filter(|p| !p.growing).and_then(|p| {
+            ov.window_pop_anim.as_ref().filter(|p| !p.growing).and_then(|p| {
                 let (x, y) = p.at?;
                 let scale = 1.0 - ease_out(progress_dur(p.started, WINDOW_POP_DURATION));
                 Some((x, y, p.base_w, p.base_h, p.hwnd, scale))
@@ -1570,7 +1672,7 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         };
         // The plain (not-dragging) hover glow around whichever preview
         // the pointer currently sits on, if any.
-        let thumb_hover_glow = st.hover_thumb.and_then(|(hovered_hwnd, started)| {
+        let thumb_hover_glow = ov.hover_thumb.and_then(|(hovered_hwnd, started)| {
             let th = thumbs.iter().find(|t| t.hwnd.0 as isize == hovered_hwnd)?;
             let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
             Some((place(th.rect, th.page), intensity))
@@ -1582,25 +1684,25 @@ pub(crate) fn paint_overview(hwnd: HWND) {
         // above (`dock_layout` already accounts for the card's own
         // position), so no `place()` transform — the dock doesn't
         // carousel-shift or zoom with the cards.
-        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(st.dock_apps.len());
-        let dock_icons: Vec<(RECT, HICON, bool)> = st
+        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(ov.dock_apps.len());
+        let dock_icons: Vec<(RECT, HICON, bool)> = ov
             .dock_apps
             .iter()
             .zip(dock_slots.iter())
             .filter_map(|(app, rect)| app.icon.map(|icon| (*rect, icon, !app.windows.is_empty())))
             .collect();
-        let dock_hover_glow = st.dock_hover.and_then(|(i, started)| {
+        let dock_hover_glow = ov.dock_hover.and_then(|(i, started)| {
             let rect = dock_slots.get(i)?;
             let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
             Some((*rect, intensity))
         });
-        let dock = (!st.dock_apps.is_empty()).then_some((dock_bar_rect, dock_icons, dock_hover_glow));
+        let dock = (!ov.dock_apps.is_empty()).then_some((dock_bar_rect, dock_icons, dock_hover_glow));
 
         // Always shown (so people know it's there — see the module
         // docs) rather than only once typing starts; the results
         // dropdown underneath it only appears once there's an actual
         // query (see the paint site).
-        let search = st.search_query.clone();
+        let search = ov.search_query.clone();
         Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, dock, search))
     });
 
@@ -1655,7 +1757,7 @@ pub(crate) fn paint_overview(hwnd: HWND) {
                 );
                 SelectClipRgn(mem, clip);
                 FillRect(mem, rect, fallback_brush);
-                draw_wallpaper_into(mem, *rect);
+                draw_wallpaper_into(monitor, mem, *rect);
                 SelectClipRgn(mem, windows::Win32::Graphics::Gdi::HRGN(std::ptr::null_mut()));
                 let _ = DeleteObject(clip);
             }
@@ -1813,8 +1915,8 @@ pub(crate) fn paint_overview(hwnd: HWND) {
             // needing to already know to type. The results dropdown
             // beneath it only appears once there's an actual query.
             {
-                let results = if search.is_empty() { Vec::new() } else { search_results(&search) };
-                let (panel, rows) = search_layout(dpi, results.len());
+                let results = if search.is_empty() { Vec::new() } else { search_results(monitor, &search) };
+                let (panel, rows) = search_layout(monitor, dpi, results.len());
                 draw_shadow(mem, panel, thumb_radius, 4);
                 let panel_brush = CreateSolidBrush(COLORREF(0x002A2A2A));
                 let null_pen = GetStockObject(NULL_PEN);
@@ -2143,8 +2245,8 @@ fn scaled_wallpaper(width: i32, height: i32) -> Option<isize> {
 /// full-wallpaper-rescale-per-card-per-frame — single-digit fps.
 /// No-op (leaves whatever fallback fill was already painted there) if
 /// the wallpaper couldn't be loaded.
-fn draw_wallpaper_into(hdc: HDC, rect: RECT) {
-    let (base_card, _) = card_layout();
+fn draw_wallpaper_into(monitor: &str, hdc: HDC, rect: RECT) {
+    let (base_card, _) = card_layout(monitor);
     let (base_w, base_h) = (base_card.right - base_card.left, base_card.bottom - base_card.top);
     let Some(handle) = scaled_wallpaper(base_w, base_h) else {
         return;
@@ -2324,7 +2426,7 @@ pub(crate) fn capture_window_snapshot(hwnd: HWND) {
 /// in-flight carousel slide (these can run at the same time, or a
 /// carousel slide can run on its own while the overview just sits
 /// `Open`) — or finalizes either once it reaches the end.
-pub(crate) fn on_animation_tick() {
+pub(crate) fn on_animation_tick(monitor: &str) {
     enum Completion {
         Opened,
         Closed { focus_after: Option<HWND> },
@@ -2333,14 +2435,15 @@ pub(crate) fn on_animation_tick() {
     let result = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
+        let ov = state.overviews.get_mut(monitor)?;
 
         let mut carousel_done = false;
-        if let Some(anim) = &state.carousel_anim {
+        if let Some(anim) = &ov.carousel_anim {
             let t = progress_dur(anim.started, CAROUSEL_SNAP_DURATION);
-            state.carousel_offset = anim.from + (anim.to - anim.from) * ease_out(t);
+            ov.carousel_offset = anim.from + (anim.to - anim.from) * ease_out(t);
             if t >= 1.0 {
-                state.carousel_offset = anim.to;
-                state.carousel_anim = None;
+                ov.carousel_offset = anim.to;
+                ov.carousel_anim = None;
                 carousel_done = true;
             }
         }
@@ -2349,13 +2452,13 @@ pub(crate) fn on_animation_tick() {
         // to expire once its duration elapses — `paint_overview` reads
         // `started`/`growing` directly and computes the current scale
         // itself, so there's nothing to advance here, only to clear.
-        if let Some(anim) = &state.window_pop_anim {
+        if let Some(anim) = &ov.window_pop_anim {
             if progress_dur(anim.started, WINDOW_POP_DURATION) >= 1.0 {
-                state.window_pop_anim = None;
+                ov.window_pop_anim = None;
             }
         }
 
-        let mode = std::mem::replace(&mut state.overview, OverviewMode::Closed);
+        let mode = std::mem::replace(&mut ov.mode, OverviewMode::Closed);
         let (new_mode, fade_alpha, fade_running, completion) = match mode {
             OverviewMode::Opening { started, thumbs, cards } => {
                 let t = progress(started);
@@ -2383,29 +2486,29 @@ pub(crate) fn on_animation_tick() {
             }
             other => (other, None, false, None),
         };
-        state.overview = new_mode;
+        ov.mode = new_mode;
 
-        let carousel_close_after = if carousel_done { state.carousel_close_after.take() } else { None };
+        let carousel_close_after = if carousel_done { ov.carousel_close_after.take() } else { None };
         // Both hover glows (per-card while dragging a window, per-thumb
         // while just browsing) ease in continuously, so the timer needs
         // to keep running for those too, not just for the pop animation.
-        let card_hover_easing = state
+        let card_hover_easing = ov
             .window_drag
             .as_ref()
             .is_some_and(|d| d.hover_page.is_some() && progress_dur(d.hover_started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
-        let thumb_hover_easing = state
+        let thumb_hover_easing = ov
             .hover_thumb
             .is_some_and(|(_, started)| progress_dur(started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
-        let dock_hover_easing = state
+        let dock_hover_easing = ov
             .dock_hover
             .is_some_and(|(_, started)| progress_dur(started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
         let keep_timer = fade_running
-            || state.carousel_anim.is_some()
-            || state.window_pop_anim.is_some()
+            || ov.carousel_anim.is_some()
+            || ov.window_pop_anim.is_some()
             || card_hover_easing
             || thumb_hover_easing
             || dock_hover_easing;
-        Some((state.overview_hwnd, fade_alpha, completion, carousel_close_after, keep_timer))
+        Some((ov.hwnd, fade_alpha, completion, carousel_close_after, keep_timer))
     });
 
     let Some((overview_hwnd, fade_alpha, completion, carousel_close_after, keep_timer)) = result else {
@@ -2468,10 +2571,11 @@ pub(crate) fn on_animation_tick() {
                         let st = s.borrow();
                         let st = st.as_ref()?;
                         let prev = st.previous_foreground;
+                        let tracker = st.workspaces.get(monitor)?;
                         (!prev.0.is_null()
                             && prev != overview_hwnd
-                            && st.workspaces.workspace_of(prev.0 as isize)
-                                == Some(st.workspaces.current_id()))
+                            && tracker.workspace_of(prev.0 as isize)
+                                == Some(tracker.current_id()))
                         .then_some(prev)
                     })
                 });
@@ -2506,6 +2610,6 @@ pub(crate) fn on_animation_tick() {
     // the overview onto that window, same as clicking a current-page
     // thumbnail does directly.
     if let Some(hwnd) = carousel_close_after {
-        close_overview(Some(hwnd));
+        close_overview(monitor, Some(hwnd));
     }
 }
