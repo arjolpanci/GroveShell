@@ -11,7 +11,9 @@ mod overview;
 mod quick_settings;
 mod state;
 mod taskbar;
+mod theme;
 mod util;
+mod wifi;
 mod workspaces;
 
 use std::ffi::c_void;
@@ -28,7 +30,9 @@ use windows::Win32::Graphics::GdiPlus::{GdiplusStartup, GdiplusStartupInput};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::SystemServices::MK_LBUTTON;
-use windows::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+use windows::Win32::UI::HiDpi::{
+    GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_SHIFT, VK_ESCAPE, VK_LEFT, VK_RIGHT,
 };
@@ -37,7 +41,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use groveshell_window_model::registry::WindowRegistry;
 use groveshell_window_model::workspace::WorkspaceTracker;
 
-use bar::{on_bar_click, paint_bar, register_appbar, unregister_appbar, QS_LABEL_MARGIN};
+use bar::{on_bar_click, on_bar_hover, on_bar_mouse_leave, paint_bar, register_appbar, unregister_appbar, QS_LABEL_MARGIN};
 use calendar::{hide_calendar, paint_calendar, CAL_HEIGHT, CAL_WIDTH};
 use monitors::{enumerate_monitors, monitor_index_for_center, monitors_sorted_by_x};
 use movesize::{
@@ -50,8 +54,9 @@ use overview::{
     paint_overview, repaint_overview, OverviewMode,
 };
 use quick_settings::{
-    adjust_volume, hide_quick_settings, paint_quick_settings, toggle_mute, QS_HEIGHT,
-    QS_MUTE, QS_PADDING, QS_VOL_DOWN, QS_VOL_UP, QS_WIDTH,
+    hide_quick_settings, on_quick_settings_mouse_down, on_quick_settings_mouse_move,
+    on_quick_settings_mouse_up, paint_quick_settings, QS_COLOR_KEY, QS_HEIGHT, QS_SHADOW_MARGIN,
+    QS_WIDTH,
 };
 use state::{
     role_of, scaled, AppState, BarWindow, Role, ANIM_TIMER_ID, BAR_CORNER_RADIUS, BAR_HEIGHT,
@@ -66,6 +71,11 @@ use workspaces::{
     switch_workspace_relative, uninstall_win_event_hooks, unpark_window, HOTKEY_MOVE_WIN_NEXT,
     HOTKEY_MOVE_WIN_PREV, HOTKEY_WS_NEXT, HOTKEY_WS_PREV, SYNC_TIMER_ID,
 };
+
+/// Not exposed by this version of the `windows` crate's
+/// `WindowsAndMessaging` module under this name; the value itself
+/// (`0x02A3`) is a stable, decades-old Win32 constant.
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 pub fn main() -> Result<()> {
     // SAFETY: must run before any window is created or any DPI-
@@ -277,72 +287,44 @@ pub fn main() -> Result<()> {
         .map_err(Error::Windows)?;
 
         // Quick Settings flyout, right-aligned under the primary bar's
-        // right label.
-        let qs_x = (primary_bar_rect.right - QS_WIDTH - QS_LABEL_MARGIN)
-            .clamp(primary_bar_rect.left, (primary_bar_rect.right - QS_WIDTH).max(primary_bar_rect.left));
+        // right label. Unlike the bar itself, `QS_WIDTH`/`QS_HEIGHT` are
+        // 96-DPI values that `quick_settings.rs`'s own paint/hit-test
+        // code (`qs_layout`) already scales internally — the window
+        // itself has to be created at that same scaled size, or the
+        // content it lays out overflows a window physically too small
+        // to hold it on any monitor above 100% scaling. The window is
+        // also bigger than the visible card by `QS_SHADOW_MARGIN` on
+        // every side (room for the drop shadow) and layered with a
+        // color-key so that margin — and the card's rounded corners —
+        // are actually transparent; see the module docs on `paint_quick_settings`.
+        let primary_dpi = GetDpiForWindow(primary_bar_hwnd).max(96);
+        let qs_margin = scaled(QS_SHADOW_MARGIN, primary_dpi);
+        let qs_width = scaled(QS_WIDTH, primary_dpi) + qs_margin * 2;
+        let qs_height = scaled(QS_HEIGHT, primary_dpi) + qs_margin * 2;
+        let qs_card_target_right = primary_bar_rect.right - scaled(QS_LABEL_MARGIN, primary_dpi);
+        let qs_x = (qs_card_target_right + qs_margin - qs_width)
+            .clamp(primary_bar_rect.left - qs_margin, (primary_bar_rect.right - qs_width).max(primary_bar_rect.left - qs_margin));
         let quick_settings_hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             w!("GroveShellQuickSettings"),
             w!("GroveShell Quick Settings"),
             WS_POPUP,
             qs_x,
             primary_bar_rect.bottom,
-            QS_WIDTH,
-            QS_HEIGHT,
+            qs_width,
+            qs_height,
             None,
             None,
             hinstance,
             None,
         )
         .map_err(Error::Windows)?;
-
-        CreateWindowExW(
-            Default::default(),
-            w!("BUTTON"),
-            w!("-"),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            QS_PADDING,
-            90,
-            40,
-            28,
+        let _ = SetLayeredWindowAttributes(
             quick_settings_hwnd,
-            HMENU(QS_VOL_DOWN as *mut c_void),
-            hinstance,
-            None,
-        )
-        .map_err(Error::Windows)?;
-
-        CreateWindowExW(
-            Default::default(),
-            w!("BUTTON"),
-            w!("+"),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            QS_PADDING + 48,
-            90,
-            40,
-            28,
-            quick_settings_hwnd,
-            HMENU(QS_VOL_UP as *mut c_void),
-            hinstance,
-            None,
-        )
-        .map_err(Error::Windows)?;
-
-        CreateWindowExW(
-            Default::default(),
-            w!("BUTTON"),
-            w!("Mute"),
-            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(BS_PUSHBUTTON as u32),
-            QS_WIDTH - QS_PADDING - 94,
-            90,
-            94,
-            28,
-            quick_settings_hwnd,
-            HMENU(QS_MUTE as *mut c_void),
-            hinstance,
-            None,
-        )
-        .map_err(Error::Windows)?;
+            COLORREF(QS_COLOR_KEY),
+            0,
+            LWA_COLORKEY,
+        );
 
         let bar_hwnds: Vec<HWND> = bars.iter().map(|b| b.hwnd).collect();
 
@@ -386,6 +368,8 @@ pub fn main() -> Result<()> {
                 dock_hover: None,
                 search_query: String::new(),
                 window_registry: WindowRegistry::new(),
+                qs_pill_hover: false,
+                qs_volume_dragging: false,
             });
         });
 
@@ -490,26 +474,51 @@ unsafe extern "system" fn wndproc(
         // `paint_overview`), so the class-brush erase pass is both
         // redundant and the source of a visible background flash
         // between erase and repaint while dragging — claim it handled.
-        WM_ERASEBKGND if role == Role::Overview => LRESULT(1),
+        WM_ERASEBKGND if role == Role::Overview || role == Role::QuickSettings => LRESULT(1),
         WM_LBUTTONDOWN => {
-            if let Role::Overview = role {
-                let x = (lparam.0 & 0xFFFF) as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                on_overview_drag_start(x, y);
-                LRESULT(0)
-            } else {
-                DefWindowProcW(hwnd, msg, wparam, lparam)
+            match role {
+                Role::Overview => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    on_overview_drag_start(x, y);
+                    LRESULT(0)
+                }
+                Role::QuickSettings => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    on_quick_settings_mouse_down(hwnd, x, y);
+                    LRESULT(0)
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
         }
         WM_MOUSEMOVE => {
-            if let Role::Overview = role {
-                let x = (lparam.0 & 0xFFFF) as i32;
-                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                if wparam.0 & (MK_LBUTTON.0 as usize) != 0 {
-                    on_overview_drag_move(x, y);
-                } else {
-                    on_overview_hover(x, y);
+            match role {
+                Role::Overview => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    if wparam.0 & (MK_LBUTTON.0 as usize) != 0 {
+                        on_overview_drag_move(x, y);
+                    } else {
+                        on_overview_hover(x, y);
+                    }
                 }
+                Role::QuickSettings => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    on_quick_settings_mouse_move(hwnd, x);
+                }
+                Role::Bar { is_primary: true } => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    on_bar_hover(hwnd, x, y);
+                }
+                _ => {}
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_MOUSELEAVE => {
+            if let Role::Bar { is_primary: true } = role {
+                on_bar_mouse_leave(hwnd);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -523,6 +532,9 @@ unsafe extern "system" fn wndproc(
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     on_overview_drag_end(x, y);
+                }
+                Role::QuickSettings => {
+                    on_quick_settings_mouse_up();
                 }
                 _ => {}
             }
@@ -586,20 +598,6 @@ unsafe extern "system" fn wndproc(
                 }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_COMMAND if role == Role::QuickSettings => {
-            let control_id = (wparam.0 & 0xFFFF) as i32;
-            let notify_code = ((wparam.0 >> 16) & 0xFFFF) as u32;
-            if notify_code == BN_CLICKED {
-                match control_id {
-                    QS_VOL_DOWN => adjust_volume(-5),
-                    QS_VOL_UP => adjust_volume(5),
-                    QS_MUTE => toggle_mute(),
-                    _ => {}
-                }
-                let _ = InvalidateRect(hwnd, None, true);
-            }
-            LRESULT(0)
         }
         WM_HOTKEY => {
             match wparam.0 as i32 {

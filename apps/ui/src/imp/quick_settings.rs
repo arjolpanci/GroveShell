@@ -1,51 +1,177 @@
-//! The Quick Settings flyout: real volume control and read-only battery
-//! status.
+//! The Quick Settings flyout: a GNOME-style panel — Wi-Fi and dark-mode
+//! toggle chips, a real draggable volume slider, and battery status.
+//! Fully custom-painted and custom-hit-tested (no native child
+//! controls), same approach as the Activities overview.
+//!
+//! The window itself is larger than the visible card by
+//! `QS_SHADOW_MARGIN` on every side and layered with a color-key: the
+//! margin is painted in that key color (so it's fully transparent) and
+//! the drop shadow + rounded card are drawn inside it. That margin is
+//! also what makes the *window's* corners look rounded — there's no
+//! `SetWindowRgn` involved, the rectangular frame is simply invisible
+//! outside the card shape.
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, InvalidateRect, SetBkMode, SetTextColor, PAINTSTRUCT, DT_SINGLELINE,
-    DT_VCENTER, TRANSPARENT,
+    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, Ellipse, EndPaint, GetStockObject,
+    RoundRect, SelectObject, SetBkMode, SetTextColor, PAINTSTRUCT, PS_SOLID, DT_SINGLELINE,
+    DT_VCENTER, HOLLOW_BRUSH, InvalidateRect, NULL_PEN, TRANSPARENT,
 };
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
 };
 
 use super::calendar::hide_calendar;
-use super::overview::close_overview;
-use super::state::STATE;
-use super::util::draw_text_in;
+use super::overview::{close_overview, draw_shadow};
+use super::state::{scaled, STATE};
+use super::theme::{apps_use_light_theme, toggle_theme};
+use super::util::{draw_battery_glyph, draw_text_in, draw_volume_glyph, draw_wifi_glyph};
+use super::wifi::{set_wifi_radio_on, wifi_radio_on};
 
-pub(crate) const QS_WIDTH: i32 = 280;
-pub(crate) const QS_HEIGHT: i32 = 170;
-pub(crate) const QS_PADDING: i32 = 16;
-pub(crate) const QS_VOL_DOWN: i32 = 2001;
-pub(crate) const QS_VOL_UP: i32 = 2002;
-pub(crate) const QS_MUTE: i32 = 2003;
+pub(crate) const QS_WIDTH: i32 = 320;
+pub(crate) const QS_HEIGHT: i32 = 240;
+/// Room around the visible card for the drop shadow (see the module
+/// docs) — comfortably more than `draw_shadow`'s 6-layer spread plus
+/// its downward bias needs.
+pub(crate) const QS_SHADOW_MARGIN: i32 = 24;
+/// The chroma-key color: fully transparent everywhere it appears,
+/// never used by anything actually drawn in the panel.
+pub(crate) const QS_COLOR_KEY: u32 = 0x00FF00FF;
 
-pub(crate) fn quick_settings_label_text() -> String {
-    match battery_percent() {
-        Some(pct) => format!("{pct}%  Quick Settings"),
-        None => "Quick Settings".to_string(),
-    }
+const QS_PADDING: i32 = 16;
+const QS_CHIP_GAP: i32 = 12;
+const QS_CHIP_HEIGHT: i32 = 60;
+const QS_CHIP_RADIUS: i32 = 14;
+const QS_CARD_RADIUS: i32 = 18;
+const QS_ROW_GAP: i32 = 18;
+const QS_VOLUME_ROW_HEIGHT: i32 = 32;
+const QS_BATTERY_ROW_HEIGHT: i32 = 28;
+const QS_ICON_SIZE: i32 = 20;
+
+/// The app's signature accent (the same light blue `draw_glow_border`
+/// uses for hover glows elsewhere) — reused here for the volume fill
+/// and the "on" chip state so Quick Settings reads as part of the same
+/// design language instead of introducing a second accent color.
+const QS_ACCENT: u32 = 0x00FFA860;
+
+/// Below this battery percentage the glyph and text turn a warning red
+/// rather than the normal foreground color.
+const QS_LOW_BATTERY_PERCENT: u8 = 20;
+
+struct QsLayout {
+    card: RECT,
+    wifi_chip: RECT,
+    theme_chip: RECT,
+    mute_button: RECT,
+    volume_track: RECT,
+    battery_row: RECT,
 }
 
-/// `None` when there's no battery to report (desktop on AC), not on
-/// I/O failure — `GetSystemPowerStatus` reports `255` for "unknown",
-/// which covers both cases; either way there's nothing meaningful to
-/// show.
-pub(crate) fn battery_percent() -> Option<u8> {
+/// Pure function of `dpi` — painting and hit-testing both call this so
+/// they can never disagree, same pattern as the overview's `card_layout`.
+/// Every rect is in *window* client coordinates, already offset by the
+/// shadow margin.
+fn qs_layout(dpi: u32) -> QsLayout {
+    let margin = scaled(QS_SHADOW_MARGIN, dpi);
+    let inner_pad = scaled(QS_PADDING, dpi);
+    let pad = margin + inner_pad;
+    let card_right = margin + scaled(QS_WIDTH, dpi);
+    let card_bottom = margin + scaled(QS_HEIGHT, dpi);
+    let content_right = card_right - inner_pad;
+    let card = RECT { left: margin, top: margin, right: card_right, bottom: card_bottom };
+
+    let chip_gap = scaled(QS_CHIP_GAP, dpi);
+    let chip_h = scaled(QS_CHIP_HEIGHT, dpi);
+    let row_gap = scaled(QS_ROW_GAP, dpi);
+    let volume_h = scaled(QS_VOLUME_ROW_HEIGHT, dpi);
+    let battery_h = scaled(QS_BATTERY_ROW_HEIGHT, dpi);
+    let icon = scaled(QS_ICON_SIZE, dpi);
+
+    let chips_top = pad;
+    let chip_w = (content_right - pad - chip_gap) / 2;
+    let wifi_chip = RECT {
+        left: pad,
+        top: chips_top,
+        right: pad + chip_w,
+        bottom: chips_top + chip_h,
+    };
+    let theme_chip = RECT {
+        left: wifi_chip.right + chip_gap,
+        top: chips_top,
+        right: content_right,
+        bottom: chips_top + chip_h,
+    };
+
+    let volume_top = wifi_chip.bottom + row_gap;
+    let mute_button = RECT {
+        left: pad,
+        top: volume_top + (volume_h - icon) / 2,
+        right: pad + icon,
+        bottom: volume_top + (volume_h - icon) / 2 + icon,
+    };
+    let volume_track = RECT {
+        left: mute_button.right + scaled(12, dpi),
+        top: volume_top,
+        right: content_right,
+        bottom: volume_top + volume_h,
+    };
+
+    let battery_top = volume_track.bottom + row_gap;
+    let battery_row = RECT {
+        left: pad,
+        top: battery_top,
+        right: content_right,
+        bottom: battery_top + battery_h,
+    };
+
+    QsLayout { card, wifi_chip, theme_chip, mute_button, volume_track, battery_row }
+}
+
+/// `None` when there's no battery to report (desktop on AC) — the
+/// battery row falls back to "On AC power" in that case. `bool` is
+/// "charging," from `SYSTEM_POWER_STATUS::BatteryFlag`'s charging bit.
+pub(crate) fn battery_status() -> Option<(u8, bool)> {
     // SAFETY: `status` is a local, zeroed `SYSTEM_POWER_STATUS` that
     // outlives this synchronous call.
     unsafe {
         let mut status = SYSTEM_POWER_STATUS::default();
         GetSystemPowerStatus(&mut status).ok()?;
-        (status.BatteryLifePercent != 255).then_some(status.BatteryLifePercent)
+        (status.BatteryLifePercent != 255)
+            .then_some((status.BatteryLifePercent, status.BatteryFlag & 0x08 != 0))
     }
+}
+
+/// Fills `rect` with `color`, no border — the correct GDI idiom is
+/// `NULL_PEN` (no stroke) plus a solid brush (the fill); selecting
+/// `HOLLOW_BRUSH` instead, as an earlier version of this file did
+/// almost everywhere, draws *no fill at all*, just an outline in
+/// whatever pen happened to be active. That bug was why the volume
+/// track/fill/thumb and the chip backgrounds all looked flat and
+/// colorless.
+unsafe fn fill_round_rect(hdc: windows::Win32::Graphics::Gdi::HDC, rect: RECT, radius: i32, color: COLORREF) {
+    let brush = CreateSolidBrush(color);
+    let previous_brush = SelectObject(hdc, brush);
+    let previous_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
+    SelectObject(hdc, previous_brush);
+    SelectObject(hdc, previous_pen);
+    let _ = DeleteObject(brush);
+}
+
+unsafe fn fill_ellipse(hdc: windows::Win32::Graphics::Gdi::HDC, rect: RECT, color: COLORREF) {
+    let brush = CreateSolidBrush(color);
+    let previous_brush = SelectObject(hdc, brush);
+    let previous_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
+    SelectObject(hdc, previous_brush);
+    SelectObject(hdc, previous_pen);
+    let _ = DeleteObject(brush);
 }
 
 pub(crate) fn paint_quick_settings(hwnd: HWND) {
@@ -54,54 +180,194 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
         SetBkMode(hdc, TRANSPARENT);
+        let dpi = GetDpiForWindow(hwnd).max(96);
+        let layout = qs_layout(dpi);
 
-        let format = DT_SINGLELINE | DT_VCENTER;
+        // The whole window first, in the color key — anything left
+        // this color after painting the card stays fully transparent
+        // (see the module docs), which is what makes the card's
+        // rounded corners and the shadow around it actually visible
+        // against the real desktop instead of a hard rectangle.
+        let key_brush = CreateSolidBrush(COLORREF(QS_COLOR_KEY));
+        let mut client = RECT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+        windows::Win32::Graphics::Gdi::FillRect(hdc, &client, key_brush);
+        let _ = DeleteObject(key_brush);
 
-        SetTextColor(hdc, COLORREF(0x00FFFFFF));
-        draw_text_in(
-            hdc,
-            RECT {
-                left: QS_PADDING,
-                top: 10,
-                right: QS_WIDTH - QS_PADDING,
-                bottom: 34,
+        let card_radius = scaled(QS_CARD_RADIUS, dpi);
+        draw_shadow(hdc, layout.card, card_radius, 6);
+        fill_round_rect(hdc, layout.card, card_radius, COLORREF(0x00262626));
+
+        let text_color = COLORREF(0x00E0E0E0);
+        let muted_text_color = COLORREF(0x00A0A0A0);
+        let accent = COLORREF(QS_ACCENT);
+        let hollow = GetStockObject(HOLLOW_BRUSH);
+
+        let draw_chip = |on: bool, available: bool, rect: RECT, icon_fn: &dyn Fn(), label: &str| {
+            let bg = if on { COLORREF(0x00203A52) } else { COLORREF(0x00383838) };
+            let radius = scaled(QS_CHIP_RADIUS, dpi);
+            fill_round_rect(hdc, rect, radius, bg);
+            if on {
+                // A thin accent ring around the active chip so "on"
+                // reads as more than just a slightly different gray.
+                let pen = CreatePen(PS_SOLID, 2, accent);
+                let previous_pen = SelectObject(hdc, pen);
+                SelectObject(hdc, hollow);
+                let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
+                SelectObject(hdc, previous_pen);
+                let _ = DeleteObject(pen);
+            }
+
+            SetTextColor(hdc, if available { text_color } else { muted_text_color });
+            icon_fn();
+            draw_text_in(
+                hdc,
+                RECT {
+                    left: rect.left + scaled(44, dpi),
+                    top: rect.top,
+                    right: rect.right - scaled(8, dpi),
+                    bottom: rect.bottom,
+                },
+                label,
+                DT_SINGLELINE | DT_VCENTER,
+            );
+        };
+
+        let wifi_on = wifi_radio_on();
+        let wifi_icon_rect = RECT {
+            left: layout.wifi_chip.left + scaled(14, dpi),
+            top: layout.wifi_chip.top + (layout.wifi_chip.bottom - layout.wifi_chip.top - scaled(QS_ICON_SIZE, dpi)) / 2,
+            right: layout.wifi_chip.left + scaled(14, dpi) + scaled(QS_ICON_SIZE, dpi),
+            bottom: layout.wifi_chip.top + (layout.wifi_chip.bottom - layout.wifi_chip.top + scaled(QS_ICON_SIZE, dpi)) / 2,
+        };
+        draw_chip(
+            wifi_on.unwrap_or(false),
+            wifi_on.is_some(),
+            layout.wifi_chip,
+            &|| {
+                let color = if wifi_on.is_some() { text_color } else { muted_text_color };
+                draw_wifi_glyph(hdc, wifi_icon_rect, color, wifi_on.unwrap_or(false));
             },
-            "Quick Settings",
-            format,
+            match wifi_on {
+                Some(true) => "Wi-Fi",
+                Some(false) => "Wi-Fi Off",
+                None => "No Adapter",
+            },
         );
 
-        let volume_text = match (get_volume_percent(), get_mute()) {
-            (Some(pct), Some(true)) => format!("Volume: {pct}% (Muted)"),
-            (Some(pct), _) => format!("Volume: {pct}%"),
-            (None, _) => "Volume: unavailable".to_string(),
+        let light = apps_use_light_theme();
+        let theme_icon_rect = RECT {
+            left: layout.theme_chip.left + scaled(14, dpi),
+            top: layout.theme_chip.top + (layout.theme_chip.bottom - layout.theme_chip.top - scaled(QS_ICON_SIZE, dpi)) / 2,
+            right: layout.theme_chip.left + scaled(14, dpi) + scaled(QS_ICON_SIZE, dpi),
+            bottom: layout.theme_chip.top + (layout.theme_chip.bottom - layout.theme_chip.top + scaled(QS_ICON_SIZE, dpi)) / 2,
         };
-        draw_text_in(
-            hdc,
-            RECT {
-                left: QS_PADDING,
-                top: 46,
-                right: QS_WIDTH - QS_PADDING,
-                bottom: 70,
+        draw_chip(
+            light == Some(false),
+            light.is_some(),
+            layout.theme_chip,
+            &|| {
+                let color = if light.is_some() { text_color } else { muted_text_color };
+                let r = (theme_icon_rect.right - theme_icon_rect.left) / 2;
+                let cx = (theme_icon_rect.left + theme_icon_rect.right) / 2;
+                let cy = (theme_icon_rect.top + theme_icon_rect.bottom) / 2;
+                if light == Some(false) {
+                    // Dark mode is on: a filled moon (solid circle).
+                    fill_ellipse(hdc, RECT { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r }, color);
+                } else {
+                    // Light mode (or unknown): a sun — hollow circle
+                    // with a few short rays.
+                    let pen = CreatePen(PS_SOLID, 1, color);
+                    let previous_pen = SelectObject(hdc, pen);
+                    SelectObject(hdc, hollow);
+                    let _ = Ellipse(hdc, cx - r + 3, cy - r + 3, cx + r - 3, cy + r - 3);
+                    for (dx, dy) in [(0, -r), (0, r), (-r, 0), (r, 0)] {
+                        let _ = windows::Win32::Graphics::Gdi::MoveToEx(hdc, cx + dx * 3 / 4, cy + dy * 3 / 4, None);
+                        let _ = windows::Win32::Graphics::Gdi::LineTo(hdc, cx + dx, cy + dy);
+                    }
+                    SelectObject(hdc, previous_pen);
+                    let _ = DeleteObject(pen);
+                }
             },
-            &volume_text,
-            format,
+            match light {
+                Some(false) => "Dark Mode",
+                Some(true) => "Light Mode",
+                None => "Theme N/A",
+            },
         );
 
-        SetTextColor(hdc, COLORREF(0x00A0A0A0));
-        let battery_text = match battery_percent() {
-            Some(pct) => format!("Battery: {pct}%"),
-            None => "On AC power".to_string(),
+        // Volume: mute glyph as a toggle button, a slider track with
+        // the accent-filled portion and a white thumb, and the
+        // percentage spelled out (nothing else in the row implies a
+        // number, so leaving it out was genuinely ambiguous).
+        let muted = get_mute().unwrap_or(false);
+        SetTextColor(hdc, text_color);
+        draw_volume_glyph(hdc, layout.mute_button, text_color, muted);
+
+        let track_h = scaled(6, dpi);
+        let percent_label_w = scaled(40, dpi);
+        let track = RECT {
+            left: layout.volume_track.left,
+            top: (layout.volume_track.top + layout.volume_track.bottom) / 2 - track_h / 2,
+            right: layout.volume_track.right - percent_label_w,
+            bottom: (layout.volume_track.top + layout.volume_track.bottom) / 2 + track_h / 2,
         };
+        fill_round_rect(hdc, track, track_h / 2, COLORREF(0x00383838));
+
+        let percent = get_volume_percent().unwrap_or(0);
+        let fill_right = track.left + ((track.right - track.left) as f64 * percent as f64 / 100.0).round() as i32;
+        if fill_right > track.left {
+            let fill_rect = RECT { left: track.left, top: track.top, right: fill_right.max(track.left + track_h), bottom: track.bottom };
+            fill_round_rect(hdc, fill_rect, track_h / 2, accent);
+        }
+        let thumb_r = scaled(7, dpi);
+        let thumb_cy = (track.top + track.bottom) / 2;
+        fill_ellipse(
+            hdc,
+            RECT { left: fill_right - thumb_r, top: thumb_cy - thumb_r, right: fill_right + thumb_r, bottom: thumb_cy + thumb_r },
+            COLORREF(0x00FFFFFF),
+        );
+
+        SetTextColor(hdc, text_color);
         draw_text_in(
             hdc,
             RECT {
-                left: QS_PADDING,
-                top: 130,
-                right: QS_WIDTH - QS_PADDING,
-                bottom: 154,
+                left: track.right + scaled(8, dpi),
+                top: layout.volume_track.top,
+                right: layout.volume_track.right,
+                bottom: layout.volume_track.bottom,
+            },
+            &format!("{percent}%"),
+            DT_SINGLELINE | DT_VCENTER,
+        );
+
+        // Battery row.
+        let (battery_color, battery_text) = match battery_status() {
+            Some((pct, true)) => (text_color, format!("{pct}% \u{2022} Charging")),
+            Some((pct, false)) if pct <= QS_LOW_BATTERY_PERCENT => {
+                (COLORREF(0x004040FF), format!("{pct}% \u{2022} Low battery"))
+            }
+            Some((pct, false)) => (text_color, format!("{pct}%")),
+            None => (muted_text_color, "On AC power".to_string()),
+        };
+        let battery_icon_rect = RECT {
+            left: layout.battery_row.left,
+            top: layout.battery_row.top,
+            right: layout.battery_row.left + scaled(QS_ICON_SIZE, dpi),
+            bottom: layout.battery_row.top + scaled(QS_ICON_SIZE, dpi),
+        };
+        draw_battery_glyph(hdc, battery_icon_rect, battery_color, battery_status().map(|(p, _)| p).unwrap_or(100));
+        SetTextColor(hdc, battery_color);
+        draw_text_in(
+            hdc,
+            RECT {
+                left: battery_icon_rect.right + scaled(10, dpi),
+                top: layout.battery_row.top,
+                right: layout.battery_row.right,
+                bottom: layout.battery_row.bottom,
             },
             &battery_text,
-            format,
+            DT_SINGLELINE | DT_VCENTER,
         );
 
         let _ = EndPaint(hwnd, &ps);
@@ -112,7 +378,8 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
 /// call rather than caching it — simpler and more robust against the
 /// default device changing than holding a long-lived COM object, at
 /// the cost of a little overhead per volume interaction (negligible;
-/// this only ever runs in response to a button click).
+/// this only ever runs in response to a user opening/dragging the
+/// panel).
 fn with_volume<R>(f: impl FnOnce(&IAudioEndpointVolume) -> windows::core::Result<R>) -> Option<R> {
     // SAFETY: `CoInitializeEx` was called once at process startup on
     // this same thread; every call here is synchronous and its result
@@ -135,11 +402,10 @@ pub(crate) fn get_mute() -> Option<bool> {
     with_volume(|v| unsafe { v.GetMute() }).map(|b| b.as_bool())
 }
 
-pub(crate) fn adjust_volume(delta_percent: i32) {
-    let Some(current) = get_volume_percent() else {
-        return;
-    };
-    let next = (current as i32 + delta_percent).clamp(0, 100) as f32 / 100.0;
+/// Sets the absolute volume level — the slider drags to a position,
+/// not a delta.
+pub(crate) fn set_volume_percent(percent: u32) {
+    let next = percent.min(100) as f32 / 100.0;
     // SAFETY: no preconditions beyond `with_volume`'s own.
     let _ = with_volume(|v| unsafe { v.SetMasterVolumeLevelScalar(next, std::ptr::null()) });
 }
@@ -152,6 +418,76 @@ pub(crate) fn toggle_mute() {
     let _ = with_volume(|v| unsafe { v.SetMute(!muted, std::ptr::null()) });
 }
 
+/// A press inside the panel: chip toggles fire immediately; a press on
+/// the mute button toggles mute; a press anywhere in the volume row
+/// (not just the thin track — the whole row height is a much easier
+/// target) starts a slider drag, cleared on release regardless of
+/// where the pointer ends up (standard slider feel).
+pub(crate) fn on_quick_settings_mouse_down(hwnd: HWND, x: i32, y: i32) {
+    // SAFETY: `hwnd` is the window currently handling this click.
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let layout = qs_layout(dpi);
+    let hit = |r: RECT| x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+
+    if hit(layout.wifi_chip) {
+        if let Some(on) = wifi_radio_on() {
+            set_wifi_radio_on(!on);
+        }
+    } else if hit(layout.theme_chip) {
+        toggle_theme();
+    } else if hit(layout.mute_button) {
+        toggle_mute();
+    } else if y >= layout.volume_track.top - scaled(8, dpi) && y < layout.volume_track.bottom + scaled(8, dpi)
+        && x >= layout.volume_track.left
+    {
+        STATE.with(|s| {
+            if let Some(state) = s.borrow_mut().as_mut() {
+                state.qs_volume_dragging = true;
+            }
+        });
+        apply_volume_drag(layout.volume_track, dpi, x);
+    } else {
+        return;
+    }
+    // SAFETY: `hwnd` is a valid, process-lifetime window.
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, true);
+    }
+}
+
+pub(crate) fn on_quick_settings_mouse_move(hwnd: HWND, x: i32) {
+    let dragging = STATE.with(|s| s.borrow().as_ref().map(|st| st.qs_volume_dragging)).unwrap_or(false);
+    if !dragging {
+        return;
+    }
+    // SAFETY: `hwnd` is the window currently handling this move.
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    apply_volume_drag(qs_layout(dpi).volume_track, dpi, x);
+    // SAFETY: `hwnd` is a valid, process-lifetime window.
+    unsafe {
+        let _ = InvalidateRect(hwnd, None, true);
+    }
+}
+
+pub(crate) fn on_quick_settings_mouse_up() {
+    STATE.with(|s| {
+        if let Some(state) = s.borrow_mut().as_mut() {
+            state.qs_volume_dragging = false;
+        }
+    });
+}
+
+/// Mirrors the percentage-label reservation `paint_quick_settings`
+/// carves out of `volume_track` so a drag can't set a value past where
+/// the visible track (and thumb) actually stop.
+fn apply_volume_drag(volume_track: RECT, dpi: u32, x: i32) {
+    let percent_label_w = scaled(40, dpi);
+    let track_right = volume_track.right - percent_label_w;
+    let width = (track_right - volume_track.left).max(1);
+    let percent = ((x - volume_track.left) as f64 / width as f64 * 100.0).round().clamp(0.0, 100.0) as u32;
+    set_volume_percent(percent);
+}
+
 /// Mirrors [`hide_calendar`] for the Quick Settings flyout.
 pub(crate) fn hide_quick_settings(restore_focus: bool) {
     let result = STATE.with(|s| {
@@ -161,6 +497,7 @@ pub(crate) fn hide_quick_settings(restore_focus: bool) {
             return None;
         }
         state.quick_settings_open = false;
+        state.qs_volume_dragging = false;
         Some((state.quick_settings_hwnd, state.previous_foreground))
     });
     let Some((hwnd, previous)) = result else {

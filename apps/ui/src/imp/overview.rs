@@ -1899,7 +1899,7 @@ pub(crate) fn paint_overview(hwnd: HWND) {
 /// *before* the content that casts it.
 ///
 /// SAFETY: `hdc` must be a valid memory DC currently being painted into.
-unsafe fn draw_shadow(hdc: HDC, rect: RECT, radius: i32, layers: i32) {
+pub(crate) unsafe fn draw_shadow(hdc: HDC, rect: RECT, radius: i32, layers: i32) {
     let hollow_brush = GetStockObject(HOLLOW_BRUSH);
     let previous_brush = SelectObject(hdc, hollow_brush);
     for i in 0..layers {

@@ -28,9 +28,19 @@ you picked.
 ## What works today
 
 - A top bar on every monitor: Activities button, workspace indicator dots, a
-  clock with a calendar flyout, battery, and quick settings. It is
+  clock with a calendar flyout, and a Wi-Fi/volume/battery status pill. It is
   per-monitor DPI aware and reserves its strip through the same AppBar
   mechanism the real taskbar uses.
+- A GNOME-style Quick Settings panel behind that status pill (hover it for a
+  highlight, click anywhere on it to open): Wi-Fi and Dark Mode toggle chips
+  that actually flip the real system state (Wi-Fi radio via `wlanapi.dll`,
+  theme via the same registry values Settings itself writes), a real
+  draggable volume slider, and battery status with charging/low-battery
+  states. Bluetooth, Airplane mode, Do Not Disturb, Night Light, and a
+  brightness slider aren't in yet: the first four need either WinRT or
+  fragile undocumented registry blobs, and brightness control is unreliable
+  on laptop panels without WMI, so all of it is deferred rather than shipped
+  half-working.
 - GNOME-style workspaces. Each monitor is a pinned workspace, and a dynamic
   tail keeps one empty workspace at the end. `Ctrl+Alt+←/→` switches,
   `Ctrl+Alt+Shift+←/→` sends the focused window away. Windows on inactive
@@ -105,10 +115,13 @@ Condensed, with current status:
 
 ### Phase 4: Top bar and dock (partial)
 - [x] Per-monitor top bars with AppBar work-area reservation
-- [x] Activities button, workspace dots, clock, calendar, quick settings
+- [x] Activities button, workspace dots, clock, calendar
 - [x] Per-monitor DPI scaling, rounded bottom corners
 - [x] Windows taskbar hidden while running, restored on exit
 - [x] Dock (pinned and running apps), overview-only, mirrored from the real taskbar's pins
+- [x] GNOME-style Quick Settings: status pill with Wi-Fi/volume/battery glyphs, working Wi-Fi and Dark Mode toggles, draggable volume slider
+- [ ] Bluetooth, Airplane mode, Do Not Disturb, Night Light toggles, and a brightness slider (need WinRT or undocumented registry blobs; deferred)
+- [ ] Mirroring real system tray icons into the bar (feasibility being checked against this Windows 11 build's actual tray internals, which may need a different technique on newer builds)
 - [ ] Central settings UI (bar height, keybindings, dock pin management)
 
 ### Phase 5: Activities overview (done)
