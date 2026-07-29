@@ -70,6 +70,15 @@ pub(crate) fn reconcile_monitors(hinstance: HINSTANCE) -> Result<()> {
         if let Some(state) = s.borrow_mut().as_mut() {
             if let Some(primary) = monitors.iter().find(|m| m.is_primary) {
                 state.primary_monitor = primary.device_name.clone();
+                // Every bar's `is_primary` flag drives the clock/Quick
+                // Settings pill rendering and hit-testing (via
+                // `Role::Bar { is_primary, .. }` in `wndproc` and inside
+                // `paint_bar`/`on_bar_click`) — it must be kept in sync
+                // with the live primary, not just `state.primary_monitor`,
+                // or a promoted bar never shows the clock/QS pill.
+                for bar in state.bars.iter_mut() {
+                    bar.is_primary = bar.monitor == primary.device_name;
+                }
                 if let Some(bar) = state.bars.iter().find(|b| b.monitor == primary.device_name) {
                     state.primary_bar_hwnd = bar.hwnd;
                     state.primary_bar_rect = bar.rect;

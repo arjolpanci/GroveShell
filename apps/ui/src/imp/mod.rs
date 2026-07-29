@@ -716,9 +716,9 @@ unsafe extern "system" fn wndproc(
                     }
                     set_windows_taskbar_visible(true);
                     restore_work_areas();
+                    PostQuitMessage(0);
                 }
             }
-            PostQuitMessage(0);
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
