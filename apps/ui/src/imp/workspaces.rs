@@ -451,6 +451,45 @@ pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
 
                 match (state.workspaces.monitor_of_window(window.hwnd), real_monitor) {
                     (Some(tracked_monitor), Some(real)) if tracked_monitor != real => {
+                        // Win32 does not move an owned window (a dialog,
+                        // color picker, etc.) when its owner is dragged
+                        // to another monitor by its title bar — shift
+                        // every currently-owned window by exactly the
+                        // delta the owner itself moved since the last
+                        // sync tick, preserving their relative offset.
+                        if let Some(&old_rect) = state.window_rects.get(&window.hwnd) {
+                            let dx = window.rect.left - old_rect.left;
+                            let dy = window.rect.top - old_rect.top;
+                            if dx != 0 || dy != 0 {
+                                for owned in groveshell_window_model::owned_windows_of(window.hwnd) {
+                                    // SAFETY: `owned` came from a live
+                                    // `EnumWindows` pass moments ago; if
+                                    // it's since closed, both calls below
+                                    // documented-fail harmlessly.
+                                    unsafe {
+                                        let owned_hwnd = HWND(owned as *mut c_void);
+                                        let mut owned_raw = windows::Win32::Foundation::RECT::default();
+                                        if GetWindowRect(owned_hwnd, &mut owned_raw).is_err() {
+                                            continue;
+                                        }
+                                        let shifted = shift_rect(
+                                            groveshell_window_model::Rect::from(owned_raw),
+                                            dx,
+                                            dy,
+                                        );
+                                        let _ = SetWindowPos(
+                                            owned_hwnd,
+                                            HWND(std::ptr::null_mut()),
+                                            shifted.left,
+                                            shifted.top,
+                                            0,
+                                            0,
+                                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         // Physically dragged to a different monitor since the last
                         // sync — move it onto the new monitor's *current* workspace
                         // rather than leaving it assigned to a monitor it's no
@@ -472,6 +511,7 @@ pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
                     }
                     _ => {}
                 }
+                state.window_rects.insert(window.hwnd, window.rect);
             }
             for name in state.workspaces.device_names().map(str::to_string).collect::<Vec<_>>() {
                 if let Some(tracker) = state.workspaces.get_mut(&name) {
@@ -479,6 +519,7 @@ pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
                 }
             }
             state.window_registry.prune(groveshell_window_model::is_alive);
+            state.window_rects.retain(|&hwnd, _| groveshell_window_model::is_alive(hwnd));
             let tracked = state.workspaces.all_tracked_windows();
             retain_window_snapshots(&tracked);
         }
