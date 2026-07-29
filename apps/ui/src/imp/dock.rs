@@ -69,8 +69,8 @@ pub(crate) struct DockApp {
 /// contained like `card_layout`, for the same reason: cheap to
 /// recompute, and this module doesn't handle live display-topology
 /// changes either.
-pub(crate) fn dock_layout(count: usize) -> (RECT, Vec<RECT>) {
-    let (card_rect, _) = super::overview::card_layout();
+pub(crate) fn dock_layout(monitor: &str, count: usize) -> (RECT, Vec<RECT>) {
+    let (card_rect, _) = super::overview::card_layout(monitor);
     let dpi = super::state::reference_dpi();
     let icon_size = scaled(DOCK_ICON_SIZE, dpi);
     let gap = scaled(DOCK_ICON_GAP, dpi);
@@ -269,15 +269,18 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
 /// pinned shortcut. No-op if the index is stale (dock rebuilt or
 /// overview closed between hover and click) or the entry somehow has
 /// neither.
-pub(crate) fn activate_dock_app(index: usize) {
+pub(crate) fn activate_dock_app(monitor: &str, index: usize) {
     let target = super::state::STATE.with(|s| {
         let state = s.borrow();
         let st = state.as_ref()?;
-        let app = st.dock_apps.get(index)?;
+        let ov = st.overviews.get(monitor)?;
+        let app = ov.dock_apps.get(index)?;
         if let Some(&hwnd) = app.windows.first() {
-            let id = st.workspaces.workspace_of(hwnd);
-            let page = id.and_then(|id| st.workspaces.index_of(id));
-            Some((Some(hwnd), page, st.workspaces.current_index(), None))
+            let tracker = st.workspaces.get(monitor);
+            let id = tracker.and_then(|t| t.workspace_of(hwnd));
+            let page = id.and_then(|id| tracker.and_then(|t| t.index_of(id)));
+            let current = tracker.map(|t| t.current_index()).unwrap_or(0);
+            Some((Some(hwnd), page, current, None))
         } else {
             app.launch_path.clone().map(|path| (None, None, 0, Some(path)))
         }
@@ -289,8 +292,8 @@ pub(crate) fn activate_dock_app(index: usize) {
     if let Some(hwnd) = hwnd {
         let handle = HWND(hwnd as *mut c_void);
         match page {
-            Some(page) if page != current => super::overview::snap_carousel_to(page, Some(handle)),
-            _ => super::overview::close_overview(Some(handle)),
+            Some(page) if page != current => super::overview::snap_carousel_to(monitor, page, Some(handle)),
+            _ => super::overview::close_overview(monitor, Some(handle)),
         }
         return;
     }
@@ -310,6 +313,6 @@ pub(crate) fn activate_dock_app(index: usize) {
                 SW_SHOWNORMAL,
             );
         }
-        super::overview::close_overview(None);
+        super::overview::close_overview(monitor, None);
     }
 }
