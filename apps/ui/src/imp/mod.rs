@@ -382,6 +382,7 @@ pub fn main() -> Result<()> {
                 workspaces,
                 overviews,
                 window_registry: WindowRegistry::new(),
+                window_rects: std::collections::HashMap::new(),
                 qs_pill_hover: false,
                 qs_volume_dragging: false,
             });

@@ -470,3 +470,28 @@ pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
     });
     live
 }
+
+/// Shifts every corner of `rect` by `(dx, dy)` — used to translate an
+/// owned window's current position by exactly the delta its owner moved
+/// between two `sync_workspaces` ticks, preserving their relative offset.
+fn shift_rect(rect: groveshell_window_model::Rect, dx: i32, dy: i32) -> groveshell_window_model::Rect {
+    groveshell_window_model::Rect {
+        left: rect.left + dx,
+        top: rect.top + dy,
+        right: rect.right + dx,
+        bottom: rect.bottom + dy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shift_rect;
+    use groveshell_window_model::Rect;
+
+    #[test]
+    fn shift_rect_moves_every_corner_by_the_same_delta() {
+        let rect = Rect { left: 100, top: 200, right: 300, bottom: 400 };
+        let shifted = shift_rect(rect, 50, -20);
+        assert_eq!(shifted, Rect { left: 150, top: 180, right: 350, bottom: 380 });
+    }
+}

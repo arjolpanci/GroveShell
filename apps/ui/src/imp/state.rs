@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use windows::Win32::Foundation::{HWND, RECT};
 
 use groveshell_window_model::registry::WindowRegistry;
+use groveshell_window_model::Rect;
 
 use super::monitor_workspaces::MonitorWorkspaces;
 use super::overview::OverviewInstance;
@@ -66,6 +67,12 @@ pub(crate) struct AppState {
     /// Per-monitor Activities overview state, keyed by device name.
     pub(crate) overviews: HashMap<String, OverviewInstance>,
     pub(crate) window_registry: WindowRegistry,
+    /// Last-observed on-screen rect per live window, updated every
+    /// `sync_workspaces` tick. Used only to compute how far a window
+    /// moved since the previous tick when a monitor mismatch is detected,
+    /// so the same delta can be applied to any of its owned windows
+    /// (dialogs) — see `workspaces::sync_workspaces`.
+    pub(crate) window_rects: HashMap<isize, Rect>,
     pub(crate) qs_pill_hover: bool,
     pub(crate) qs_volume_dragging: bool,
 }
