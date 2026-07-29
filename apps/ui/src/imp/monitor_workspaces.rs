@@ -108,4 +108,20 @@ mod tests {
         all.sort();
         assert_eq!(all, vec![1, 2]);
     }
+
+    #[test]
+    fn reassigning_a_window_to_a_new_monitor_removes_it_from_the_old_one() {
+        let mut mw = MonitorWorkspaces::new();
+        mw.insert_monitor("A".into(), WorkspaceTracker::with_monitor_workspaces(1, 0));
+        mw.insert_monitor("B".into(), WorkspaceTracker::with_monitor_workspaces(1, 0));
+        mw.get_mut("A").unwrap().assign_to_index(42, 0);
+        assert_eq!(mw.monitor_of_window(42), Some("A".to_string()));
+
+        // Simulate what `sync_workspaces` will do: forget it on its old
+        // monitor, assign it on the new one.
+        mw.get_mut("A").unwrap().forget(42);
+        mw.get_mut("B").unwrap().assign_to_index(42, 0);
+
+        assert_eq!(mw.monitor_of_window(42), Some("B".to_string()));
+    }
 }
