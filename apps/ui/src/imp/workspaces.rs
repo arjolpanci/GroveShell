@@ -79,6 +79,17 @@ pub(crate) fn park_window(hwnd: HWND) {
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
     }
+    // Win32 does not move an owned window (a dialog, color picker, etc.)
+    // when its owner moves — carry every currently-live owned window
+    // along so it doesn't strand on the wrong workspace. Recursing
+    // through `park_window` itself (rather than inlining the move) means
+    // a multi-level owner chain (a dialog that owns a further dialog)
+    // parks correctly too; each recursive call's own early-return guards
+    // make this cheap and safe even though `owned_windows_of` already
+    // returns the full transitive set.
+    for owned in groveshell_window_model::owned_windows_of(hwnd.0 as isize) {
+        park_window(HWND(owned as *mut c_void));
+    }
 }
 
 /// Inverse of [`park_window`]: returns `hwnd` to its real position (a
@@ -109,6 +120,10 @@ pub(crate) fn unpark_window(hwnd: HWND) {
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         );
+    }
+    // See `park_window` — carry every owned window back too.
+    for owned in groveshell_window_model::owned_windows_of(hwnd.0 as isize) {
+        unpark_window(HWND(owned as *mut c_void));
     }
 }
 
