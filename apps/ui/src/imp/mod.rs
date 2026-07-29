@@ -5,6 +5,7 @@
 mod bar;
 mod calendar;
 mod dock;
+mod gpu;
 mod hotplug;
 mod icons;
 mod monitors;
@@ -126,6 +127,11 @@ pub fn main() -> Result<()> {
         ..Default::default()
     };
     let _ = unsafe { GdiplusStartup(&mut gdiplus_token, &gdiplus_input, std::ptr::null_mut()) };
+
+    // Decided once, here, before any window exists — see gpu.rs. Every
+    // later GPU-path call site just checks `gpu::is_enabled()`; this is
+    // never retried or re-evaluated.
+    gpu::init();
 
     // SAFETY: every Win32 call below either has a call-site safety
     // comment or is a plain value/query with no aliasing or lifetime
