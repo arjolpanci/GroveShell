@@ -27,10 +27,12 @@ you picked.
 
 ## What works today
 
-- A top bar on every monitor: Activities button, workspace indicator dots, a
-  clock with a calendar flyout, and a Wi-Fi/volume/battery status pill. It is
-  per-monitor DPI aware and reserves its strip through the same AppBar
-  mechanism the real taskbar uses.
+- A top bar on every monitor: Activities button and workspace dots (each
+  reflecting that monitor's own independent workspace set), plus — on the
+  primary monitor only, since these reflect machine-wide state rather than
+  anything per-monitor — a clock with a calendar flyout and a Wi-Fi/volume/
+  battery status pill. Every bar is per-monitor DPI aware and reserves its
+  strip through the same AppBar mechanism the real taskbar uses.
 - Real icon assets ([Lucide](https://lucide.dev), ISC-licensed) instead of
   hand-drawn shapes, checked into `apps/ui/resources/icons/` and embedded
   into the binary at compile time. States pick the matching variant rather
@@ -50,17 +52,25 @@ you picked.
   Do Not Disturb, Night Light, and a brightness slider still aren't in:
   the first two need fragile undocumented registry blobs with no public API
   at all, and brightness control is unreliable on laptop panels without WMI.
-- GNOME-style workspaces. Each monitor is a pinned workspace, and a dynamic
-  tail keeps one empty workspace at the end. `Ctrl+Alt+←/→` switches,
-  `Ctrl+Alt+Shift+←/→` sends the focused window away. Windows on inactive
-  workspaces are parked off-screen rather than hidden, with a snapshot taken
-  at park time so previews don't go blank when apps stop rendering.
+- GNOME-style workspaces, independent per monitor. Each monitor has its own
+  pinned workspace and its own dynamic tail (a spare empty workspace always
+  waiting at the end), and its own Activities overview — switching
+  workspaces on one monitor never affects any other. `Ctrl+Alt+←/→` switches
+  the workspace on whichever monitor currently has keyboard focus,
+  `Ctrl+Alt+Shift+←/→` sends the focused window away on that same monitor.
+  Windows on inactive workspaces are parked off-screen rather than hidden,
+  with a snapshot taken at park time so previews don't go blank when apps
+  stop rendering. Monitors can be connected or disconnected while GroveShell
+  is running: a new monitor gets its own bar, workspace set, and overview
+  within a second or two, and unplugging one hands its windows back to the
+  primary monitor's current workspace rather than stranding them.
 - Live window tracking. `SetWinEventHook` picks up new, closed, and renamed
   windows in the background, and switching to a parked window through
   Alt+Tab or the taskbar's own window list brings its workspace along with
   it. A small identity registry means a recycled window handle never
   inherits a dead window's workspace or preview.
-- The Activities overview: fixed-size workspace cards in a draggable
+- The Activities overview: one per monitor, each scoped to only that
+  monitor's own workspaces — fixed-size workspace cards in a draggable
   carousel. The focused card is a little larger than its neighbors, opening
   and closing animate as a zoom, and cards get rounded corners and drop
   shadows. Dragging a window's preview onto another card pops it out with a
@@ -116,8 +126,11 @@ Condensed, with current status:
 
 ### Phase 3: Managed workspaces (partial)
 - [x] Workspace domain model (pure, unit-tested) with the dynamic empty-tail policy
-- [x] Pinned per-monitor workspaces plus a shared dynamic tail
-- [x] Keyboard switching and move-window shortcuts
+- [x] Independent per-monitor workspace sets: one pinned workspace and one
+  dynamic tail per monitor, with live hotplug (new monitors get their own
+  set; disconnected ones hand their windows to the primary monitor)
+- [x] Keyboard switching and move-window shortcuts, resolved to whichever
+  monitor currently has keyboard focus
 - [x] Park/unpark instead of hide/show, with crash recovery on the next start
 - [ ] Session persistence across restarts
 - [ ] Owned dialogs following their owner window
@@ -134,7 +147,9 @@ Condensed, with current status:
 - [ ] Central settings UI (bar height, keybindings, dock pin management)
 
 ### Phase 5: Activities overview (done)
-- [x] Carousel layout engine with focused-card scaling
+- [x] One Activities overview per monitor, each with its own carousel
+  layout engine and focused-card scaling, scoped to only that monitor's
+  own workspaces
 - [x] Window previews from our own captures, which survive apps that stop rendering off-screen
 - [x] Zoom and fade open/close animations, smooth drag with snap
 - [x] Click to focus, click empty space to switch or cancel
