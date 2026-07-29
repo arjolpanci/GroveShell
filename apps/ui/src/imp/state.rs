@@ -10,6 +10,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use groveshell_window_model::registry::WindowRegistry;
 use groveshell_window_model::Rect;
 
+use super::gpu::GpuSurface;
 use super::monitor_workspaces::MonitorWorkspaces;
 use super::overview::OverviewInstance;
 
@@ -57,6 +58,10 @@ pub(crate) struct AppState {
     /// windows/workspaces orphaned by a monitor unplug (Task 10).
     pub(crate) primary_monitor: String,
     pub(crate) calendar_hwnd: HWND,
+    /// `None` if GPU rendering isn't available (see `gpu::is_enabled`) —
+    /// `paint_calendar`/`toggle_calendar` fall back to plain GDI in that
+    /// case, unchanged from before this feature existed.
+    pub(crate) calendar_gpu: Option<GpuSurface>,
     pub(crate) quick_settings_hwnd: HWND,
     pub(crate) calendar_open: bool,
     pub(crate) quick_settings_open: bool,
