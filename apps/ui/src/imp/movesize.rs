@@ -52,7 +52,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-use super::overview::{close_overview, open_overview};
 use super::state::{role_of, Role, STATE};
 
 const VK_LWIN: u32 = 0x5B;
@@ -168,16 +167,15 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
 }
 
 fn toggle_overview() {
-    let is_closed = STATE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|st| matches!(st.overview, super::overview::OverviewMode::Closed))
-    });
-    match is_closed {
-        Some(true) => open_overview(),
-        Some(false) => close_overview(None),
-        None => {}
+    let mut pt = POINT::default();
+    // SAFETY: plain query, no preconditions.
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return;
     }
+    let Some(monitor) = super::monitors::monitor_key_at_point(pt) else {
+        return;
+    };
+    super::overview::toggle_overview_for(&monitor);
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -374,22 +372,18 @@ pub(crate) fn check_hot_corners() {
     if unsafe { GetCursorPos(&mut pt) }.is_err() {
         return;
     }
-    let monitors = super::monitors::enumerate_monitors();
-    let in_corner = monitors.iter().any(|m| {
+    let monitors = super::monitors::monitors_sorted_by_x();
+    let corner_monitor = monitors.iter().find(|m| {
         pt.x >= m.rect.left
             && pt.x < m.rect.left + HOTCORNER_ZONE
             && pt.y >= m.rect.top
             && pt.y < m.rect.top + HOTCORNER_ZONE
     });
+    let in_corner = corner_monitor.is_some();
     let was_in_corner = IN_HOT_CORNER.with(|c| c.replace(in_corner));
     if in_corner && !was_in_corner {
-        let is_closed = STATE.with(|s| {
-            s.borrow()
-                .as_ref()
-                .map(|st| matches!(st.overview, super::overview::OverviewMode::Closed))
-        });
-        if is_closed == Some(true) {
-            open_overview();
+        if let Some(m) = corner_monitor {
+            super::overview::open_overview(&m.device_name);
         }
     }
 }
