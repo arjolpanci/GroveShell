@@ -314,3 +314,87 @@ fn exe_name_for_pid(pid: u32) -> Option<String> {
         path.rsplit(['\\', '/']).next().map(str::to_string)
     }
 }
+
+/// Returns every window (top-level or itself owned) that `owner` owns,
+/// directly or transitively — e.g. a dialog that itself owns a color
+/// picker — unfiltered by visibility, title, or tool-window status, since
+/// a not-yet-shown or hidden owned window should still follow its owner.
+/// Win32 does not move an owned window when its owner moves (unlike a
+/// true child window), so callers use this to carry owned dialogs along
+/// during a workspace switch or a cross-monitor drag.
+pub fn owned_windows_of(owner: isize) -> Vec<isize> {
+    let mut pairs: Vec<(isize, isize)> = Vec::new();
+    // SAFETY: `pairs` is a local `Vec` whose address is passed through as
+    // `lparam` and only ever read back by `enum_owner_pairs_proc` during
+    // this call; `EnumWindows` is synchronous, so `pairs` is guaranteed to
+    // outlive every callback invocation.
+    unsafe {
+        let _ = EnumWindows(
+            Some(enum_owner_pairs_proc),
+            LPARAM(&mut pairs as *mut Vec<(isize, isize)> as isize),
+        );
+    }
+    owned_windows_from_pairs(owner, &pairs)
+}
+
+unsafe extern "system" fn enum_owner_pairs_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    // SAFETY: `lparam` was created from a live `&mut Vec<(isize, isize)>`
+    // in `owned_windows_of` and this callback only runs synchronously
+    // within that call's lifetime.
+    let pairs = &mut *(lparam.0 as *mut Vec<(isize, isize)>);
+    let owner = GetWindow(hwnd, GW_OWNER).map(|o| o.0 as isize).unwrap_or(0);
+    if owner != 0 {
+        pairs.push((hwnd.0 as isize, owner));
+    }
+    TRUE
+}
+
+/// Pure transitive walk: every hwnd in `pairs` whose owner is `root`,
+/// directly or through a chain, using a visited set so a pathological
+/// owner cycle can't loop forever or include `root` in its own result.
+fn owned_windows_from_pairs(root: isize, pairs: &[(isize, isize)]) -> Vec<isize> {
+    let mut result = Vec::new();
+    let mut frontier = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(root);
+    while let Some(current) = frontier.pop() {
+        for &(hwnd, owner) in pairs {
+            if owner == current && visited.insert(hwnd) {
+                result.push(hwnd);
+                frontier.push(hwnd);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod owned_windows_tests {
+    use super::owned_windows_from_pairs;
+
+    #[test]
+    fn finds_direct_and_transitive_owned_windows() {
+        // 1 owns 2; 2 owns 3 (transitive); 4 is owned by an unrelated
+        // window (99) and must not appear.
+        let pairs = vec![(2, 1), (3, 2), (4, 99)];
+        let mut owned = owned_windows_from_pairs(1, &pairs);
+        owned.sort();
+        assert_eq!(owned, vec![2, 3]);
+    }
+
+    #[test]
+    fn returns_empty_when_nothing_is_owned() {
+        let pairs = vec![(2, 1)];
+        assert_eq!(owned_windows_from_pairs(5, &pairs), Vec::<isize>::new());
+    }
+
+    #[test]
+    fn an_owner_cycle_does_not_infinite_loop() {
+        // Pathological: 1 owns 2 and 2 "owns" 1 back. Must terminate and
+        // must not include the root itself in its own owned set.
+        let pairs = vec![(1, 2), (2, 1)];
+        let mut owned = owned_windows_from_pairs(1, &pairs);
+        owned.sort();
+        assert_eq!(owned, vec![2]);
+    }
+}
