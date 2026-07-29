@@ -124,3 +124,123 @@ fn try_create_surface(ctx: &GpuContext, hwnd: HWND, width: i32, height: i32) -> 
         Ok(GpuSurface { target, visual, surface })
     }
 }
+
+use windows::Foundation::Numerics::Matrix3x2;
+use windows::Win32::Foundation::POINT;
+use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F};
+use windows::Win32::Graphics::Direct2D::{ID2D1DeviceContext, D2D1_DRAW_TEXT_OPTIONS_NONE};
+use windows::Win32::Graphics::DirectWrite::{
+    DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+    DWRITE_TEXT_ALIGNMENT_LEADING,
+};
+
+/// Draws into `surface` via `draw`, then commits so the compositor picks
+/// up the new content. `draw` receives a device context whose origin is
+/// already adjusted for `BeginDraw`'s update offset, so callers can draw
+/// as if the surface's own top-left were always `(0, 0)`.
+pub(crate) fn redraw<F>(surface: &GpuSurface, draw: F)
+where
+    F: FnOnce(&ID2D1DeviceContext),
+{
+    GPU.with(|g| {
+        let g = g.borrow();
+        let Some(ctx) = g.as_ref() else { return };
+        // SAFETY: `surface.surface` was created by this module's own
+        // `try_create_surface` and is still owned (alive) by the
+        // caller's `GpuSurface`; `BeginDraw`/`EndDraw` bracket every
+        // Direct2D call made inside `draw`, matching Direct2D's required
+        // usage pattern.
+        unsafe {
+            let mut offset = POINT::default();
+            let Ok(d2d_ctx): windows::core::Result<ID2D1DeviceContext> =
+                surface.surface.BeginDraw(None, &mut offset)
+            else {
+                return;
+            };
+            let translate = Matrix3x2 {
+                M11: 1.0,
+                M12: 0.0,
+                M21: 0.0,
+                M22: 1.0,
+                M31: offset.x as f32,
+                M32: offset.y as f32,
+            };
+            let _ = d2d_ctx.SetTransform(&translate);
+            draw(&d2d_ctx);
+            let _ = surface.surface.EndDraw();
+            let _ = ctx.dcomp_device.Commit();
+        }
+    });
+}
+
+pub(crate) fn fill_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u32) {
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`
+    // (enforced by `redraw`'s closure scope).
+    unsafe {
+        if let Ok(brush) = ctx.CreateSolidColorBrush(&colorref_to_d2d(colorref), None) {
+            let _ = ctx.FillRectangle(&rect, &brush);
+        }
+    }
+}
+
+pub(crate) fn draw_text(
+    ctx: &ID2D1DeviceContext,
+    rect: D2D_RECT_F,
+    text: &str,
+    colorref: u32,
+    size: f32,
+    center_horizontally: bool,
+) {
+    GPU.with(|g| {
+        let g = g.borrow();
+        let Some(gpu_ctx) = g.as_ref() else { return };
+        // SAFETY: same as `fill_rect`; `gpu_ctx.dwrite_factory` is the
+        // process-wide factory from `init`, alive for the process's life.
+        unsafe {
+            let Ok(format) = gpu_ctx.dwrite_factory.CreateTextFormat(
+                windows::core::w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_NORMAL,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                size,
+                windows::core::w!("en-us"),
+            ) else {
+                return;
+            };
+            let _ = format.SetTextAlignment(if center_horizontally {
+                DWRITE_TEXT_ALIGNMENT_CENTER
+            } else {
+                DWRITE_TEXT_ALIGNMENT_LEADING
+            });
+            let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+            let Ok(brush) = ctx.CreateSolidColorBrush(&colorref_to_d2d(colorref), None) else {
+                return;
+            };
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let _ = ctx.DrawText(
+                &wide,
+                &format,
+                &rect,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    });
+}
+
+/// `COLORREF` is `0x00BBGGRR` — the same bit layout every GDI color
+/// constant in this codebase already uses (e.g. `calendar.rs`'s
+/// `COLORREF(0x00A0A0A0)`), so callers can pass those exact literals
+/// unchanged.
+fn colorref_to_d2d(colorref: u32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F {
+        r: (colorref & 0xFF) as f32 / 255.0,
+        g: ((colorref >> 8) & 0xFF) as f32 / 255.0,
+        b: ((colorref >> 16) & 0xFF) as f32 / 255.0,
+        a: 1.0,
+    }
+}
