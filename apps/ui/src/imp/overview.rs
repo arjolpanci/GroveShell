@@ -812,13 +812,13 @@ pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
         if !matches!(ov.mode, OverviewMode::Open { .. }) {
             return None;
         }
-        let (_, slots) = super::dock::dock_layout(ov.dock_apps.len());
+        let (_, slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
         slots
             .iter()
             .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
     });
     if let Some(index) = dock_hit {
-        super::dock::activate_dock_app(index);
+        super::dock::activate_dock_app(monitor, index);
         return;
     }
 
@@ -901,7 +901,7 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
         // The dock has no drag behavior — a press on it is handled
         // entirely as a click on release (see `on_overview_click`), so
         // just don't start any drag for it.
-        let (_, dock_slots) = super::dock::dock_layout(ov.dock_apps.len());
+        let (_, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
         if dock_slots.iter().any(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
             return None;
         }
@@ -1061,7 +1061,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
 
         // Dock icons take priority: a dock slot is never also a window
         // preview, so at most one of `hovered`/`dock_hit` is ever Some.
-        let (_, dock_slots) = super::dock::dock_layout(ov.dock_apps.len());
+        let (_, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
         let dock_hit = dock_slots
             .iter()
             .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
@@ -1684,7 +1684,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         // above (`dock_layout` already accounts for the card's own
         // position), so no `place()` transform — the dock doesn't
         // carousel-shift or zoom with the cards.
-        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(ov.dock_apps.len());
+        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
         let dock_icons: Vec<(RECT, HICON, bool)> = ov
             .dock_apps
             .iter()
