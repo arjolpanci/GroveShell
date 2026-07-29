@@ -239,3 +239,36 @@ pub(crate) fn toggle_calendar() {
         let _ = SetFocus(hwnd);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{days_in_month, is_leap_year, month_name};
+
+    #[test]
+    fn leap_years_follow_the_gregorian_rule() {
+        assert!(is_leap_year(2024)); // divisible by 4
+        assert!(!is_leap_year(1900)); // divisible by 100, not 400
+        assert!(is_leap_year(2000)); // divisible by 400
+        assert!(!is_leap_year(2023)); // not divisible by 4
+    }
+
+    #[test]
+    fn february_has_29_days_in_a_leap_year_and_28_otherwise() {
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2023, 2), 28);
+    }
+
+    #[test]
+    fn days_in_month_matches_the_calendar_for_every_month() {
+        let expected = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        for (i, &days) in expected.iter().enumerate() {
+            assert_eq!(days_in_month(2023, i as i32 + 1), days);
+        }
+    }
+
+    #[test]
+    fn month_name_returns_the_full_english_name() {
+        assert_eq!(month_name(1), "January");
+        assert_eq!(month_name(12), "December");
+    }
+}
