@@ -465,12 +465,12 @@ unsafe extern "system" fn wndproc(
 
     match msg {
         WM_PAINT => match role {
-            Role::Bar { is_primary } => {
-                paint_bar(hwnd, is_primary);
+            Role::Bar { is_primary, monitor } => {
+                paint_bar(hwnd, is_primary, &monitor);
                 LRESULT(0)
             }
-            Role::Overview => {
-                paint_overview(hwnd);
+            Role::Overview { monitor } => {
+                paint_overview(hwnd, &monitor);
                 LRESULT(0)
             }
             Role::Calendar => {
@@ -487,13 +487,15 @@ unsafe extern "system" fn wndproc(
         // `paint_overview`), so the class-brush erase pass is both
         // redundant and the source of a visible background flash
         // between erase and repaint while dragging — claim it handled.
-        WM_ERASEBKGND if role == Role::Overview || role == Role::QuickSettings => LRESULT(1),
+        WM_ERASEBKGND if matches!(role, Role::Overview { .. }) || role == Role::QuickSettings => {
+            LRESULT(1)
+        }
         WM_LBUTTONDOWN => {
             match role {
-                Role::Overview => {
+                Role::Overview { monitor } => {
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                    on_overview_drag_start(x, y);
+                    on_overview_drag_start(&monitor, x, y);
                     LRESULT(0)
                 }
                 Role::QuickSettings => {
@@ -507,44 +509,44 @@ unsafe extern "system" fn wndproc(
         }
         WM_MOUSEMOVE => {
             match role {
-                Role::Overview => {
+                Role::Overview { monitor } => {
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     if wparam.0 & (MK_LBUTTON.0 as usize) != 0 {
-                        on_overview_drag_move(x, y);
+                        on_overview_drag_move(&monitor, x, y);
                     } else {
-                        on_overview_hover(x, y);
+                        on_overview_hover(&monitor, x, y);
                     }
                 }
                 Role::QuickSettings => {
                     let x = (lparam.0 & 0xFFFF) as i32;
                     on_quick_settings_mouse_move(hwnd, x);
                 }
-                Role::Bar { is_primary: true } => {
+                Role::Bar { is_primary: true, .. } => {
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                    on_bar_hover(hwnd, x, y);
+                    on_bar_hover(hwnd, x, y, true);
                 }
                 _ => {}
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSELEAVE => {
-            if let Role::Bar { is_primary: true } = role {
+            if let Role::Bar { is_primary: true, .. } = role {
                 on_bar_mouse_leave(hwnd);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
             match role {
-                Role::Bar { is_primary: true } => {
+                Role::Bar { is_primary, monitor } => {
                     let x = (lparam.0 & 0xFFFF) as i32;
-                    on_bar_click(hwnd, x);
+                    on_bar_click(hwnd, x, is_primary, &monitor);
                 }
-                Role::Overview => {
+                Role::Overview { monitor } => {
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                    on_overview_drag_end(x, y);
+                    on_overview_drag_end(&monitor, x, y);
                 }
                 Role::QuickSettings => {
                     on_quick_settings_mouse_up();
@@ -553,22 +555,25 @@ unsafe extern "system" fn wndproc(
             }
             LRESULT(0)
         }
-        WM_CHAR if role == Role::Overview => {
-            on_overview_char(wparam.0 as u32);
+        WM_CHAR if matches!(role, Role::Overview { .. }) => {
+            if let Role::Overview { monitor } = role {
+                on_overview_char(&monitor, wparam.0 as u32);
+            }
             LRESULT(0)
         }
         WM_KEYDOWN => {
             if wparam.0 == VK_ESCAPE.0 as usize {
                 match role {
-                    Role::Overview => {
+                    Role::Overview { monitor } => {
                         // Escape backs out one layer: an active search
                         // first, the overview itself second.
                         let searching = STATE.with(|s| {
                             s.borrow_mut()
                                 .as_mut()
-                                .map(|st| {
-                                    let searching = !st.search_query.is_empty();
-                                    st.search_query.clear();
+                                .and_then(|st| st.overviews.get_mut(&monitor))
+                                .map(|ov| {
+                                    let searching = !ov.search_query.is_empty();
+                                    ov.search_query.clear();
                                     searching
                                 })
                                 .unwrap_or(false)
@@ -576,22 +581,27 @@ unsafe extern "system" fn wndproc(
                         if searching {
                             repaint_overview(hwnd);
                         } else {
-                            close_overview(None);
+                            close_overview(&monitor, None);
                         }
                     }
                     Role::Calendar => hide_calendar(true),
                     Role::QuickSettings => hide_quick_settings(true),
                     _ => {}
                 }
-            } else if role == Role::Overview {
+            } else if let Role::Overview { monitor } = &role {
                 let searching = STATE
-                    .with(|s| s.borrow().as_ref().map(|st| !st.search_query.is_empty()))
+                    .with(|s| {
+                        s.borrow()
+                            .as_ref()
+                            .and_then(|st| st.overviews.get(monitor.as_str()))
+                            .map(|ov| !ov.search_query.is_empty())
+                    })
                     .unwrap_or(false);
                 if !searching {
                     if wparam.0 == VK_LEFT.0 as usize {
-                        on_overview_arrow(-1);
+                        on_overview_arrow(monitor, -1);
                     } else if wparam.0 == VK_RIGHT.0 as usize {
-                        on_overview_arrow(1);
+                        on_overview_arrow(monitor, 1);
                     }
                 }
             }
@@ -624,7 +634,11 @@ unsafe extern "system" fn wndproc(
         }
         WM_TIMER => {
             match wparam.0 {
-                ANIM_TIMER_ID => on_animation_tick(),
+                ANIM_TIMER_ID => {
+                    if let Role::Overview { monitor } = role {
+                        on_animation_tick(&monitor);
+                    }
+                }
                 SYNC_TIMER_ID => on_window_sync_timer(hwnd),
                 HOTCORNER_TIMER_ID => check_hot_corners(),
                 DRAG_TIMER_ID => on_drag_timer(),
