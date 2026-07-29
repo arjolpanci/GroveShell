@@ -55,7 +55,7 @@ use movesize::{
 use overview::{
     close_overview, on_animation_tick, on_overview_arrow, on_overview_char,
     on_overview_drag_end, on_overview_drag_move, on_overview_drag_start, on_overview_hover,
-    paint_overview, repaint_overview, OverviewMode,
+    paint_overview, repaint_overview,
 };
 use quick_settings::{
     hide_quick_settings, on_quick_settings_mouse_down, on_quick_settings_mouse_move,

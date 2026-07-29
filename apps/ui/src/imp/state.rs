@@ -4,13 +4,11 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::time::Instant;
 
 use windows::Win32::Foundation::{HWND, RECT};
 
 use groveshell_window_model::registry::WindowRegistry;
 
-use super::dock::DockApp;
 use super::monitor_workspaces::MonitorWorkspaces;
 use super::overview::OverviewInstance;
 
