@@ -558,11 +558,15 @@ pub(crate) fn hide_quick_settings(restore_focus: bool) {
 
 pub(crate) fn toggle_quick_settings() {
     let info = STATE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|st| (st.quick_settings_hwnd, st.quick_settings_open))
+        s.borrow().as_ref().map(|st| {
+            (
+                st.quick_settings_hwnd,
+                st.quick_settings_open,
+                st.primary_monitor.clone(),
+            )
+        })
     });
-    let Some((hwnd, is_open)) = info else {
+    let Some((hwnd, is_open, primary_monitor)) = info else {
         return;
     };
 
@@ -572,7 +576,7 @@ pub(crate) fn toggle_quick_settings() {
     }
 
     hide_calendar(false);
-    close_overview(None);
+    close_overview(&primary_monitor, None);
 
     // SAFETY: no preconditions.
     let previous_foreground = unsafe { GetForegroundWindow() };
