@@ -166,7 +166,7 @@ where
                 M31: offset.x as f32,
                 M32: offset.y as f32,
             };
-            let _ = d2d_ctx.SetTransform(&translate);
+            d2d_ctx.SetTransform(&translate);
             draw(&d2d_ctx);
             let _ = surface.surface.EndDraw();
             let _ = ctx.dcomp_device.Commit();
@@ -179,7 +179,7 @@ pub(crate) fn fill_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u3
     // (enforced by `redraw`'s closure scope).
     unsafe {
         if let Ok(brush) = ctx.CreateSolidColorBrush(&colorref_to_d2d(colorref), None) {
-            let _ = ctx.FillRectangle(&rect, &brush);
+            ctx.FillRectangle(&rect, &brush);
         }
     }
 }
@@ -220,7 +220,7 @@ pub(crate) fn draw_text(
                 return;
             };
             let wide: Vec<u16> = text.encode_utf16().collect();
-            let _ = ctx.DrawText(
+            ctx.DrawText(
                 &wide,
                 &format,
                 &rect,

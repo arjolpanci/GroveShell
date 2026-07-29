@@ -55,12 +55,133 @@ fn month_name(month: i32) -> &'static str {
     NAMES[(month - 1) as usize]
 }
 
+/// Draws the calendar's content (background, header, day grid,
+/// notifications section) through the Direct2D wrapper — the GPU-path
+/// equivalent of the GDI drawing `paint_calendar` does below. Every
+/// coordinate and color here is copied from `paint_calendar` unchanged;
+/// this must stay a faithful port, not a redesign.
+fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceContext) {
+    use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+
+    // Background fill: replicates the `GroveShellCalendar` window
+    // class's solid brush (`COLORREF(0x00303030)`), which `WM_ERASEBKGND`
+    // painted automatically before GDI's `paint_calendar` ran. Once this
+    // surface owns the window's visual content, nothing else provides
+    // that background any more, so it has to be drawn explicitly here.
+    super::gpu::fill_rect(
+        ctx,
+        D2D_RECT_F { left: 0.0, top: 0.0, right: CAL_WIDTH as f32, bottom: CAL_HEIGHT as f32 },
+        0x00303030,
+    );
+
+    // SAFETY: plain query, no preconditions.
+    let now = unsafe { GetLocalTime() };
+    let year = now.wYear as i32;
+    let month = now.wMonth as i32;
+    let today = now.wDay as i32;
+    let today_dow = now.wDayOfWeek as i32;
+    let first_dow = ((today_dow - (today - 1)) % 7 + 7) % 7;
+    let days = days_in_month(year, month);
+
+    super::gpu::draw_text(
+        ctx,
+        D2D_RECT_F { left: CAL_PADDING as f32, top: 8.0, right: (CAL_WIDTH - CAL_PADDING) as f32, bottom: 32.0 },
+        &format!("{} {year}", month_name(month)),
+        0x00FFFFFF,
+        16.0,
+        true,
+    );
+
+    let cell_w = (CAL_WIDTH - CAL_PADDING * 2) / 7;
+    const DOW_LABELS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+    for (i, label) in DOW_LABELS.iter().enumerate() {
+        let x = CAL_PADDING + i as i32 * cell_w;
+        super::gpu::draw_text(
+            ctx,
+            D2D_RECT_F { left: x as f32, top: 40.0, right: (x + cell_w) as f32, bottom: 60.0 },
+            label,
+            0x00A0A0A0,
+            12.0,
+            true,
+        );
+    }
+
+    let mut day = 1;
+    let mut col = first_dow;
+    let mut row = 0;
+    while day <= days {
+        let x = CAL_PADDING + col * cell_w;
+        let y = 64 + row * CAL_CELL_HEIGHT;
+        let color = if day == today { 0x0040A0FF } else { 0x00E0E0E0 };
+        super::gpu::draw_text(
+            ctx,
+            D2D_RECT_F {
+                left: x as f32,
+                top: y as f32,
+                right: (x + cell_w) as f32,
+                bottom: (y + CAL_CELL_HEIGHT) as f32,
+            },
+            &day.to_string(),
+            color,
+            14.0,
+            true,
+        );
+        day += 1;
+        col += 1;
+        if col == 7 {
+            col = 0;
+            row += 1;
+        }
+    }
+
+    // Notifications section: left-aligned (`center_horizontally: false`),
+    // matching `paint_calendar`'s `DT_SINGLELINE | DT_VCENTER` (no
+    // `DT_CENTER`) for these two lines specifically.
+    super::gpu::draw_text(
+        ctx,
+        D2D_RECT_F {
+            left: CAL_PADDING as f32,
+            top: (CAL_CALENDAR_HEIGHT + 10) as f32,
+            right: (CAL_WIDTH - CAL_PADDING) as f32,
+            bottom: (CAL_CALENDAR_HEIGHT + 34) as f32,
+        },
+        "Notifications",
+        0x00FFFFFF,
+        14.0,
+        false,
+    );
+    super::gpu::draw_text(
+        ctx,
+        D2D_RECT_F {
+            left: CAL_PADDING as f32,
+            top: (CAL_CALENDAR_HEIGHT + 40) as f32,
+            right: (CAL_WIDTH - CAL_PADDING) as f32,
+            bottom: (CAL_CALENDAR_HEIGHT + 64) as f32,
+        },
+        "No new notifications",
+        0x00A0A0A0,
+        12.0,
+        false,
+    );
+}
+
 /// Draws a real month calendar (today highlighted) over a notifications
 /// section. The day-of-week of the 1st is derived from today's own
 /// day-of-week/day-of-month rather than a separate date calculation,
 /// since the two are always a fixed number of days apart within the
 /// same month.
 pub(crate) fn paint_calendar(hwnd: HWND) {
+    if super::gpu::is_enabled() {
+        // Content is already composited independently by
+        // DirectComposition — this just acknowledges the paint request.
+        // SAFETY: `hwnd` is the window currently processing `WM_PAINT`.
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
+        }
+        return;
+    }
     // SAFETY: `hwnd` is the window currently processing `WM_PAINT`.
     unsafe {
         let mut ps = PAINTSTRUCT::default();
@@ -231,9 +352,20 @@ pub(crate) fn toggle_calendar() {
         }
     });
 
+    if super::gpu::is_enabled() {
+        STATE.with(|s| {
+            let state = s.borrow();
+            let Some(state) = state.as_ref() else { return };
+            let Some(surface) = state.calendar_gpu.as_ref() else { return };
+            super::gpu::redraw(surface, paint_calendar_content);
+        });
+    }
+
     // SAFETY: `hwnd` is a valid, process-lifetime window.
     unsafe {
-        let _ = InvalidateRect(hwnd, None, true);
+        if !super::gpu::is_enabled() {
+            let _ = InvalidateRect(hwnd, None, true);
+        }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);
