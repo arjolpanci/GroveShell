@@ -132,7 +132,10 @@ Condensed, with current status:
 - [x] Keyboard switching and move-window shortcuts, resolved to whichever
   monitor currently has keyboard focus
 - [x] Park/unpark instead of hide/show, with crash recovery on the next start
-- [ ] Session persistence across restarts
+- [ ] Session persistence across restarts (abandoned for now — still
+  deciding the best approach to matching reopened windows back to their
+  saved workspace, given Win32 gives no stable window identity across a
+  restart)
 - [ ] Owned dialogs following their owner window
 
 ### Phase 4: Top bar and dock (partial)
