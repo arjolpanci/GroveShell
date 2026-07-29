@@ -5,6 +5,7 @@
 mod bar;
 mod calendar;
 mod dock;
+mod hotplug;
 mod icons;
 mod monitors;
 mod monitor_workspaces;
@@ -629,6 +630,16 @@ unsafe extern "system" fn wndproc(
                 HOTKEY_MOVE_WIN_PREV => move_focused_window_relative(-1),
                 HOTKEY_MOVE_WIN_NEXT => move_focused_window_relative(1),
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            // SAFETY: `GetModuleHandleW(None)` is a plain, idempotent query;
+            // `hinstance` is only used to create new windows for newly
+            // connected monitors, exactly as at startup.
+            if let Ok(module) = unsafe { GetModuleHandleW(None) } {
+                let hinstance = windows::Win32::Foundation::HINSTANCE(module.0);
+                let _ = hotplug::reconcile_monitors(hinstance);
             }
             LRESULT(0)
         }
