@@ -428,18 +428,34 @@ pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
                     }
                     drop_window_snapshot(window.hwnd);
                 }
-                if state.workspaces.monitor_of_window(window.hwnd).is_some() {
-                    continue;
-                }
                 let center_x = (window.rect.left + window.rect.right) / 2;
                 let center_y = (window.rect.top + window.rect.bottom) / 2;
-                let target_monitor = super::monitors::monitor_index_for_center(&monitors, center_x, center_y)
+                let real_monitor = super::monitors::monitor_index_for_center(&monitors, center_x, center_y)
                     .and_then(|i| monitors.get(i))
-                    .map(|m| m.device_name.clone())
-                    .unwrap_or_else(|| state.primary_monitor.clone());
-                if let Some(tracker) = state.workspaces.get_mut(&target_monitor) {
-                    let index = tracker.current_index();
-                    tracker.assign_to_index(window.hwnd, index);
+                    .map(|m| m.device_name.clone());
+
+                match (state.workspaces.monitor_of_window(window.hwnd), real_monitor) {
+                    (Some(tracked_monitor), Some(real)) if tracked_monitor != real => {
+                        // Physically dragged to a different monitor since the last
+                        // sync — move it onto the new monitor's *current* workspace
+                        // rather than leaving it assigned to a monitor it's no
+                        // longer on.
+                        if let Some(t) = state.workspaces.get_mut(&tracked_monitor) {
+                            t.forget(window.hwnd);
+                        }
+                        if let Some(t) = state.workspaces.get_mut(&real) {
+                            let index = t.current_index();
+                            t.assign_to_index(window.hwnd, index);
+                        }
+                    }
+                    (None, real) => {
+                        let target_monitor = real.unwrap_or_else(|| state.primary_monitor.clone());
+                        if let Some(tracker) = state.workspaces.get_mut(&target_monitor) {
+                            let index = tracker.current_index();
+                            tracker.assign_to_index(window.hwnd, index);
+                        }
+                    }
+                    _ => {}
                 }
             }
             for name in state.workspaces.device_names().map(str::to_string).collect::<Vec<_>>() {
