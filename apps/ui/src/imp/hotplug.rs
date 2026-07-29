@@ -36,9 +36,20 @@ pub(crate) fn reconcile_monitors(hinstance: HINSTANCE) -> Result<()> {
         s.borrow().as_ref().map(|st| st.bars.iter().map(|b| b.monitor.clone()).collect()).unwrap_or_default()
     });
 
+    // Computed from the *live* enumeration, not `state.primary_monitor`
+    // (which, if the primary itself is the monitor being disconnected,
+    // still names that same now-gone device) — this is the target every
+    // `remove_monitor` call below must reassign orphaned windows onto.
+    let next_primary: Option<String> = monitors.iter().find(|m| m.is_primary).map(|m| m.device_name.clone());
+
     // Disconnected: anything tracked that's no longer in the live list.
     for removed in existing_names.iter().filter(|n| !current_names.contains(n)) {
-        remove_monitor(removed);
+        if let Some(np) = &next_primary {
+            remove_monitor(removed, np);
+        }
+        // If there's no primary at all in the live list (a transient
+        // zero-monitor state), there's nothing to reassign onto; skip
+        // rather than panic. Should be unreachable in practice.
     }
 
     // Connected: anything live that isn't tracked yet.
@@ -49,7 +60,12 @@ pub(crate) fn reconcile_monitors(hinstance: HINSTANCE) -> Result<()> {
     // A surviving monitor's primary status or geometry may have
     // changed (e.g. the old primary was unplugged and Windows promoted
     // another one) — refresh `primary_monitor`/`primary_bar_hwnd` to
-    // match reality.
+    // match reality, and re-arm the primary-bar-owned hotkeys/timers on
+    // the new primary bar if it's actually a different window than
+    // before (its predecessor's hotkeys/timers, if any, died with it
+    // when `remove_monitor` destroyed it).
+    let old_primary_bar_hwnd = STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
+
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
             if let Some(primary) = monitors.iter().find(|m| m.is_primary) {
@@ -61,6 +77,13 @@ pub(crate) fn reconcile_monitors(hinstance: HINSTANCE) -> Result<()> {
             }
         }
     });
+
+    let new_primary_bar_hwnd = STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
+    if let (Some(old), Some(new)) = (old_primary_bar_hwnd, new_primary_bar_hwnd) {
+        if old != new {
+            super::install_primary_bar_extras(new);
+        }
+    }
 
     Ok(())
 }
@@ -102,7 +125,7 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
 
         let overview_width = monitor.rect.right - monitor.rect.left;
         let overview_height = monitor.rect.bottom - monitor.rect.top;
-        let overview_hwnd = CreateWindowExW(
+        let overview_hwnd = match CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             w!("GroveShellOverview"),
             w!("GroveShell Activities"),
@@ -115,8 +138,19 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
             None,
             hinstance,
             None,
-        )
-        .map_err(Error::Windows)?;
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(err) => {
+                // The bar window was already created and registered as
+                // an AppBar above; without this cleanup it would leak
+                // (never pushed into `state.bars`, so never torn down)
+                // and the next `WM_DISPLAYCHANGE` would try to add this
+                // same monitor again, stacking duplicate bars.
+                unregister_appbar(bar_hwnd);
+                let _ = DestroyWindow(bar_hwnd);
+                return Err(Error::Windows(err));
+            }
+        };
 
         STATE.with(|s| {
             if let Some(state) = s.borrow_mut().as_mut() {
@@ -135,27 +169,31 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
     Ok(())
 }
 
-fn remove_monitor(device_name: &str) {
-    let (bar_hwnd, overview_hwnd, orphaned_windows, primary) = STATE.with(|s| {
+fn remove_monitor(device_name: &str, next_primary: &str) {
+    let (bar_hwnd, overview_hwnd, orphaned_windows) = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let Some(state) = state_ref.as_mut() else {
-            return (None, None, Vec::new(), String::new());
+            return (None, None, Vec::new());
         };
         let bar_hwnd = state.bars.iter().position(|b| b.monitor == device_name).map(|i| state.bars.remove(i).hwnd);
         let overview_hwnd = state.overviews.remove(device_name).map(|ov| ov.hwnd);
         let orphaned = state.workspaces.remove_monitor(device_name)
             .map(|t| t.workspace_ids().to_vec().into_iter().flat_map(|id| t.windows_on(id)).collect())
             .unwrap_or_default();
-        (bar_hwnd, overview_hwnd, orphaned, state.primary_monitor.clone())
+        (bar_hwnd, overview_hwnd, orphaned)
     });
 
-    // Reassign every orphaned window onto the primary monitor's
-    // current workspace, un-parking any that were parked on a
-    // background workspace of the removed monitor (they must become
-    // visible now — there's no monitor left to hide them off of).
+    // Reassign every orphaned window onto the next primary monitor's
+    // current workspace — `next_primary` is supplied by the caller from
+    // the live monitor enumeration, not read from `state.primary_monitor`
+    // here, since if `device_name` itself was the primary, that field
+    // still names the now-gone monitor at this point. Also un-park any
+    // that were parked on a background workspace of the removed monitor
+    // (they must become visible now — there's no monitor left to hide
+    // them off of).
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
-            if let Some(tracker) = state.workspaces.get_mut(&primary) {
+            if let Some(tracker) = state.workspaces.get_mut(next_primary) {
                 let target = tracker.current_index();
                 for hwnd in &orphaned_windows {
                     tracker.assign_to_index(*hwnd, target);
