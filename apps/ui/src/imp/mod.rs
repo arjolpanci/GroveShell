@@ -396,32 +396,17 @@ pub fn main() -> Result<()> {
         for bar_hwnd in bar_hwnds {
             let _ = InvalidateRect(bar_hwnd, None, true);
         }
-        SetTimer(primary_bar_hwnd, CLOCK_TIMER_ID, 1000, None);
 
-        // Global workspace-switching hotkeys, delivered as `WM_HOTKEY`
-        // to whichever window registered them — the primary bar, since
-        // it already has a message loop and outlives every flyout.
-        // Best-effort: another app may already own one of these
-        // combinations, in which case that one shortcut silently
-        // doesn't fire rather than failing shell startup.
-        let _ = RegisterHotKey(primary_bar_hwnd, HOTKEY_WS_PREV, MOD_CONTROL | MOD_ALT, VK_LEFT.0 as u32);
-        let _ = RegisterHotKey(primary_bar_hwnd, HOTKEY_WS_NEXT, MOD_CONTROL | MOD_ALT, VK_RIGHT.0 as u32);
-        let _ = RegisterHotKey(
-            primary_bar_hwnd,
-            HOTKEY_MOVE_WIN_PREV,
-            MOD_CONTROL | MOD_ALT | MOD_SHIFT,
-            VK_LEFT.0 as u32,
-        );
-        let _ = RegisterHotKey(
-            primary_bar_hwnd,
-            HOTKEY_MOVE_WIN_NEXT,
-            MOD_CONTROL | MOD_ALT | MOD_SHIFT,
-            VK_RIGHT.0 as u32,
-        );
+        // Global workspace-switching hotkeys plus the clock and hot-
+        // corner timers, all owned by whichever window is currently the
+        // primary bar (delivered as `WM_HOTKEY`/`WM_TIMER` to it, since
+        // it already has a message loop and outlives every flyout).
+        // Re-run whenever hotplug promotes a new primary bar, since a
+        // destroyed window silently drops everything it owned.
+        install_primary_bar_extras(primary_bar_hwnd);
 
         install_win_event_hooks();
         install_move_size_hooks();
-        SetTimer(primary_bar_hwnd, HOTCORNER_TIMER_ID, HOTCORNER_INTERVAL_MS, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -454,6 +439,38 @@ unsafe fn register_class(
         return Err(Error::Windows(windows::core::Error::from_win32()));
     }
     Ok(())
+}
+
+/// Registers the primary-bar-owned hotkeys (workspace-switch,
+/// move-window) and timers (clock, hot corners) on `hwnd`. Called once
+/// at startup on the initial primary bar, and again from
+/// `hotplug::reconcile_monitors` whenever a monitor hotplug promotes a
+/// different bar to primary — the previous holder's hotkeys/timers, if
+/// any, are silently released when Windows destroys that window, so
+/// nothing needs to be explicitly unregistered first.
+pub(crate) fn install_primary_bar_extras(hwnd: HWND) {
+    // SAFETY: all Win32 calls here are best-effort registrations against
+    // a single valid window handle the caller owns; failure (e.g.
+    // another app already holds one of these hotkey combinations)
+    // degrades that one feature rather than being fatal.
+    unsafe {
+        SetTimer(hwnd, CLOCK_TIMER_ID, 1000, None);
+        let _ = RegisterHotKey(hwnd, HOTKEY_WS_PREV, MOD_CONTROL | MOD_ALT, VK_LEFT.0 as u32);
+        let _ = RegisterHotKey(hwnd, HOTKEY_WS_NEXT, MOD_CONTROL | MOD_ALT, VK_RIGHT.0 as u32);
+        let _ = RegisterHotKey(
+            hwnd,
+            HOTKEY_MOVE_WIN_PREV,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT,
+            VK_LEFT.0 as u32,
+        );
+        let _ = RegisterHotKey(
+            hwnd,
+            HOTKEY_MOVE_WIN_NEXT,
+            MOD_CONTROL | MOD_ALT | MOD_SHIFT,
+            VK_RIGHT.0 as u32,
+        );
+        SetTimer(hwnd, HOTCORNER_TIMER_ID, HOTCORNER_INTERVAL_MS, None);
+    }
 }
 
 unsafe extern "system" fn wndproc(
