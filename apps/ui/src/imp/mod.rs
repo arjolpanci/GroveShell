@@ -300,6 +300,7 @@ pub fn main() -> Result<()> {
             None,
         )
         .map_err(Error::Windows)?;
+        let calendar_gpu = gpu::create_surface(calendar_hwnd, CAL_WIDTH, CAL_HEIGHT);
 
         // Quick Settings flyout, right-aligned under the primary bar's
         // right label. Unlike the bar itself, `QS_WIDTH`/`QS_HEIGHT` are
@@ -381,6 +382,7 @@ pub fn main() -> Result<()> {
                 primary_bar_rect,
                 primary_monitor,
                 calendar_hwnd,
+                calendar_gpu,
                 quick_settings_hwnd,
                 calendar_open: false,
                 quick_settings_open: false,

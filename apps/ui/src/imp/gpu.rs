@@ -76,3 +76,51 @@ fn try_init() -> windows::core::Result<GpuContext> {
 pub(crate) fn is_enabled() -> bool {
     GPU.with(|g| g.borrow().is_some())
 }
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::DirectComposition::{IDCompositionSurface, IDCompositionTarget, IDCompositionVisual};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
+
+/// One window's GPU-composited surface: a target bound to its `HWND`, a
+/// root visual covering the client area, and the surface Direct2D draws
+/// into. Fields are private — every window holding a `GpuSurface` only
+/// ever passes it back into this module's own functions.
+pub(crate) struct GpuSurface {
+    #[allow(dead_code)] // kept alive for as long as the surface must render; never read directly
+    target: IDCompositionTarget,
+    #[allow(dead_code)]
+    visual: IDCompositionVisual,
+    surface: IDCompositionSurface,
+}
+
+/// Creates a `GpuSurface` for `hwnd`, sized `width`×`height`. Returns
+/// `None` (never panics) if the process-wide GPU setup isn't available,
+/// or if this specific window's setup fails even though the process-wide
+/// setup succeeded — both cases mean the caller should keep using its
+/// existing GDI painting for this window, unchanged.
+pub(crate) fn create_surface(hwnd: HWND, width: i32, height: i32) -> Option<GpuSurface> {
+    GPU.with(|g| {
+        let g = g.borrow();
+        let ctx = g.as_ref()?;
+        try_create_surface(ctx, hwnd, width, height).ok()
+    })
+}
+
+fn try_create_surface(ctx: &GpuContext, hwnd: HWND, width: i32, height: i32) -> windows::core::Result<GpuSurface> {
+    // SAFETY: `hwnd` is a valid, process-lifetime window; the device
+    // calls below have no other preconditions.
+    unsafe {
+        let target = ctx.dcomp_device.CreateTargetForHwnd(hwnd, true)?;
+        let visual = ctx.dcomp_device.CreateVisual()?;
+        let surface = ctx.dcomp_device.CreateSurface(
+            width as u32,
+            height as u32,
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            DXGI_ALPHA_MODE_PREMULTIPLIED,
+        )?;
+        visual.SetContent(&surface)?;
+        target.SetRoot(&visual)?;
+        ctx.dcomp_device.Commit()?;
+        Ok(GpuSurface { target, visual, surface })
+    }
+}
