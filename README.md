@@ -136,7 +136,10 @@ Condensed, with current status:
   deciding the best approach to matching reopened windows back to their
   saved workspace, given Win32 gives no stable window identity across a
   restart)
-- [ ] Owned dialogs following their owner window
+- [x] Owned dialogs following their owner window: carried along by
+  `park_window`/`unpark_window` during a workspace switch, and
+  repositioned to preserve their relative offset when their owner is
+  dragged to a different monitor
 
 ### Phase 4: Top bar and dock (partial)
 - [x] Per-monitor top bars with AppBar work-area reservation
