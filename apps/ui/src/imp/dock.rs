@@ -325,19 +325,61 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
     apps
 }
 
-/// Activates the dock entry at `index`: focuses its first tracked
-/// window if it has one (switching that window's workspace into view
-/// first, same as clicking a search result), otherwise launches its
-/// pinned shortcut. No-op if the index is stale (dock rebuilt or
-/// overview closed between hover and click) or the entry somehow has
-/// neither.
+thread_local! {
+    /// Last-focused window per dock entry, keyed by the entry's
+    /// lowercased exe name (the same key `build_dock_apps` already uses
+    /// to group windows into one entry, for both pinned and running-
+    /// unpinned entries) — lets repeat clicks on a multi-window app
+    /// cycle through its windows instead of always refocusing the
+    /// first one. Cleared implicitly by just going stale (an exe key
+    /// for an app that's no longer running simply never gets read
+    /// again); no explicit eviction needed.
+    static LAST_FOCUSED: RefCell<HashMap<String, isize>> = RefCell::new(HashMap::new());
+}
+
+/// The window to focus next in `windows`, given whichever one was last
+/// focused (or `None` if this entry has never been clicked, or its
+/// previously-focused window closed) — advances past `last_focused` and
+/// wraps around; falls back to the first window if `last_focused` isn't
+/// (or no longer is) in `windows`.
+pub(crate) fn next_window(windows: &[isize], last_focused: Option<isize>) -> Option<isize> {
+    if windows.is_empty() {
+        return None;
+    }
+    let Some(last) = last_focused else {
+        return Some(windows[0]);
+    };
+    match windows.iter().position(|&w| w == last) {
+        Some(i) => Some(windows[(i + 1) % windows.len()]),
+        None => Some(windows[0]),
+    }
+}
+
+/// Activates the dock entry at `index`: focuses its next tracked
+/// window (cycling past whichever one was last focused, if any —
+/// switching that window's workspace into view first, same as clicking
+/// a search result) if it has one, otherwise launches its pinned
+/// shortcut. No-op if the index is stale (dock rebuilt or overview
+/// closed between hover and click) or the entry somehow has neither.
 pub(crate) fn activate_dock_app(monitor: &str, index: usize) {
     let target = super::state::STATE.with(|s| {
         let state = s.borrow();
         let st = state.as_ref()?;
         let ov = st.overviews.get(monitor)?;
         let app = ov.dock_apps.get(index)?;
-        if let Some(&hwnd) = app.windows.first() {
+        if !app.windows.is_empty() {
+            let exe_key = app
+                .windows
+                .first()
+                .and_then(|&hwnd| groveshell_window_model::describe(hwnd))
+                .and_then(|w| w.exe_name)
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            let last = LAST_FOCUSED.with(|m| m.borrow().get(&exe_key).copied());
+            let hwnd = next_window(&app.windows, last).unwrap();
+            LAST_FOCUSED.with(|m| {
+                m.borrow_mut().insert(exe_key, hwnd);
+            });
             let tracker = st.workspaces.get(monitor);
             let id = tracker.and_then(|t| t.workspace_of(hwnd));
             let page = id.and_then(|id| tracker.and_then(|t| t.index_of(id)));
@@ -376,5 +418,35 @@ pub(crate) fn activate_dock_app(monitor: &str, index: usize) {
             );
         }
         super::overview::close_overview(monitor, None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_window_with_no_last_focused_returns_the_first() {
+        assert_eq!(next_window(&[10, 20, 30], None), Some(10));
+    }
+
+    #[test]
+    fn next_window_advances_past_the_last_focused() {
+        assert_eq!(next_window(&[10, 20, 30], Some(10)), Some(20));
+    }
+
+    #[test]
+    fn next_window_wraps_around_after_the_last_entry() {
+        assert_eq!(next_window(&[10, 20, 30], Some(30)), Some(10));
+    }
+
+    #[test]
+    fn next_window_falls_back_to_first_if_last_focused_is_gone() {
+        assert_eq!(next_window(&[10, 20, 30], Some(999)), Some(10));
+    }
+
+    #[test]
+    fn next_window_with_no_windows_returns_none() {
+        assert_eq!(next_window(&[], Some(10)), None);
     }
 }
