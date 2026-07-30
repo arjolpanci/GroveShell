@@ -385,12 +385,35 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             format!("Search: {}", ov.search_query)
         };
         gpu::draw_text(ctx, rect_to_d2d(rows[0], 0, 0), &header_text, 0x00A0A0A0, 14.0, false);
+        let icon_size = scaled(super::overview::SEARCH_ICON_SIZE, dpi);
+        let icon_gap = scaled(super::overview::SEARCH_ICON_TEXT_GAP, dpi);
         for (i, result) in results.iter().enumerate() {
             let label = match result {
                 super::overview::SearchResult::Window { title, .. } => title.clone(),
                 super::overview::SearchResult::App { name, .. } => format!("{name}  (launch)"),
             };
-            gpu::draw_text(ctx, rect_to_d2d(rows[i + 1], 0, 0), &label, 0x00E0E0E0, 14.0, false);
+            let mut row = rows[i + 1];
+            if let Some(icon) = super::overview::search_result_icon(result) {
+                let icon_y = row.top + ((row.bottom - row.top) - icon_size) / 2;
+                let icon_rect = RECT {
+                    left: row.left,
+                    top: icon_y,
+                    right: row.left + icon_size,
+                    bottom: icon_y + icon_size,
+                };
+                if let Some(icon_bitmap) = icon_to_hbitmap(icon, icon_size) {
+                    if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, icon_bitmap) {
+                        gpu::draw_rounded_bitmap(ctx, rect_to_d2d(icon_rect, 0, 0), 0.0, &bitmap);
+                    }
+                    // SAFETY: `icon_bitmap` was created locally above by
+                    // `icon_to_hbitmap` and is owned exclusively here.
+                    unsafe {
+                        let _ = DeleteObject(icon_bitmap);
+                    }
+                }
+                row.left += icon_size + icon_gap;
+            }
+            gpu::draw_text(ctx, rect_to_d2d(row, 0, 0), &label, 0x00E0E0E0, 14.0, false);
         }
 
         // The ghost itself: a live drag follows the cursor at full size

@@ -107,6 +107,8 @@ const SEARCH_MAX_RESULTS: usize = 8;
 const SEARCH_PANEL_WIDTH: i32 = 640;
 const SEARCH_ROW_HEIGHT: i32 = 36;
 const SEARCH_PANEL_GAP: i32 = 14;
+pub(crate) const SEARCH_ICON_SIZE: i32 = 22;
+pub(crate) const SEARCH_ICON_TEXT_GAP: i32 = 8;
 
 /// One window's grid slot within its workspace's card — a fixed,
 /// synthetic layout position (see `layout_grid`), *not* the window's
@@ -1615,6 +1617,16 @@ fn app_index_matches(query_lower: &str, limit: usize) -> Vec<(String, std::path:
     })
 }
 
+/// Best-effort icon for a search result row: a window's own icon for an
+/// open-window result, or the shortcut's icon (resolved via the same
+/// arrow-free lookup the dock uses) for an installed-app result.
+pub(crate) fn search_result_icon(result: &SearchResult) -> Option<HICON> {
+    match result {
+        SearchResult::Window { hwnd, .. } => window_icon(HWND(*hwnd as *mut c_void)),
+        SearchResult::App { path, .. } => super::dock::file_icon(path),
+    }
+}
+
 /// Open windows whose title or exe matches, then installed apps whose
 /// name matches — capped at `SEARCH_MAX_RESULTS`, windows first since
 /// switching beats launching a duplicate.
@@ -2220,14 +2232,22 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                     );
                 }
                 SetTextColor(mem, COLORREF(0x00E0E0E0));
+                let icon_size = scaled(SEARCH_ICON_SIZE, dpi);
+                let icon_gap = scaled(SEARCH_ICON_TEXT_GAP, dpi);
                 for (i, result) in results.iter().enumerate() {
                     let label = match result {
                         SearchResult::Window { title, .. } => title.clone(),
                         SearchResult::App { name, .. } => format!("{name}  (launch)"),
                     };
+                    let mut row = inset(&rows[i + 1]);
+                    if let Some(icon) = search_result_icon(result) {
+                        let icon_y = row.top + ((row.bottom - row.top) - icon_size) / 2;
+                        let _ = DrawIconEx(mem, row.left, icon_y, icon, icon_size, icon_size, 0, None, DI_NORMAL);
+                        row.left += icon_size + icon_gap;
+                    }
                     draw_text_in(
                         mem,
-                        inset(&rows[i + 1]),
+                        row,
                         &label,
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                     );
