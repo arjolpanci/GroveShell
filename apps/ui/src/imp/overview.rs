@@ -1125,8 +1125,17 @@ fn repaint_thumb_hover_diff(
     for page in pages {
         let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) else { continue };
         let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == page).collect();
-        let hover = (Some(page) == new_page)
-            .then_some((super::overview_gpu::HoverTarget::Thumb(new_hwnd.unwrap()), intensity));
+        // `new_hwnd` is only read once this card is confirmed to be the
+        // newly-hovered one (`Some(page) == new_page` implies
+        // `new_hwnd.is_some()`, since `new_page` came from
+        // `new_hwnd.and_then(page_of)` above) — never unwrapped
+        // unconditionally, since `bool::then_some`'s argument is
+        // evaluated eagerly regardless of which branch "wins".
+        let hover = if Some(page) == new_page {
+            new_hwnd.map(|hwnd| (super::overview_gpu::HoverTarget::Thumb(hwnd), intensity))
+        } else {
+            None
+        };
         super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
     }
 }
