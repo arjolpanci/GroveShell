@@ -262,8 +262,20 @@ pub fn main() -> Result<()> {
         for monitor in &monitors {
             let width = monitor.rect.right - monitor.rect.left;
             let height = monitor.rect.bottom - monitor.rect.top;
+            // DirectComposition's `CreateTargetForHwnd` unconditionally
+            // refuses a window that has `WS_EX_LAYERED` set
+            // (`DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`) — the overview
+            // only needs that style for the GDI-fallback fade
+            // (`SetLayeredWindowAttributes`); the GPU path fades via
+            // `SetOpacity2` on the compositor visual instead, so it must
+            // omit the style entirely to let `overview_gpu::create` succeed.
+            let overview_ex_style = if gpu::is_enabled() {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+            } else {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+            };
             let overview_hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+                overview_ex_style,
                 w!("GroveShellOverview"),
                 w!("GroveShell Activities"),
                 WS_POPUP,

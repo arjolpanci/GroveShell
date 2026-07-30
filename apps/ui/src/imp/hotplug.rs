@@ -134,8 +134,17 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
 
         let overview_width = monitor.rect.right - monitor.rect.left;
         let overview_height = monitor.rect.bottom - monitor.rect.top;
+        // See the matching comment at the startup creation site in mod.rs:
+        // DirectComposition refuses to target a window that has
+        // `WS_EX_LAYERED` set, so this style is omitted whenever the GPU
+        // path is available (it fades via compositor opacity instead).
+        let overview_ex_style = if super::gpu::is_enabled() {
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+        } else {
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+        };
         let overview_hwnd = match CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            overview_ex_style,
             w!("GroveShellOverview"),
             w!("GroveShell Activities"),
             WS_POPUP,
