@@ -19,8 +19,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL, HICON};
 
 use super::gpu::{self, GpuSurface};
-use super::overview::{card_layout, displayed_rect, zoom_rect, CardAnim, ThumbAnim};
+use super::overview::{
+    card_layout, displayed_rect, zoom_rect, CardAnim, ThumbAnim, WINDOW_HOVER_GLOW_DURATION, WINDOW_POP_DURATION,
+};
 use super::state::{reference_dpi, scaled};
+use super::util::{ease_out, progress_dur};
 
 /// One workspace card's own composited surface, at the card's natural
 /// (unscrolled, unzoomed) size — carousel position/zoom is applied on
@@ -271,6 +274,7 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
         if !ov.dock_apps.is_empty() {
             let bar = rect_to_d2d(dock_bar_rect, 0, 0);
             gpu::fill_rounded_rect(ctx, bar, dock_radius, 0x002A2A2A);
+            let running_dot_radius = super::dock::dock_running_dot_radius();
             for (app, slot) in ov.dock_apps.iter().zip(dock_slots.iter()) {
                 let Some(icon) = app.icon else { continue };
                 let size = (slot.right - slot.left).max(1);
@@ -281,6 +285,38 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                     // SAFETY: created locally above, owned exclusively here.
                     unsafe {
                         let _ = DeleteObject(icon_bitmap);
+                    }
+                }
+                // A small dot beneath any app with at least one
+                // currently-tracked window — a circle is just a
+                // "rounded rect" whose radius is half its own size.
+                if !app.windows.is_empty() {
+                    let cx = (slot.left + slot.right) / 2;
+                    let dot_y = slot.bottom + running_dot_radius + 2;
+                    let dot_rect = D2D_RECT_F {
+                        left: (cx - running_dot_radius) as f32,
+                        top: (dot_y - running_dot_radius) as f32,
+                        right: (cx + running_dot_radius) as f32,
+                        bottom: (dot_y + running_dot_radius) as f32,
+                    };
+                    gpu::fill_rounded_rect(ctx, dot_rect, running_dot_radius as f32, 0x00E0E0E0);
+                }
+            }
+            // The dock's own hover glow — whichever slot the pointer
+            // currently sits on, if any, easing in the same way as the
+            // card/thumbnail glows.
+            if let Some((index, started)) = ov.dock_hover {
+                if let Some(slot) = dock_slots.get(index) {
+                    let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)) as f32;
+                    if intensity > 0.001 {
+                        gpu::stroke_rounded_rect(
+                            ctx,
+                            rect_to_d2d(*slot, 0, 0),
+                            thumb_radius,
+                            0x0060A8FF,
+                            intensity,
+                            2.0,
+                        );
                     }
                 }
             }
@@ -307,21 +343,42 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             gpu::draw_text(ctx, rect_to_d2d(rows[i + 1], 0, 0), &label, 0x00E0E0E0, 14.0, false);
         }
 
-        if let Some(drag) = ov.window_drag.as_ref() {
-            let (base_w, base_h) = (drag.base_w, drag.base_h);
-            if let Some(scaled_handle) = super::overview::slot_scaled_snapshot(drag.hwnd, base_w, base_h) {
-                let gw = base_w * 3 / 5;
-                let gh = base_h * 3 / 5;
-                let rect = D2D_RECT_F {
-                    left: (drag.cur_x - gw / 2) as f32,
-                    top: (drag.cur_y - gh / 2) as f32,
-                    right: (drag.cur_x + gw / 2) as f32,
-                    bottom: (drag.cur_y + gh / 2) as f32,
-                };
-                if let Some(bitmap) =
-                    gpu::bitmap_from_hbitmap(ctx, HBITMAP(scaled_handle as *mut c_void))
-                {
-                    gpu::draw_rounded_bitmap(ctx, rect, thumb_radius, &bitmap);
+        // The ghost itself: a live drag follows the cursor at full size
+        // unless a pickup pop is still growing in (then it scales up
+        // from nothing); once the drag ends, a drop-out pop shrinks it
+        // back to nothing at the frozen release point — mirrors
+        // `overview::paint_overview`'s `ghost` computation exactly.
+        let ghost = if let Some(drag) = ov.window_drag.as_ref() {
+            let scale = match &ov.window_pop_anim {
+                Some(p) if p.growing && p.hwnd == drag.hwnd => {
+                    ease_out(progress_dur(p.started, WINDOW_POP_DURATION))
+                }
+                _ => 1.0,
+            };
+            Some((drag.cur_x, drag.cur_y, drag.base_w, drag.base_h, drag.hwnd, scale))
+        } else {
+            ov.window_pop_anim.as_ref().filter(|p| !p.growing).and_then(|p| {
+                let (x, y) = p.at?;
+                let scale = 1.0 - ease_out(progress_dur(p.started, WINDOW_POP_DURATION));
+                Some((x, y, p.base_w, p.base_h, p.hwnd, scale))
+            })
+        };
+        if let Some((cx, cy, base_w, base_h, ghost_hwnd, scale)) = ghost {
+            if scale > 0.001 {
+                if let Some(scaled_handle) = super::overview::slot_scaled_snapshot(ghost_hwnd, base_w, base_h) {
+                    let gw = ((base_w * 3 / 5) as f64 * scale).round() as i32;
+                    let gh = ((base_h * 3 / 5) as f64 * scale).round() as i32;
+                    let rect = D2D_RECT_F {
+                        left: (cx - gw / 2) as f32,
+                        top: (cy - gh / 2) as f32,
+                        right: (cx + gw / 2) as f32,
+                        bottom: (cy + gh / 2) as f32,
+                    };
+                    if let Some(bitmap) =
+                        gpu::bitmap_from_hbitmap(ctx, HBITMAP(scaled_handle as *mut c_void))
+                    {
+                        gpu::draw_rounded_bitmap(ctx, rect, thumb_radius, &bitmap);
+                    }
                 }
             }
         }
