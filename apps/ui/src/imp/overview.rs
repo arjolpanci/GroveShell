@@ -700,22 +700,30 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
     // Paint each card's GPU surface (frame/wallpaper/thumbnails/icons)
     // now, while `cards`/`thumbs` are still borrowable locals — they're
     // moved into `OverviewMode::Open` below.
-    STATE.with(|s| {
-        if let Some(state) = s.borrow_mut().as_mut() {
-            if let Some(ov) = state.overviews.get_mut(monitor) {
-                if let Some(gpu) = ov.gpu.as_mut() {
-                    super::overview_gpu::rebuild_cards(gpu, ov.hwnd, &cards);
-                    for card_visual in &gpu.cards {
-                        let card = cards.iter().find(|c| c.page == card_visual.page);
-                        if let Some(card) = card {
-                            let page_thumbs: Vec<&ThumbAnim> =
-                                thumbs.iter().filter(|t| t.page == card.page).collect();
-                            super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor);
-                        }
-                    }
-                }
+    let gpu_updated = STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let ov = state.as_mut()?.overviews.get_mut(monitor)?;
+        let carousel_offset = ov.carousel_offset;
+        let gpu = ov.gpu.as_mut()?;
+        super::overview_gpu::rebuild_cards(gpu, ov.hwnd, &cards);
+        for card_visual in &gpu.cards {
+            let card = cards.iter().find(|c| c.page == card_visual.page);
+            if let Some(card) = card {
+                let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == card.page).collect();
+                super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor);
             }
         }
+        // Newly created/repositioned card visuals sit at their default
+        // identity transform (top-left of the window) until something
+        // calls `update_transforms` — this function can run while the
+        // overview is idly `Open` with `ANIM_TIMER` already stopped
+        // (workspace add/remove, window dragged to another card), so it
+        // must apply the current carousel position itself rather than
+        // waiting for the next tick/mouse-move. Zoom is always `1.0`
+        // here since this only ever runs while `Open` (never
+        // `Opening`/`Closing`).
+        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, 1.0);
+        Some(())
     });
 
     STATE.with(|s| {
@@ -729,7 +737,9 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         }
     });
 
-    repaint_overview(overview_hwnd);
+    if gpu_updated.is_none() {
+        repaint_overview(overview_hwnd);
+    }
 }
 
 /// Starts the fade-out, then hides the overview and focuses
