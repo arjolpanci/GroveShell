@@ -842,19 +842,26 @@ pub(crate) fn toggle_overview_for(monitor: &str) {
 /// slots the plain click/hover paths already use, and shows the
 /// context menu for whichever one (if any) was clicked.
 pub(crate) fn on_overview_right_click(monitor: &str, x: i32, y: i32) {
+    tracing::info!(monitor, x, y, "on_overview_right_click");
     let hit = STATE.with(|s| {
         let state = s.borrow();
         let st = state.as_ref()?;
         let ov = st.overviews.get(monitor)?;
         if !matches!(ov.mode, OverviewMode::Open { .. }) {
+            tracing::info!("on_overview_right_click: overview not Open, ignoring");
             return None;
         }
-        let (_, slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
+        let (_, slots, _) = super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
+        tracing::info!(dock_apps = ov.dock_apps.len(), slots = slots.len(), "on_overview_right_click: dock layout");
         let index = slots.iter().position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)?;
         Some((ov.hwnd, index))
     });
-    if let Some((overview_hwnd, index)) = hit {
-        super::dock::show_context_menu(monitor, overview_hwnd, index);
+    match hit {
+        Some((overview_hwnd, index)) => {
+            tracing::info!(index, "on_overview_right_click: hit dock slot, showing menu");
+            super::dock::show_context_menu(monitor, overview_hwnd, index);
+        }
+        None => tracing::info!("on_overview_right_click: no dock slot hit"),
     }
 }
 
@@ -929,7 +936,7 @@ pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
         if !matches!(ov.mode, OverviewMode::Open { .. }) {
             return None;
         }
-        let (_, slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
+        let (_, slots, _) = super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
         slots
             .iter()
             .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
@@ -1019,7 +1026,7 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
         // drag; a press on a running-but-unpinned icon (or missing the
         // dock entirely) falls through unchanged — handled entirely as
         // a click on release (see `on_overview_click`).
-        let (_, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
+        let (_, dock_slots, _) = super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
         let dock_hit = dock_slots.iter().position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
         if let Some(index) = dock_hit {
             let is_pinned = ov.dock_apps.get(index).is_some_and(|a| a.launch_path.is_some());
@@ -1320,7 +1327,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
 
         // Dock icons take priority: a dock slot is never also a window
         // preview, so at most one of `hovered`/`dock_hit` is ever Some.
-        let (_, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
+        let (_, dock_slots, _) = super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
         let dock_hit = dock_slots
             .iter()
             .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
@@ -2013,25 +2020,28 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
             Some((place(th.rect, th.page), intensity))
         });
 
-        // The dock: bar rect, one (slot, icon, is_running) triple per
-        // entry with an icon, and the hover glow for whichever slot the
-        // pointer sits on, if any. Page-local like everything else
-        // above (`dock_layout` already accounts for the card's own
-        // position), so no `place()` transform — the dock doesn't
-        // carousel-shift or zoom with the cards.
-        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
-        let dock_icons: Vec<(RECT, HICON, bool)> = ov
+        // The dock: bar rect, one (slot, icon, window_count) triple per
+        // entry with an icon, the hover glow for whichever slot the
+        // pointer sits on, if any, and the pinned/running-unpinned
+        // divider rect (GNOME/macOS-dash-style), if there's one to
+        // draw. Page-local like everything else above (`dock_layout`
+        // already accounts for the card's own position), so no
+        // `place()` transform — the dock doesn't carousel-shift or zoom
+        // with the cards.
+        let (dock_bar_rect, dock_slots, dock_divider) =
+            super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
+        let dock_icons: Vec<(RECT, HICON, usize)> = ov
             .dock_apps
             .iter()
             .zip(dock_slots.iter())
-            .filter_map(|(app, rect)| app.icon.map(|icon| (*rect, icon, !app.windows.is_empty())))
+            .filter_map(|(app, rect)| app.icon.map(|icon| (*rect, icon, app.windows.len())))
             .collect();
         let dock_hover_glow = ov.dock_hover.and_then(|(i, started)| {
             let rect = dock_slots.get(i)?;
             let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
             Some((*rect, intensity))
         });
-        let dock = (!ov.dock_apps.is_empty()).then_some((dock_bar_rect, dock_icons, dock_hover_glow));
+        let dock = (!ov.dock_apps.is_empty()).then_some((dock_bar_rect, dock_icons, dock_hover_glow, dock_divider));
 
         // Always shown (so people know it's there — see the module
         // docs) rather than only once typing starts; the results
@@ -2200,7 +2210,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
             // rest of the overview's chrome) along the bottom of the
             // focused card, one icon per entry with a small dot beneath
             // any that are currently running, then its own hover glow.
-            if let Some((bar_rect, dock_icons, dock_hover_glow)) = dock {
+            if let Some((bar_rect, dock_icons, dock_hover_glow, dock_divider)) = dock {
                 draw_shadow(mem, bar_rect, dock_radius, 4);
                 let dock_brush = CreateSolidBrush(COLORREF(0x002A2A2A));
                 let null_pen = GetStockObject(NULL_PEN);
@@ -2219,24 +2229,26 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                 SelectObject(mem, previous_brush);
                 let _ = DeleteObject(dock_brush);
 
+                // GNOME/macOS-dash-style divider between the pinned
+                // section (left) and the running-but-unpinned section
+                // (right), if there's one to draw.
+                if let Some(divider) = dock_divider {
+                    let divider_brush = CreateSolidBrush(COLORREF(0x00454545));
+                    FillRect(mem, &divider, divider_brush);
+                    let _ = DeleteObject(divider_brush);
+                }
+
                 let running_dot_brush = CreateSolidBrush(COLORREF(0x00E0E0E0));
                 let running_dot_radius = super::dock::dock_running_dot_radius();
-                for (rect, icon, running) in &dock_icons {
+                let running_dot_gap = scaled(super::dock::DOCK_RUNNING_DOT_GAP, dpi);
+                for (rect, icon, window_count) in &dock_icons {
                     let size = rect.right - rect.left;
                     let _ = DrawIconEx(mem, rect.left, rect.top, *icon, size, size, 0, None, DI_NORMAL);
-                    if *running {
-                        let cx = (rect.left + rect.right) / 2;
-                        let dot_y = rect.bottom + running_dot_radius + 2;
-                        let previous = SelectObject(mem, running_dot_brush);
-                        let _ = Ellipse(
-                            mem,
-                            cx - running_dot_radius,
-                            dot_y - running_dot_radius,
-                            cx + running_dot_radius,
-                            dot_y + running_dot_radius,
-                        );
-                        SelectObject(mem, previous);
+                    let previous = SelectObject(mem, running_dot_brush);
+                    for dot in super::dock::running_dot_rects(*rect, *window_count, running_dot_radius, running_dot_gap) {
+                        let _ = Ellipse(mem, dot.left, dot.top, dot.right, dot.bottom);
                     }
+                    SelectObject(mem, previous);
                 }
                 let _ = DeleteObject(running_dot_brush);
 

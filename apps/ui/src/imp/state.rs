@@ -86,7 +86,7 @@ thread_local! {
     pub(crate) static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
     Bar { is_primary: bool, monitor: String },
     Overview { monitor: String },
