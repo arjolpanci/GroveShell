@@ -41,8 +41,10 @@ const DOCK_ICON_GAP: i32 = 14;
 const DOCK_PADDING_X: i32 = 14;
 const DOCK_PADDING_Y: i32 = 10;
 /// Gap between the dock bar's bottom edge and the bottom of the card
-/// margin reserved for it (see `CARD_MARGIN_BOTTOM` in `overview.rs`).
-const DOCK_MARGIN_BOTTOM: i32 = 20;
+/// margin reserved for it (see `CARD_MARGIN_BOTTOM` in `overview.rs`) —
+/// small and GNOME-dash-like, sitting close to the screen's bottom edge
+/// rather than floating in the middle of the reserved margin band.
+const DOCK_MARGIN_BOTTOM: i32 = 8;
 pub(crate) const DOCK_CORNER_RADIUS: i32 = 18;
 const DOCK_RUNNING_DOT_RADIUS: i32 = 3;
 /// Hard cap so a very cluttered taskbar/desktop can't turn the dock
@@ -123,11 +125,14 @@ thread_local! {
     static PINNED_ICON_CACHE: RefCell<HashMap<PathBuf, isize>> = RefCell::new(HashMap::new());
 }
 
-fn pinned_icon(lnk_path: &Path) -> Option<HICON> {
-    if let Some(cached) = PINNED_ICON_CACHE.with(|c| c.borrow().get(lnk_path).copied()) {
+/// Icon for any file path, via `SHGetFileInfoW` — cached forever per
+/// path, same tradeoff as `PINNED_ICON_CACHE`'s doc comment explains.
+/// Also usable for search results' app icons, not just the dock.
+pub(crate) fn file_icon(path: &Path) -> Option<HICON> {
+    if let Some(cached) = PINNED_ICON_CACHE.with(|c| c.borrow().get(path).copied()) {
         return Some(HICON(cached as *mut c_void));
     }
-    let wide: Vec<u16> = lnk_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let mut info = SHFILEINFOW::default();
     // SAFETY: `wide` is nul-terminated and outlives the call; `info` is
     // a local, zeroed struct outliving it too. The returned `hIcon`, on
@@ -144,7 +149,7 @@ fn pinned_icon(lnk_path: &Path) -> Option<HICON> {
     if result == 0 || info.hIcon.is_invalid() {
         return None;
     }
-    PINNED_ICON_CACHE.with(|c| c.borrow_mut().insert(lnk_path.to_path_buf(), info.hIcon.0 as isize));
+    PINNED_ICON_CACHE.with(|c| c.borrow_mut().insert(path.to_path_buf(), info.hIcon.0 as isize));
     Some(info.hIcon)
 }
 
@@ -202,7 +207,9 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
         if apps.len() >= DOCK_MAX_APPS {
             break;
         }
-        let target_exe = resolve_shortcut_target(&lnk)
+        let target_path = resolve_shortcut_target(&lnk);
+        let target_exe = target_path
+            .as_ref()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
         let windows: Vec<isize> = match &target_exe {
             Some(exe) => live
@@ -219,8 +226,13 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
                 .collect(),
             None => Vec::new(),
         };
+        // The target executable's own icon has no shortcut-arrow overlay,
+        // unlike asking the shell for the `.lnk` file's icon directly;
+        // fall back to the `.lnk` itself only if resolving the target
+        // failed (still an icon, just possibly with the overlay).
+        let icon = target_path.as_deref().and_then(file_icon).or_else(|| file_icon(&lnk));
         apps.push(DockApp {
-            icon: pinned_icon(&lnk),
+            icon,
             launch_path: Some(lnk),
             windows,
         });
