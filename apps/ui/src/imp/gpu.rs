@@ -398,14 +398,16 @@ pub(crate) fn stroke_rounded_rect(
             right: rect.right - inset,
             bottom: rect.bottom - inset,
         };
-        let Ok(geometry) = GPU.with(|g| {
+        let Some(geometry) = GPU.with(|g| {
             let g = g.borrow();
-            let ctx = g.as_ref().expect("stroke_rounded_rect called with no GPU context");
-            ctx.d2d_factory.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
-                rect: inset_rect,
-                radiusX: radius,
-                radiusY: radius,
-            })
+            let ctx = g.as_ref()?;
+            ctx.d2d_factory
+                .CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                    rect: inset_rect,
+                    radiusX: radius,
+                    radiusY: radius,
+                })
+                .ok()
         }) else {
             return;
         };
