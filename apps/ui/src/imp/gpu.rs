@@ -119,7 +119,13 @@ pub(crate) fn create_surface(hwnd: HWND, width: i32, height: i32) -> Option<GpuS
     GPU.with(|g| {
         let g = g.borrow();
         let ctx = g.as_ref()?;
-        try_create_surface(ctx, hwnd, width, height).ok()
+        match try_create_surface(ctx, hwnd, width, height) {
+            Ok(surface) => Some(surface),
+            Err(e) => {
+                tracing::warn!(error = ?e, ?hwnd, width, height, "per-window GPU surface setup failed, falling back to GDI for this window");
+                None
+            }
+        }
     })
 }
 
