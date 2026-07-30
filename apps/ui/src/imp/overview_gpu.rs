@@ -163,14 +163,33 @@ fn icon_to_hbitmap(icon: HICON, size: i32) -> Option<HBITMAP> {
     }
 }
 
+/// Which piece of hover-glow state (if any) `paint_card` should render
+/// on this call — a whole-card border (a real window drag hovering
+/// this card, matched by page) or a single-thumbnail border (plain
+/// browsing, matched by hwnd). Hover glow lives on card content, not
+/// root, per this task's design scoping — mutually exclusive in
+/// practice (starting a window drag clears `hover_thumb`, and
+/// `on_overview_hover` is a no-op while a drag is active).
+pub(crate) enum HoverTarget {
+    Card(usize),
+    Thumb(isize),
+}
+
 /// Paints one card's frame (wallpaper-filled rounded rect, drop-shadow
 /// approximation), thumbnails (each clipped/rounded, WIC-bridged from
-/// the existing `PrintWindow` capture cache), icon badges, and
-/// placeholder chips — mirrors the corresponding subset of
-/// `overview::paint_overview`'s GDI drawing, at the card's own natural
-/// (unscrolled) size. `thumbs` must already be filtered to this card's
-/// `page`.
-pub(crate) fn paint_card(card_visual: &CardVisual, card_rect: RECT, thumbs: &[&ThumbAnim], monitor: &str) {
+/// the existing `PrintWindow` capture cache), icon badges, placeholder
+/// chips, and — when `hover` names this card or one of its thumbnails —
+/// the light-blue hover-glow outline. Mirrors the corresponding subset
+/// of `overview::paint_overview`'s GDI drawing, at the card's own
+/// natural (unscrolled) size. `thumbs` must already be filtered to this
+/// card's `page`.
+pub(crate) fn paint_card(
+    card_visual: &CardVisual,
+    card_rect: RECT,
+    thumbs: &[&ThumbAnim],
+    monitor: &str,
+    hover: Option<(HoverTarget, f64)>,
+) {
     let dpi = reference_dpi();
     let card_radius = scaled(20, dpi) as f32; // CARD_CORNER_RADIUS
     let thumb_radius = scaled(8, dpi) as f32; // THUMB_CORNER_RADIUS
@@ -184,6 +203,14 @@ pub(crate) fn paint_card(card_visual: &CardVisual, card_rect: RECT, thumbs: &[&T
         if let Some(wallpaper) = super::overview::wallpaper_hbitmap_for(monitor, card_rect) {
             if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, wallpaper) {
                 gpu::draw_rounded_bitmap(ctx, full, card_radius, &bitmap);
+            }
+        }
+
+        // Whole-card hover glow: this card is the one a real window
+        // drag currently sits over.
+        if let Some((HoverTarget::Card(page), intensity)) = &hover {
+            if *page == card_visual.page && *intensity > 0.001 {
+                gpu::stroke_rounded_rect(ctx, full, card_radius, 0x0060A8FF, *intensity as f32, 2.0);
             }
         }
 
@@ -215,6 +242,86 @@ pub(crate) fn paint_card(card_visual: &CardVisual, card_rect: RECT, thumbs: &[&T
                     unsafe {
                         let _ = DeleteObject(icon_bitmap);
                     }
+                }
+            }
+            // Plain per-thumbnail hover glow: just browsing, not
+            // dragging anything.
+            if let Some((HoverTarget::Thumb(hovered_hwnd), intensity)) = &hover {
+                if *hovered_hwnd == hwnd && *intensity > 0.001 {
+                    gpu::stroke_rounded_rect(ctx, rect, thumb_radius, 0x0060A8FF, *intensity as f32, 2.0);
+                }
+            }
+        }
+    });
+}
+
+/// Paints the root surface's chrome: the dock bar/icons, the search
+/// panel/rows, and the dragged-window ghost. Mirrors the corresponding
+/// slice of `overview::paint_overview`'s GDI drawing. Triggered only by
+/// the same state changes that already invalidated this content under
+/// GDI (dock/search/drag changes) — never by the per-tick
+/// carousel-position path (see `update_transforms`).
+pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::overview::OverviewInstance) {
+    let dpi = reference_dpi();
+    let dock_radius = scaled(super::dock::DOCK_CORNER_RADIUS, dpi) as f32;
+    let thumb_radius = scaled(8, dpi) as f32;
+
+    gpu::redraw(&gpu.root, |ctx: &ID2D1DeviceContext| {
+        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
+        if !ov.dock_apps.is_empty() {
+            let bar = rect_to_d2d(dock_bar_rect, 0, 0);
+            gpu::fill_rounded_rect(ctx, bar, dock_radius, 0x002A2A2A);
+            for (app, slot) in ov.dock_apps.iter().zip(dock_slots.iter()) {
+                let Some(icon) = app.icon else { continue };
+                let size = (slot.right - slot.left).max(1);
+                if let Some(icon_bitmap) = icon_to_hbitmap(icon, size) {
+                    if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, icon_bitmap) {
+                        gpu::draw_rounded_bitmap(ctx, rect_to_d2d(*slot, 0, 0), 0.0, &bitmap);
+                    }
+                    // SAFETY: created locally above, owned exclusively here.
+                    unsafe {
+                        let _ = DeleteObject(icon_bitmap);
+                    }
+                }
+            }
+        }
+
+        let results = if ov.search_query.is_empty() {
+            Vec::new()
+        } else {
+            super::overview::search_results(monitor, &ov.search_query)
+        };
+        let (panel, rows) = super::overview::search_layout(monitor, dpi, results.len());
+        gpu::fill_rounded_rect(ctx, rect_to_d2d(panel, 0, 0), thumb_radius, 0x002A2A2A);
+        let header_text = if ov.search_query.is_empty() {
+            "Type to search".to_string()
+        } else {
+            format!("Search: {}", ov.search_query)
+        };
+        gpu::draw_text(ctx, rect_to_d2d(rows[0], 0, 0), &header_text, 0x00A0A0A0, 14.0, false);
+        for (i, result) in results.iter().enumerate() {
+            let label = match result {
+                super::overview::SearchResult::Window { title, .. } => title.clone(),
+                super::overview::SearchResult::App { name, .. } => format!("{name}  (launch)"),
+            };
+            gpu::draw_text(ctx, rect_to_d2d(rows[i + 1], 0, 0), &label, 0x00E0E0E0, 14.0, false);
+        }
+
+        if let Some(drag) = ov.window_drag.as_ref() {
+            let (base_w, base_h) = (drag.base_w, drag.base_h);
+            if let Some(scaled_handle) = super::overview::slot_scaled_snapshot(drag.hwnd, base_w, base_h) {
+                let gw = base_w * 3 / 5;
+                let gh = base_h * 3 / 5;
+                let rect = D2D_RECT_F {
+                    left: (drag.cur_x - gw / 2) as f32,
+                    top: (drag.cur_y - gh / 2) as f32,
+                    right: (drag.cur_x + gw / 2) as f32,
+                    bottom: (drag.cur_y + gh / 2) as f32,
+                };
+                if let Some(bitmap) =
+                    gpu::bitmap_from_hbitmap(ctx, HBITMAP(scaled_handle as *mut c_void))
+                {
+                    gpu::draw_rounded_bitmap(ctx, rect, thumb_radius, &bitmap);
                 }
             }
         }
