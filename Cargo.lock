@@ -301,6 +301,8 @@ version = "0.1.0"
 dependencies = [
  "groveshell-common",
  "groveshell-window-model",
+ "serde",
+ "serde_json",
  "tracing",
  "windows",
 ]
