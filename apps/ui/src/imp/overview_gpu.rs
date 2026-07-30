@@ -33,22 +33,37 @@ pub(crate) struct CardVisual {
     pub(crate) surface: GpuSurface,
 }
 
-/// One monitor overview's GPU state. `root`'s surface holds the dock
-/// bar, search panel, and drag ghost; `cards` holds one entry per
-/// current `CardAnim`, kept in sync by `rebuild_cards`.
+/// One monitor overview's GPU state. `root`'s own surface is left
+/// blank — it exists only as the composition-tree parent that carries
+/// the open/close opacity fade (`gpu::set_opacity`) down to its
+/// children. `cards` holds one entry per current `CardAnim`, kept in
+/// sync by `rebuild_cards`. `chrome` holds the dock bar, search panel,
+/// and drag ghost, and is kept re-inserted above every card visual (see
+/// `rebuild_cards`) so it always composites on top — a card is a full,
+/// opaque rounded rect, and without this the drag ghost and search
+/// panel would render underneath whichever card visual they overlap.
 pub(crate) struct OverviewGpuState {
     pub(crate) root: GpuSurface,
     pub(crate) cards: Vec<CardVisual>,
+    pub(crate) chrome: GpuSurface,
 }
 
-/// Creates the root surface for `hwnd` (sized to the overview window's
-/// full client area). Returns `None` if the process-wide GPU setup
-/// isn't available, or if this specific window's target/surface setup
-/// fails — either way the caller keeps using GDI for this monitor's
-/// overview, unchanged.
+/// Creates the root/chrome surfaces for `hwnd` (both sized to the
+/// overview window's full client area). Returns `None` if the
+/// process-wide GPU setup isn't available, or if this specific
+/// window's target/surface setup fails — either way the caller keeps
+/// using GDI for this monitor's overview, unchanged.
 pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuState> {
     let root = gpu::create_surface(hwnd, width, height)?;
-    Some(OverviewGpuState { root, cards: Vec::new() })
+    let chrome = gpu::create_surface(hwnd, width, height)?;
+    // SAFETY: `root`/`chrome` were both just created above by this
+    // module's own `gpu::create_surface` and are alive for as long as
+    // the `OverviewGpuState` returned below is. `AddVisual` on a fresh,
+    // never-attached visual simply attaches it.
+    unsafe {
+        let _ = root.visual().AddVisual(chrome.visual(), true, None);
+    }
+    Some(OverviewGpuState { root, cards: Vec::new(), chrome })
 }
 
 /// Rebuilds `state.cards` to have exactly one entry per `cards`,
@@ -59,14 +74,14 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
 /// `on_animation_tick`'s per-tick transform pass below will iterate
 /// them.
 pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[CardAnim]) {
+    let mut old_cards = std::mem::take(&mut state.cards);
     let mut rebuilt = Vec::with_capacity(cards.len());
     for card in cards {
         let (w, h) = (card.rect.right - card.rect.left, card.rect.bottom - card.rect.top);
-        let reused = state
-            .cards
+        let reused = old_cards
             .iter()
             .position(|cv| cv.page == card.page)
-            .map(|i| state.cards.remove(i))
+            .map(|i| old_cards.remove(i))
             .filter(|cv| cv.surface.width() == w && cv.surface.height() == h);
         let card_visual = match reused {
             Some(cv) => cv,
@@ -77,6 +92,25 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[C
         };
         rebuilt.push(card_visual);
     }
+    // Anything left in `old_cards` here is a page that no longer
+    // exists, or one whose surface size changed and so got rejected by
+    // the `filter` above — either way it's about to be dropped. Dropping
+    // the Rust wrapper only releases *our* COM reference; `state.root`'s
+    // visual still holds its own separate reference from the `AddVisual`
+    // call below (a previous invocation of this same function), so
+    // without an explicit `RemoveVisual` the now-orphaned child visual
+    // would never leave the composition tree — it'd leak for the rest of
+    // this monitor's overview lifetime and keep rendering stale, frozen
+    // content that no longer tracks the carousel.
+    for stale in &old_cards {
+        // SAFETY: `stale.surface.visual()` was attached to
+        // `state.root.visual()` by an earlier call to this function (or
+        // never attached, in which case `RemoveVisual` is a documented
+        // no-op). `state.root` is alive for as long as `state` is.
+        unsafe {
+            let _ = state.root.visual().RemoveVisual(stale.surface.visual());
+        }
+    }
     state.cards = rebuilt;
     for card_visual in &state.cards {
         // SAFETY: both visuals belong to the same `IDCompositionDesktopDevice`;
@@ -86,6 +120,16 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[C
         unsafe {
             let _ = state.root.visual().AddVisual(card_visual.surface.visual(), true, None);
         }
+    }
+    // Re-insert `chrome` above every card just attached above — each
+    // `AddVisual(_, true, None)` call inserts its visual at the very top
+    // of `root`'s children, so whichever visual is added last ends up on
+    // top; this keeps the dock/search/drag-ghost chrome above every card,
+    // regardless of card add/remove order this call.
+    // SAFETY: `state.chrome.visual()` was created alongside `state.root`
+    // in `create` and is alive for as long as `state` is.
+    unsafe {
+        let _ = state.root.visual().AddVisual(state.chrome.visual(), true, None);
     }
 }
 
@@ -258,18 +302,24 @@ pub(crate) fn paint_card(
     });
 }
 
-/// Paints the root surface's chrome: the dock bar/icons, the search
+/// Paints the chrome surface: the dock bar/icons, the search
 /// panel/rows, and the dragged-window ghost. Mirrors the corresponding
 /// slice of `overview::paint_overview`'s GDI drawing. Triggered only by
 /// the same state changes that already invalidated this content under
 /// GDI (dock/search/drag changes) — never by the per-tick
-/// carousel-position path (see `update_transforms`).
+/// carousel-position path (see `update_transforms`). Drawn onto
+/// `gpu.chrome`, not `gpu.root`, because `chrome`'s visual is kept
+/// re-inserted above every card visual (see `rebuild_cards`) — the
+/// drag ghost and search panel both need to render above cards, and
+/// the dock, though it never overlaps a card today, is painted here
+/// too rather than split onto `root`, since a future layout change to
+/// either could silently reintroduce the occlusion bug this fixes.
 pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::overview::OverviewInstance) {
     let dpi = reference_dpi();
     let dock_radius = scaled(super::dock::DOCK_CORNER_RADIUS, dpi) as f32;
     let thumb_radius = scaled(8, dpi) as f32;
 
-    gpu::redraw(&gpu.root, |ctx: &ID2D1DeviceContext| {
+    gpu::redraw(&gpu.chrome, |ctx: &ID2D1DeviceContext| {
         let (dock_bar_rect, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
         if !ov.dock_apps.is_empty() {
             let bar = rect_to_d2d(dock_bar_rect, 0, 0);
