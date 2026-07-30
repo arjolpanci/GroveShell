@@ -37,6 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::bar::{raise_bars_topmost, refresh_bar_indicator};
 use super::calendar::hide_calendar;
+use super::gpu;
 use super::monitors::monitors_sorted_by_x;
 use super::quick_settings::hide_quick_settings;
 use super::state::{reference_dpi, scaled, STATE, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, BAR_HEIGHT};
@@ -663,9 +664,18 @@ pub(crate) fn open_overview(monitor: &str) {
         }
     });
 
+    let gpu_root_opacity_set = STATE.with(|s| {
+        let state = s.borrow();
+        let ov = state.as_ref()?.overviews.get(monitor)?;
+        let gpu = ov.gpu.as_ref()?;
+        gpu::set_opacity(&gpu.root, 0.0);
+        Some(())
+    });
     // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
     unsafe {
-        let _ = SetLayeredWindowAttributes(overview_hwnd, COLORREF(0), 0, LWA_ALPHA);
+        if gpu_root_opacity_set.is_none() {
+            let _ = SetLayeredWindowAttributes(overview_hwnd, COLORREF(0), 0, LWA_ALPHA);
+        }
         let _ = ShowWindow(overview_hwnd, SW_SHOW);
         let _ = SetForegroundWindow(overview_hwnd);
         let _ = SetFocus(overview_hwnd);
@@ -2622,10 +2632,19 @@ pub(crate) fn on_animation_tick(monitor: &str) {
     };
 
     if let Some(alpha) = fade_alpha {
-        // SAFETY: `overview_hwnd` is a valid, process-lifetime window
-        // already created with `WS_EX_LAYERED`.
-        unsafe {
-            let _ = SetLayeredWindowAttributes(overview_hwnd, COLORREF(0), alpha, LWA_ALPHA);
+        let gpu_root_opacity_set = STATE.with(|s| {
+            let state = s.borrow();
+            let ov = state.as_ref()?.overviews.get(monitor)?;
+            let gpu = ov.gpu.as_ref()?;
+            gpu::set_opacity(&gpu.root, alpha as f32 / 255.0);
+            Some(())
+        });
+        if gpu_root_opacity_set.is_none() {
+            // SAFETY: `overview_hwnd` is a valid, process-lifetime window
+            // already created with `WS_EX_LAYERED`.
+            unsafe {
+                let _ = SetLayeredWindowAttributes(overview_hwnd, COLORREF(0), alpha, LWA_ALPHA);
+            }
         }
     }
 
