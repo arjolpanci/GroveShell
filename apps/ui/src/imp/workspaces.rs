@@ -503,10 +503,16 @@ pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
                         }
                     }
                     (None, real) => {
-                        let target_monitor = real.unwrap_or_else(|| state.primary_monitor.clone());
-                        if let Some(tracker) = state.workspaces.get_mut(&target_monitor) {
-                            let index = tracker.current_index();
-                            tracker.assign_to_index(window.hwnd, index);
+                        if let Some((target_monitor, index)) = super::pending_launch::take_match(window.pid) {
+                            if let Some(tracker) = state.workspaces.get_mut(&target_monitor) {
+                                tracker.assign_to_index(window.hwnd, index);
+                            }
+                        } else {
+                            let target_monitor = real.unwrap_or_else(|| state.primary_monitor.clone());
+                            if let Some(tracker) = state.workspaces.get_mut(&target_monitor) {
+                                let index = tracker.current_index();
+                                tracker.assign_to_index(window.hwnd, index);
+                            }
                         }
                     }
                     _ => {}
