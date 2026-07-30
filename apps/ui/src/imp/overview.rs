@@ -181,10 +181,17 @@ pub(crate) struct OverviewInstance {
     pub(crate) dock_apps: Vec<super::dock::DockApp>,
     pub(crate) dock_hover: Option<(usize, std::time::Instant)>,
     pub(crate) search_query: String,
+    /// `None` if GPU rendering isn't available for this window (see
+    /// `gpu::is_enabled`) or this specific window's DirectComposition
+    /// setup failed — `paint_overview`/`repaint_overview`/
+    /// `on_animation_tick` all fall back to plain GDI in that case,
+    /// unchanged from before this feature existed.
+    #[allow(dead_code)] // read starting in a later task (card/root GPU painting)
+    pub(crate) gpu: Option<super::overview_gpu::OverviewGpuState>,
 }
 
 impl OverviewInstance {
-    pub(crate) fn new(hwnd: HWND) -> Self {
+    pub(crate) fn new(hwnd: HWND, width: i32, height: i32) -> Self {
         Self {
             hwnd,
             mode: OverviewMode::Closed,
@@ -198,6 +205,7 @@ impl OverviewInstance {
             dock_apps: Vec::new(),
             dock_hover: None,
             search_query: String::new(),
+            gpu: super::overview_gpu::create(hwnd, width, height),
         }
     }
 }

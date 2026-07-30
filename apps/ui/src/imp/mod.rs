@@ -277,7 +277,10 @@ pub fn main() -> Result<()> {
                 None,
             )
             .map_err(Error::Windows)?;
-            overviews.insert(monitor.device_name.clone(), overview::OverviewInstance::new(overview_hwnd));
+            overviews.insert(
+                monitor.device_name.clone(),
+                overview::OverviewInstance::new(overview_hwnd, width, height),
+            );
         }
 
         // Calendar + notifications flyout, centered under the primary
