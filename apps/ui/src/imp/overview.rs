@@ -288,7 +288,7 @@ pub(crate) struct WindowPopAnim {
 }
 
 /// One row in the overview's search results.
-enum SearchResult {
+pub(crate) enum SearchResult {
     /// An open window: activating switches to its workspace and
     /// focuses it.
     Window { hwnd: isize, title: String },
@@ -634,7 +634,7 @@ pub(crate) fn open_overview(monitor: &str) {
                         if let Some(card) = card {
                             let page_thumbs: Vec<&ThumbAnim> =
                                 thumbs.iter().filter(|t| t.page == card.page).collect();
-                            super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor);
+                            super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor, None);
                         }
                     }
                 }
@@ -720,7 +720,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
             let card = cards.iter().find(|c| c.page == card_visual.page);
             if let Some(card) = card {
                 let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == card.page).collect();
-                super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor);
+                super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor, None);
             }
         }
         // Newly created/repositioned card visuals sit at their default
@@ -864,7 +864,16 @@ pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
                     s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).map(|ov| ov.hwnd)
                 });
                 if let Some(overview_hwnd) = overview_hwnd {
-                    repaint_overview(overview_hwnd);
+                    let gpu_repainted = STATE.with(|s| {
+                        let state = s.borrow();
+                        let ov = state.as_ref()?.overviews.get(monitor)?;
+                        let gpu = ov.gpu.as_ref()?;
+                        super::overview_gpu::paint_root(gpu, monitor, ov);
+                        Some(())
+                    });
+                    if gpu_repainted.is_none() {
+                        repaint_overview(overview_hwnd);
+                    }
                 }
             }
         }
@@ -1113,6 +1122,30 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
             let ov = state.as_ref()?.overviews.get(monitor)?;
             let gpu = ov.gpu.as_ref()?;
             super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+            if let Some(drag) = ov.window_drag.as_ref() {
+                // A real window drag: the ghost follows the cursor (root
+                // content) and the card currently under it gets the
+                // whole-card hover glow (card content — see
+                // `overview_gpu::HoverTarget`). Every card's surface is
+                // redrawn here (not just the newly-hovered one) so a
+                // previously-glowing card reliably has its glow cleared
+                // too — cheap enough since this only runs while a real
+                // window drag is in progress, not on every idle tick.
+                super::overview_gpu::paint_root(gpu, monitor, ov);
+                if let OverviewMode::Open { thumbs, .. } = &ov.mode {
+                    if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+                        let (card_rect, _) = card_layout(monitor);
+                        let intensity = ease_out(progress_dur(drag.hover_started, WINDOW_HOVER_GLOW_DURATION));
+                        for card_visual in &gpu.cards {
+                            let hover = (Some(card_visual.page) == drag.hover_page)
+                                .then_some((super::overview_gpu::HoverTarget::Card(card_visual.page), intensity));
+                            let page_thumbs: Vec<&ThumbAnim> =
+                                thumbs.iter().filter(|t| t.page == card_visual.page).collect();
+                            super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
+                        }
+                    }
+                }
+            }
             Some(())
         });
         if gpu_updated.is_none() {
@@ -1182,6 +1215,29 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
             let ov = state.as_ref()?.overviews.get(monitor)?;
             let gpu = ov.gpu.as_ref()?;
             super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+            // Dock hover is root content — repaint the chrome surface.
+            super::overview_gpu::paint_root(gpu, monitor, ov);
+            // Thumbnail hover is card content (see `HoverTarget`) —
+            // every card is redrawn so a previously-glowing thumbnail's
+            // card reliably has its glow cleared too, cheap enough since
+            // this only runs on an actual hover change, not every tick.
+            if let OverviewMode::Open { thumbs, .. } = &ov.mode {
+                let (card_rect, _) = card_layout(monitor);
+                let hover_target = ov.hover_thumb.map(|(hwnd, started)| {
+                    (hwnd, ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)))
+                });
+                for card_visual in &gpu.cards {
+                    let page_thumbs: Vec<&ThumbAnim> =
+                        thumbs.iter().filter(|t| t.page == card_visual.page).collect();
+                    let hover = hover_target.and_then(|(hwnd, intensity)| {
+                        page_thumbs
+                            .iter()
+                            .any(|t| t.hwnd.0 as isize == hwnd)
+                            .then_some((super::overview_gpu::HoverTarget::Thumb(hwnd), intensity))
+                    });
+                    super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
+                }
+            }
             Some(())
         });
         if gpu_updated.is_none() {
@@ -1329,7 +1385,16 @@ fn on_window_drop(monitor: &str, drag: WindowDrag, x: i32, y: i32) {
             unsafe {
                 SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
             }
-            repaint_overview(overview_hwnd);
+            let gpu_repainted = STATE.with(|s| {
+                let state = s.borrow();
+                let ov = state.as_ref()?.overviews.get(monitor)?;
+                let gpu = ov.gpu.as_ref()?;
+                super::overview_gpu::paint_root(gpu, monitor, ov);
+                Some(())
+            });
+            if gpu_repainted.is_none() {
+                repaint_overview(overview_hwnd);
+            }
         }
         return;
     };
@@ -1474,7 +1539,7 @@ fn app_index_matches(query_lower: &str, limit: usize) -> Vec<(String, std::path:
 /// Open windows whose title or exe matches, then installed apps whose
 /// name matches — capped at `SEARCH_MAX_RESULTS`, windows first since
 /// switching beats launching a duplicate.
-fn search_results(monitor: &str, query: &str) -> Vec<SearchResult> {
+pub(crate) fn search_results(monitor: &str, query: &str) -> Vec<SearchResult> {
     let q = query.to_lowercase();
     let tracked: Vec<isize> = STATE.with(|s| {
         s.borrow()
@@ -1517,7 +1582,7 @@ fn search_results(monitor: &str, query: &str) -> Vec<SearchResult> {
 /// itself, then one rect per result row. Row 0 of `rows` is the header
 /// line showing the query. Pure function of dpi + row count so painting
 /// and click hit-testing can't disagree.
-fn search_layout(monitor: &str, dpi: u32, result_count: usize) -> (RECT, Vec<RECT>) {
+pub(crate) fn search_layout(monitor: &str, dpi: u32, result_count: usize) -> (RECT, Vec<RECT>) {
     let (card, _) = card_layout(monitor);
     let width = scaled(SEARCH_PANEL_WIDTH, dpi);
     let row_h = scaled(SEARCH_ROW_HEIGHT, dpi);
@@ -1630,12 +1695,30 @@ pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
                 activate_search_result(monitor, first);
             }
             if let Some(overview_hwnd) = overview_hwnd {
-                repaint_overview(overview_hwnd);
+                let gpu_repainted = STATE.with(|s| {
+                    let state = s.borrow();
+                    let ov = state.as_ref()?.overviews.get(monitor)?;
+                    let gpu = ov.gpu.as_ref()?;
+                    super::overview_gpu::paint_root(gpu, monitor, ov);
+                    Some(())
+                });
+                if gpu_repainted.is_none() {
+                    repaint_overview(overview_hwnd);
+                }
             }
         }
         Action::Repaint => {
             if let Some(overview_hwnd) = overview_hwnd {
-                repaint_overview(overview_hwnd);
+                let gpu_repainted = STATE.with(|s| {
+                    let state = s.borrow();
+                    let ov = state.as_ref()?.overviews.get(monitor)?;
+                    let gpu = ov.gpu.as_ref()?;
+                    super::overview_gpu::paint_root(gpu, monitor, ov);
+                    Some(())
+                });
+                if gpu_repainted.is_none() {
+                    repaint_overview(overview_hwnd);
+                }
             }
         }
         Action::Nothing => {}

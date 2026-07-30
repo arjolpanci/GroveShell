@@ -409,7 +409,6 @@ pub(crate) fn fill_rounded_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radi
 /// edge — the Direct2D replacement for the GDI multi-ring shadow/glow
 /// approximation. `alpha` (0..1) drives fade-in for the hover glow;
 /// shadow callers always pass a fixed alpha.
-#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
 pub(crate) fn stroke_rounded_rect(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
