@@ -266,3 +266,153 @@ fn colorref_to_d2d(colorref: u32) -> D2D1_COLOR_F {
         a: 1.0,
     }
 }
+
+use windows::Win32::Graphics::Direct2D::{
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_INTERPOLATION_MODE_LINEAR, D2D1_LAYER_OPTIONS1_NONE,
+    D2D1_LAYER_PARAMETERS1, D2D1_ROUNDED_RECT, ID2D1Bitmap, ID2D1Geometry,
+};
+use windows::Win32::Graphics::Gdi::HBITMAP;
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, IWICImagingFactory, WICBitmapUsePremultipliedAlpha,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+
+/// Converts a GDI `HBITMAP` (a `PrintWindow` capture, a wallpaper tile,
+/// or an icon rendered to a temp bitmap) into a Direct2D-drawable
+/// bitmap via the WIC bridge. `None` on any failure — callers already
+/// treat a missing bitmap as "draw the placeholder chip instead",
+/// matching today's GDI behavior.
+#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
+pub(crate) fn bitmap_from_hbitmap(ctx: &ID2D1DeviceContext, hbitmap: HBITMAP) -> Option<ID2D1Bitmap> {
+    // SAFETY: `hbitmap` is a valid, caller-owned GDI bitmap for the
+    // duration of this call; every COM object created here is released
+    // when it goes out of scope at the end of the function.
+    unsafe {
+        let wic: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+        let wic_bitmap = wic
+            .CreateBitmapFromHBITMAP(hbitmap, None, WICBitmapUsePremultipliedAlpha)
+            .ok()?;
+        // `ID2D1DeviceContext::CreateBitmapFromWicBitmap` returns the
+        // newer `ID2D1Bitmap1`, which is a COM subtype of `ID2D1Bitmap`;
+        // `cast` is a same-object `QueryInterface`, guaranteed to
+        // succeed here.
+        let bitmap1: windows::Win32::Graphics::Direct2D::ID2D1Bitmap1 =
+            ctx.CreateBitmapFromWicBitmap(&wic_bitmap, None).ok()?;
+        bitmap1.cast().ok()
+    }
+}
+
+/// Draws `bitmap` stretched to fill `rect`, clipped to a rounded rect
+/// of `radius`. Mirrors `overview.rs`'s GDI `StretchBlt`-into-a-
+/// `CreateRoundRectRgn`-clip pattern.
+#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
+pub(crate) fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, bitmap: &ID2D1Bitmap) {
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
+    unsafe {
+        let geometry = GPU.with(|g| {
+            let g = g.borrow();
+            let ctx = g.as_ref()?;
+            ctx.d2d_factory
+                .CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                    rect,
+                    radiusX: radius,
+                    radiusY: radius,
+                })
+                .ok()
+        });
+        let Some(geometry) = geometry else { return };
+        // `CreateRoundedRectangleGeometry` returns the concrete
+        // `ID2D1RoundedRectangleGeometry`; `D2D1_LAYER_PARAMETERS1`'s
+        // `geometricMask` field is typed as the base `ID2D1Geometry`, so
+        // it needs an explicit (same-object, infallible) `cast`.
+        let geometry: ID2D1Geometry = match geometry.cast() {
+            Ok(geometry) => geometry,
+            Err(_) => return,
+        };
+        let Ok(layer) = ctx.CreateLayer(None) else { return };
+        let params = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: rect,
+            geometricMask: core::mem::ManuallyDrop::new(Some(geometry)),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 },
+            opacity: 1.0,
+            opacityBrush: core::mem::ManuallyDrop::new(None),
+            layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+        };
+        // `ID2D1DeviceContext::PushLayer`/`PopLayer` (unlike the
+        // `ID2D1RenderTarget` overloads with the same name) don't return
+        // `Result` — there's no fallible step between them to guard.
+        ctx.PushLayer(&params, &layer);
+        ctx.DrawBitmap(bitmap, Some(&rect), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+        ctx.PopLayer();
+        // `D2D1_LAYER_PARAMETERS1.geometricMask` is a `ManuallyDrop` —
+        // its COM reference must be released explicitly or every call
+        // leaks one `ID2D1Geometry` (this runs on every card
+        // redraw/thumbnail, not once at startup, so the leak would be
+        // real).
+        let mut params = params;
+        core::mem::ManuallyDrop::drop(&mut params.geometricMask);
+    }
+}
+
+/// Fills a rounded rect — the flat-color fallback drawn under the
+/// wallpaper (mirrors the GDI fallback-brush fill in `paint_overview`).
+#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
+pub(crate) fn fill_rounded_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, colorref: u32) {
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
+    unsafe {
+        let geometry = GPU.with(|g| {
+            let g = g.borrow();
+            let ctx = g.as_ref()?;
+            ctx.d2d_factory
+                .CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT { rect, radiusX: radius, radiusY: radius })
+                .ok()
+        });
+        let Some(geometry) = geometry else { return };
+        if let Ok(brush) = ctx.CreateSolidColorBrush(&colorref_to_d2d(colorref), None) {
+            ctx.FillGeometry(&geometry, &brush, None);
+        }
+    }
+}
+
+/// A single semi-transparent rounded stroke, just inside `rect`'s
+/// edge — the Direct2D replacement for the GDI multi-ring shadow/glow
+/// approximation. `alpha` (0..1) drives fade-in for the hover glow;
+/// shadow callers always pass a fixed alpha.
+#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
+pub(crate) fn stroke_rounded_rect(
+    ctx: &ID2D1DeviceContext,
+    rect: D2D_RECT_F,
+    radius: f32,
+    colorref: u32,
+    alpha: f32,
+    stroke_width: f32,
+) {
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
+    unsafe {
+        let inset = stroke_width / 2.0;
+        let inset_rect = D2D_RECT_F {
+            left: rect.left + inset,
+            top: rect.top + inset,
+            right: rect.right - inset,
+            bottom: rect.bottom - inset,
+        };
+        let Ok(geometry) = GPU.with(|g| {
+            let g = g.borrow();
+            let ctx = g.as_ref().expect("stroke_rounded_rect called with no GPU context");
+            ctx.d2d_factory.CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT {
+                rect: inset_rect,
+                radiusX: radius,
+                radiusY: radius,
+            })
+        }) else {
+            return;
+        };
+        let mut color = colorref_to_d2d(colorref);
+        color.a = alpha.clamp(0.0, 1.0);
+        if let Ok(brush) = ctx.CreateSolidColorBrush(&color, None) {
+            ctx.DrawGeometry(&geometry, &brush, stroke_width, None);
+        }
+    }
+}
