@@ -96,10 +96,10 @@ const OVERVIEW_ZOOM_MAX: f64 = 1.0 / CARD_WIDTH_FRACTION;
 
 /// How long a dragged window's ghost takes to pop in at pickup or pop
 /// out at drop (see `WindowPopAnim`).
-const WINDOW_POP_DURATION: Duration = Duration::from_millis(140);
+pub(crate) const WINDOW_POP_DURATION: Duration = Duration::from_millis(140);
 /// How long the hover glow takes to ease to full intensity once the
 /// pointer settles over a card while dragging a window.
-const WINDOW_HOVER_GLOW_DURATION: Duration = Duration::from_millis(220);
+pub(crate) const WINDOW_HOVER_GLOW_DURATION: Duration = Duration::from_millis(220);
 
 /// Overview search: cap on rendered results, and 96-DPI layout metrics
 /// for the results panel (see `search_layout`).
@@ -747,7 +747,20 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         }
     });
 
-    if gpu_updated.is_none() {
+    // `dock_apps` just changed above — the GPU branch that ran earlier
+    // (card content only) predates this assignment, so it can't have
+    // painted the new dock. Repaint the root surface's chrome now that
+    // `ov.dock_apps` is current; a no-op (falls through to the GDI
+    // fallback below) when GPU isn't available for this window.
+    let gpu_dock_updated = STATE.with(|s| {
+        let state = s.borrow();
+        let ov = state.as_ref()?.overviews.get(monitor)?;
+        let gpu = ov.gpu.as_ref()?;
+        super::overview_gpu::paint_root(gpu, monitor, ov);
+        Some(())
+    });
+
+    if gpu_updated.is_none() || gpu_dock_updated.is_none() {
         repaint_overview(overview_hwnd);
     }
 }
@@ -1053,6 +1066,71 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
     }
 }
 
+/// Repaints just the card(s) affected by a whole-card hover-glow change
+/// (a real window drag hovering a different card) — at most the
+/// previously-hovered and newly-hovered card, deduplicated, instead of
+/// a blanket redraw of every card visual on every mouse move.
+fn repaint_card_hover_diff(
+    gpu: &super::overview_gpu::OverviewGpuState,
+    monitor: &str,
+    thumbs: &[ThumbAnim],
+    card_rect: RECT,
+    old_page: Option<usize>,
+    new_page: Option<usize>,
+    intensity: f64,
+) {
+    let mut pages = Vec::with_capacity(2);
+    if let Some(p) = old_page {
+        pages.push(p);
+    }
+    if let Some(p) = new_page {
+        if !pages.contains(&p) {
+            pages.push(p);
+        }
+    }
+    for page in pages {
+        let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) else { continue };
+        let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == page).collect();
+        let hover = (Some(page) == new_page)
+            .then_some((super::overview_gpu::HoverTarget::Card(page), intensity));
+        super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
+    }
+}
+
+/// Repaints just the card(s) affected by a per-thumbnail hover-glow
+/// change (plain browsing, not dragging) — at most the card holding the
+/// previously-hovered thumbnail and the card holding the newly-hovered
+/// one, deduplicated (usually the same card, meaning one repaint).
+fn repaint_thumb_hover_diff(
+    gpu: &super::overview_gpu::OverviewGpuState,
+    monitor: &str,
+    thumbs: &[ThumbAnim],
+    card_rect: RECT,
+    old_hwnd: Option<isize>,
+    new_hwnd: Option<isize>,
+    intensity: f64,
+) {
+    let page_of = |hwnd: isize| thumbs.iter().find(|t| t.hwnd.0 as isize == hwnd).map(|t| t.page);
+    let old_page = old_hwnd.and_then(page_of);
+    let new_page = new_hwnd.and_then(page_of);
+    let mut pages = Vec::with_capacity(2);
+    if let Some(p) = old_page {
+        pages.push(p);
+    }
+    if let Some(p) = new_page {
+        if !pages.contains(&p) {
+            pages.push(p);
+        }
+    }
+    for page in pages {
+        let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) else { continue };
+        let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == page).collect();
+        let hover = (Some(page) == new_page)
+            .then_some((super::overview_gpu::HoverTarget::Thumb(new_hwnd.unwrap()), intensity));
+        super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
+    }
+}
+
 /// Follows the pointer while a drag is active. A window drag just
 /// tracks the cursor (the ghost is painted at the current position); a
 /// carousel drag scrolls the content with the cursor (dragging right
@@ -1061,7 +1139,11 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
 /// overview's actual (screen-spanning) pixel width — see that
 /// constant's docs.
 pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
-    let overview_hwnd = STATE.with(|s| {
+    enum MoveKind {
+        Window { old_page: Option<usize> },
+        Carousel,
+    }
+    let result = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
         let workspace_count = state
@@ -1092,6 +1174,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
             let Some(drag) = ov.window_drag.as_mut() else {
                 unreachable!("just checked window_drag.is_some() above");
             };
+            let old_page = drag.hover_page;
             drag.cur_x = x;
             drag.cur_y = y;
             let travel = (x - drag.start_x).abs().max((y - drag.start_y).abs());
@@ -1100,7 +1183,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 drag.hover_page = hovered;
                 drag.hover_started = Instant::now();
             }
-            return Some(ov.hwnd);
+            return Some((ov.hwnd, MoveKind::Window { old_page }));
         }
 
         let drag = ov.carousel_drag.as_mut()?;
@@ -1114,43 +1197,38 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
         let page_distance_px = scaled(CAROUSEL_DRAG_PAGE_DISTANCE_PX as i32, reference_dpi()) as f64;
         let raw_offset = drag.start_offset - delta_px as f64 / page_distance_px;
         ov.carousel_offset = raw_offset.clamp(0.0, (workspace_count.max(1) - 1) as f64);
-        Some(ov.hwnd)
+        Some((ov.hwnd, MoveKind::Carousel))
     });
-    if let Some(overview_hwnd) = overview_hwnd {
-        let gpu_updated = STATE.with(|s| {
-            let state = s.borrow();
-            let ov = state.as_ref()?.overviews.get(monitor)?;
-            let gpu = ov.gpu.as_ref()?;
-            super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+    let Some((overview_hwnd, kind)) = result else {
+        return;
+    };
+    let gpu_updated = STATE.with(|s| {
+        let state = s.borrow();
+        let ov = state.as_ref()?.overviews.get(monitor)?;
+        let gpu = ov.gpu.as_ref()?;
+        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+        if let MoveKind::Window { old_page } = kind {
+            // A real window drag: the ghost follows the cursor (root
+            // content) and the card currently under it gets the
+            // whole-card hover glow (card content — see
+            // `overview_gpu::HoverTarget`). Only the previously- and
+            // newly-hovered card (at most two, usually the same one)
+            // are repainted, not every card visual.
+            super::overview_gpu::paint_root(gpu, monitor, ov);
             if let Some(drag) = ov.window_drag.as_ref() {
-                // A real window drag: the ghost follows the cursor (root
-                // content) and the card currently under it gets the
-                // whole-card hover glow (card content — see
-                // `overview_gpu::HoverTarget`). Every card's surface is
-                // redrawn here (not just the newly-hovered one) so a
-                // previously-glowing card reliably has its glow cleared
-                // too — cheap enough since this only runs while a real
-                // window drag is in progress, not on every idle tick.
-                super::overview_gpu::paint_root(gpu, monitor, ov);
-                if let OverviewMode::Open { thumbs, .. } = &ov.mode {
-                    if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+                if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+                    if let OverviewMode::Open { thumbs, .. } = &ov.mode {
                         let (card_rect, _) = card_layout(monitor);
                         let intensity = ease_out(progress_dur(drag.hover_started, WINDOW_HOVER_GLOW_DURATION));
-                        for card_visual in &gpu.cards {
-                            let hover = (Some(card_visual.page) == drag.hover_page)
-                                .then_some((super::overview_gpu::HoverTarget::Card(card_visual.page), intensity));
-                            let page_thumbs: Vec<&ThumbAnim> =
-                                thumbs.iter().filter(|t| t.page == card_visual.page).collect();
-                            super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
-                        }
+                        repaint_card_hover_diff(gpu, monitor, thumbs, card_rect, old_page, drag.hover_page, intensity);
                     }
                 }
             }
-            Some(())
-        });
-        if gpu_updated.is_none() {
-            repaint_overview(overview_hwnd);
         }
+        Some(())
+    });
+    if gpu_updated.is_none() {
+        repaint_overview(overview_hwnd);
     }
 }
 
@@ -1160,7 +1238,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
 /// you're about to click. A no-op while a carousel or window drag is
 /// in progress — those already show their own hover feedback.
 pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
-    let overview_hwnd = STATE.with(|s| {
+    let result = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
         let ov = state.overviews.get_mut(monitor)?;
@@ -1188,8 +1266,9 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
             })
         };
 
+        let old_hover = ov.hover_thumb.map(|(hwnd, _)| hwnd);
         let mut changed = false;
-        if ov.hover_thumb.map(|(hwnd, _)| hwnd) != hovered {
+        if old_hover != hovered {
             ov.hover_thumb = hovered.map(|hwnd| (hwnd, Instant::now()));
             changed = true;
         }
@@ -1198,51 +1277,42 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
             changed = true;
         }
         if changed {
-            Some(ov.hwnd)
+            Some((ov.hwnd, old_hover, hovered))
         } else {
             None
         }
     });
-    if let Some(overview_hwnd) = overview_hwnd {
-        // SAFETY: `overview_hwnd` is a valid, process-lifetime window;
-        // keeps the glow easing in even if the pointer stops moving the
-        // instant it lands on a preview.
-        unsafe {
-            SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+    let Some((overview_hwnd, old_hover, new_hover)) = result else {
+        return;
+    };
+    // SAFETY: `overview_hwnd` is a valid, process-lifetime window; keeps
+    // the glow easing in even if the pointer stops moving the instant
+    // it lands on a preview.
+    unsafe {
+        SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+    }
+    let gpu_updated = STATE.with(|s| {
+        let state = s.borrow();
+        let ov = state.as_ref()?.overviews.get(monitor)?;
+        let gpu = ov.gpu.as_ref()?;
+        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+        // Dock hover is root content — repaint the chrome surface.
+        super::overview_gpu::paint_root(gpu, monitor, ov);
+        // Thumbnail hover is card content (see `HoverTarget`) — only
+        // the previously- and newly-hovered card (at most two, usually
+        // the same one) are repainted.
+        if let OverviewMode::Open { thumbs, .. } = &ov.mode {
+            let (card_rect, _) = card_layout(monitor);
+            let intensity = ov
+                .hover_thumb
+                .map(|(_, started)| ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)))
+                .unwrap_or(0.0);
+            repaint_thumb_hover_diff(gpu, monitor, thumbs, card_rect, old_hover, new_hover, intensity);
         }
-        let gpu_updated = STATE.with(|s| {
-            let state = s.borrow();
-            let ov = state.as_ref()?.overviews.get(monitor)?;
-            let gpu = ov.gpu.as_ref()?;
-            super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
-            // Dock hover is root content — repaint the chrome surface.
-            super::overview_gpu::paint_root(gpu, monitor, ov);
-            // Thumbnail hover is card content (see `HoverTarget`) —
-            // every card is redrawn so a previously-glowing thumbnail's
-            // card reliably has its glow cleared too, cheap enough since
-            // this only runs on an actual hover change, not every tick.
-            if let OverviewMode::Open { thumbs, .. } = &ov.mode {
-                let (card_rect, _) = card_layout(monitor);
-                let hover_target = ov.hover_thumb.map(|(hwnd, started)| {
-                    (hwnd, ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)))
-                });
-                for card_visual in &gpu.cards {
-                    let page_thumbs: Vec<&ThumbAnim> =
-                        thumbs.iter().filter(|t| t.page == card_visual.page).collect();
-                    let hover = hover_target.and_then(|(hwnd, intensity)| {
-                        page_thumbs
-                            .iter()
-                            .any(|t| t.hwnd.0 as isize == hwnd)
-                            .then_some((super::overview_gpu::HoverTarget::Thumb(hwnd), intensity))
-                    });
-                    super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
-                }
-            }
-            Some(())
-        });
-        if gpu_updated.is_none() {
-            repaint_overview(overview_hwnd);
-        }
+        Some(())
+    });
+    if gpu_updated.is_none() {
+        repaint_overview(overview_hwnd);
     }
 }
 
@@ -2699,17 +2769,37 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         let dock_hover_easing = ov
             .dock_hover
             .is_some_and(|(_, started)| progress_dur(started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
-        let keep_timer = fade_running
-            || ov.carousel_anim.is_some()
-            || ov.window_pop_anim.is_some()
-            || card_hover_easing
-            || thumb_hover_easing
-            || dock_hover_easing;
-        Some((ov.hwnd, fade_alpha, zoom, ov.carousel_offset, completion, carousel_close_after, keep_timer))
+        let pop_active = ov.window_pop_anim.is_some();
+        let keep_timer =
+            fade_running || ov.carousel_anim.is_some() || pop_active || card_hover_easing || thumb_hover_easing || dock_hover_easing;
+        Some((
+            ov.hwnd,
+            fade_alpha,
+            zoom,
+            ov.carousel_offset,
+            completion,
+            carousel_close_after,
+            keep_timer,
+            pop_active,
+            card_hover_easing,
+            thumb_hover_easing,
+            dock_hover_easing,
+        ))
     });
 
-    let Some((overview_hwnd, fade_alpha, zoom, carousel_offset, completion, carousel_close_after, keep_timer)) =
-        result
+    let Some((
+        overview_hwnd,
+        fade_alpha,
+        zoom,
+        carousel_offset,
+        completion,
+        carousel_close_after,
+        keep_timer,
+        pop_active,
+        card_hover_easing,
+        thumb_hover_easing,
+        dock_hover_easing,
+    )) = result
     else {
         return;
     };
@@ -2738,6 +2828,58 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
         super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, zoom);
+        // The drag-pop ghost's scale and the dock's hover-glow both
+        // ease continuously while active, so — unlike every other
+        // root/card repaint in this module — this one *does* need to
+        // run on the per-tick path, but only while one of those is
+        // actually in flight (gated the same way `keep_timer` is),
+        // never for plain carousel motion.
+        if pop_active || dock_hover_easing {
+            super::overview_gpu::paint_root(gpu, monitor, ov);
+        }
+        if card_hover_easing || thumb_hover_easing {
+            if let OverviewMode::Open { thumbs, .. } = &ov.mode {
+                let (card_rect, _) = card_layout(monitor);
+                if card_hover_easing {
+                    if let Some(page) = ov.window_drag.as_ref().and_then(|d| d.hover_page) {
+                        let intensity = ov
+                            .window_drag
+                            .as_ref()
+                            .map(|d| ease_out(progress_dur(d.hover_started, WINDOW_HOVER_GLOW_DURATION)))
+                            .unwrap_or(0.0);
+                        if let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) {
+                            let page_thumbs: Vec<&ThumbAnim> =
+                                thumbs.iter().filter(|t| t.page == page).collect();
+                            super::overview_gpu::paint_card(
+                                card_visual,
+                                card_rect,
+                                &page_thumbs,
+                                monitor,
+                                Some((super::overview_gpu::HoverTarget::Card(page), intensity)),
+                            );
+                        }
+                    }
+                }
+                if thumb_hover_easing {
+                    if let Some((hwnd, started)) = ov.hover_thumb {
+                        if let Some(page) = thumbs.iter().find(|t| t.hwnd.0 as isize == hwnd).map(|t| t.page) {
+                            let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
+                            if let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) {
+                                let page_thumbs: Vec<&ThumbAnim> =
+                                    thumbs.iter().filter(|t| t.page == page).collect();
+                                super::overview_gpu::paint_card(
+                                    card_visual,
+                                    card_rect,
+                                    &page_thumbs,
+                                    monitor,
+                                    Some((super::overview_gpu::HoverTarget::Thumb(hwnd), intensity)),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Some(())
     });
     if gpu_updated.is_none() {
