@@ -170,7 +170,10 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
                     monitor: monitor.device_name.clone(),
                 });
                 state.workspaces.insert_monitor(monitor.device_name.clone(), WorkspaceTracker::with_monitor_workspaces(1, 0));
-                state.overviews.insert(monitor.device_name.clone(), OverviewInstance::new(overview_hwnd));
+                state.overviews.insert(
+                    monitor.device_name.clone(),
+                    OverviewInstance::new(overview_hwnd, overview_width, overview_height),
+                );
             }
         });
         let _ = InvalidateRect(bar_hwnd, None, true);

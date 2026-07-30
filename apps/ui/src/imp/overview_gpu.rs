@@ -6,12 +6,6 @@
 //! `None`/absent anywhere in this module means "fall back to this
 //! overview window's existing GDI painting, unchanged" — never a panic.
 
-// `OverviewGpuState`/`CardVisual`/`create`/`rebuild_cards` aren't called
-// from anywhere yet; Task 4 wires them into `OverviewInstance` and its
-// creation sites, at which point this attribute becomes unnecessary and
-// should be removed.
-#![allow(dead_code)]
-
 use windows::Win32::Foundation::HWND;
 
 use super::gpu::{self, GpuSurface};
@@ -21,7 +15,9 @@ use super::overview::CardAnim;
 /// (unscrolled, unzoomed) size — carousel position/zoom is applied on
 /// top via `SetTransform2`, never baked into what's drawn here.
 pub(crate) struct CardVisual {
+    #[allow(dead_code)] // read by rebuild_cards, which isn't called until a later task
     pub(crate) page: usize,
+    #[allow(dead_code)] // read by rebuild_cards, which isn't called until a later task
     pub(crate) surface: GpuSurface,
 }
 
@@ -29,7 +25,9 @@ pub(crate) struct CardVisual {
 /// bar, search panel, and drag ghost; `cards` holds one entry per
 /// current `CardAnim`, kept in sync by `rebuild_cards`.
 pub(crate) struct OverviewGpuState {
+    #[allow(dead_code)] // will be painted into by a later task
     pub(crate) root: GpuSurface,
+    #[allow(dead_code)] // read/written by rebuild_cards, which isn't called until a later task
     pub(crate) cards: Vec<CardVisual>,
 }
 
@@ -50,6 +48,7 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
 /// layout). Cards are recreated in `cards`' order, matching how
 /// `on_animation_tick`'s per-tick transform pass below will iterate
 /// them.
+#[allow(dead_code)] // will be called by overview GPU state in a later task
 pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[CardAnim]) {
     let mut rebuilt = Vec::with_capacity(cards.len());
     for card in cards {
