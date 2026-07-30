@@ -620,6 +620,27 @@ pub(crate) fn open_overview(monitor: &str) {
 
     let (cards, thumbs, current_pos, dock_apps) = build_carousel_pages(monitor);
 
+    // Paint each card's GPU surface (frame/wallpaper/thumbnails/icons)
+    // now, while `cards`/`thumbs` are still borrowable locals — they're
+    // moved into `OverviewMode::Opening` below.
+    STATE.with(|s| {
+        if let Some(state) = s.borrow_mut().as_mut() {
+            if let Some(ov) = state.overviews.get_mut(monitor) {
+                if let Some(gpu) = ov.gpu.as_mut() {
+                    super::overview_gpu::rebuild_cards(gpu, ov.hwnd, &cards);
+                    for card_visual in &gpu.cards {
+                        let card = cards.iter().find(|c| c.page == card_visual.page);
+                        if let Some(card) = card {
+                            let page_thumbs: Vec<&ThumbAnim> =
+                                thumbs.iter().filter(|t| t.page == card.page).collect();
+                            super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     // SAFETY: no preconditions.
     let previous_foreground = unsafe { GetForegroundWindow() };
 
@@ -675,6 +696,27 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
     };
 
     let (cards, thumbs, _current_pos, dock_apps) = build_carousel_pages(monitor);
+
+    // Paint each card's GPU surface (frame/wallpaper/thumbnails/icons)
+    // now, while `cards`/`thumbs` are still borrowable locals — they're
+    // moved into `OverviewMode::Open` below.
+    STATE.with(|s| {
+        if let Some(state) = s.borrow_mut().as_mut() {
+            if let Some(ov) = state.overviews.get_mut(monitor) {
+                if let Some(gpu) = ov.gpu.as_mut() {
+                    super::overview_gpu::rebuild_cards(gpu, ov.hwnd, &cards);
+                    for card_visual in &gpu.cards {
+                        let card = cards.iter().find(|c| c.page == card_visual.page);
+                        if let Some(card) = card {
+                            let page_thumbs: Vec<&ThumbAnim> =
+                                thumbs.iter().filter(|t| t.page == card.page).collect();
+                            super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
@@ -2280,6 +2322,27 @@ fn draw_wallpaper_into(monitor: &str, hdc: HDC, rect: RECT) {
     }
 }
 
+/// The wallpaper pre-scaled to `rect`'s size (see `scaled_wallpaper`),
+/// as a raw GDI handle for the GPU path's WIC bridge. `None` if the
+/// wallpaper couldn't be loaded — callers already handle that as
+/// "leave the flat fallback fill showing."
+pub(crate) fn wallpaper_hbitmap_for(monitor: &str, rect: RECT) -> Option<HBITMAP> {
+    let (base_card, _) = card_layout(monitor);
+    let (base_w, base_h) = (base_card.right - base_card.left, base_card.bottom - base_card.top);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    if width != base_w || height != base_h {
+        // The card's own surface is always created at its natural
+        // (unscrolled) size — see `rebuild_cards` — so this path only
+        // triggers if a card's rect and the reference card_layout ever
+        // disagree, which would itself be a bug; fail safe (flat fill)
+        // rather than stretch here, since GPU content is drawn once at
+        // natural size, not per-frame like the old GDI zoom path.
+        return None;
+    }
+    scaled_wallpaper(base_w, base_h).map(|h| HBITMAP(h as *mut c_void))
+}
+
 thread_local! {
     /// Per-window `PrintWindow` captures taken at park time, keyed by
     /// hwnd: `(width, height, HBITMAP)`. A parked window's snapshot is
@@ -2327,7 +2390,7 @@ thread_local! {
 
 /// The window's snapshot pre-scaled to `(w, h)` — served from cache
 /// when the size matches, rebuilt from the full capture otherwise.
-fn slot_scaled_snapshot(hwnd: isize, w: i32, h: i32) -> Option<isize> {
+pub(crate) fn slot_scaled_snapshot(hwnd: isize, w: i32, h: i32) -> Option<isize> {
     if w <= 0 || h <= 0 {
         return None;
     }

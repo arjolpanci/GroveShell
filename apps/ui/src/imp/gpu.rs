@@ -294,7 +294,6 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 /// bitmap via the WIC bridge. `None` on any failure — callers already
 /// treat a missing bitmap as "draw the placeholder chip instead",
 /// matching today's GDI behavior.
-#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
 pub(crate) fn bitmap_from_hbitmap(ctx: &ID2D1DeviceContext, hbitmap: HBITMAP) -> Option<ID2D1Bitmap> {
     // SAFETY: `hbitmap` is a valid, caller-owned GDI bitmap for the
     // duration of this call; every COM object created here is released
@@ -318,7 +317,6 @@ pub(crate) fn bitmap_from_hbitmap(ctx: &ID2D1DeviceContext, hbitmap: HBITMAP) ->
 /// Draws `bitmap` stretched to fill `rect`, clipped to a rounded rect
 /// of `radius`. Mirrors `overview.rs`'s GDI `StretchBlt`-into-a-
 /// `CreateRoundRectRgn`-clip pattern.
-#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
 pub(crate) fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, bitmap: &ID2D1Bitmap) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
     unsafe {
@@ -370,7 +368,6 @@ pub(crate) fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, ra
 
 /// Fills a rounded rect — the flat-color fallback drawn under the
 /// wallpaper (mirrors the GDI fallback-brush fill in `paint_overview`).
-#[allow(dead_code)] // will be called by overview card/thumbnail painting in a later task
 pub(crate) fn fill_rounded_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, colorref: u32) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
     unsafe {
