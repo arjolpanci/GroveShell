@@ -31,7 +31,7 @@ fn take_match_at(pending: &mut Vec<PendingLaunch>, pid: u32, now: Instant) -> Op
 }
 
 thread_local! {
-    static PENDING: RefCell<Vec<PendingLaunch>> = RefCell::new(Vec::new());
+    static PENDING: RefCell<Vec<PendingLaunch>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Registers a newly-launched process to watch for. Called right after
