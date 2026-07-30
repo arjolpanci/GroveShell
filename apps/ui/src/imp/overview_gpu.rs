@@ -455,5 +455,26 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                 }
             }
         }
+
+        if let Some(drag) = ov.dock_drag.as_ref() {
+            if let Some(icon) = drag.icon {
+                let size = scaled(40, dpi);
+                if let Some(icon_bitmap) = icon_to_hbitmap(icon, size) {
+                    if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, icon_bitmap) {
+                        let rect = D2D_RECT_F {
+                            left: (drag.cur_x - size / 2) as f32,
+                            top: (drag.cur_y - size / 2) as f32,
+                            right: (drag.cur_x + size / 2) as f32,
+                            bottom: (drag.cur_y + size / 2) as f32,
+                        };
+                        gpu::draw_rounded_bitmap(ctx, rect, 0.0, &bitmap);
+                    }
+                    // SAFETY: created locally above, owned exclusively here.
+                    unsafe {
+                        let _ = DeleteObject(icon_bitmap);
+                    }
+                }
+            }
+        }
     });
 }

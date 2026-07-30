@@ -179,6 +179,7 @@ pub(crate) struct OverviewInstance {
     pub(crate) carousel_anim: Option<CarouselAnim>,
     pub(crate) carousel_close_after: Option<HWND>,
     pub(crate) window_drag: Option<WindowDrag>,
+    pub(crate) dock_drag: Option<super::dock::DockDrag>,
     pub(crate) window_pop_anim: Option<WindowPopAnim>,
     pub(crate) hover_thumb: Option<(isize, std::time::Instant)>,
     pub(crate) dock_apps: Vec<super::dock::DockApp>,
@@ -203,6 +204,7 @@ impl OverviewInstance {
             carousel_anim: None,
             carousel_close_after: None,
             window_drag: None,
+            dock_drag: None,
             window_pop_anim: None,
             hover_thumb: None,
             dock_apps: Vec::new(),
@@ -1013,11 +1015,27 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
         if !ov.search_query.is_empty() {
             return None;
         }
-        // The dock has no drag behavior — a press on it is handled
-        // entirely as a click on release (see `on_overview_click`), so
-        // just don't start any drag for it.
+        // A press on a **pinned** dock icon starts a reorder/drag-to-open
+        // drag; a press on a running-but-unpinned icon (or missing the
+        // dock entirely) falls through unchanged — handled entirely as
+        // a click on release (see `on_overview_click`).
         let (_, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
-        if dock_slots.iter().any(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom) {
+        let dock_hit = dock_slots.iter().position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
+        if let Some(index) = dock_hit {
+            let is_pinned = ov.dock_apps.get(index).is_some_and(|a| a.launch_path.is_some());
+            if is_pinned {
+                ov.hover_thumb = None;
+                ov.dock_drag = Some(super::dock::DockDrag {
+                    start_x: x,
+                    start_y: y,
+                    cur_x: x,
+                    cur_y: y,
+                    max_delta: 0,
+                    from_index: index,
+                    icon: ov.dock_apps.get(index).and_then(|a| a.icon),
+                });
+                return Some(ov.hwnd);
+            }
             return None;
         }
         let thumb = {
@@ -1173,6 +1191,7 @@ fn repaint_thumb_hover_diff(
 pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
     enum MoveKind {
         Window { old_page: Option<usize> },
+        Dock,
         Carousel,
     }
     let result = STATE.with(|s| {
@@ -1184,6 +1203,14 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
             .map(|t| t.workspace_ids().len())
             .unwrap_or(0);
         let ov = state.overviews.get_mut(monitor)?;
+
+        if let Some(drag) = ov.dock_drag.as_mut() {
+            drag.cur_x = x;
+            drag.cur_y = y;
+            let travel = (x - drag.start_x).abs().max((y - drag.start_y).abs());
+            drag.max_delta = drag.max_delta.max(travel);
+            return Some((ov.hwnd, MoveKind::Dock));
+        }
 
         if ov.window_drag.is_some() {
             // Hit-test which card (if any) the pointer sits over now,
@@ -1239,23 +1266,33 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
         super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
-        if let MoveKind::Window { old_page } = kind {
-            // A real window drag: the ghost follows the cursor (root
-            // content) and the card currently under it gets the
-            // whole-card hover glow (card content — see
-            // `overview_gpu::HoverTarget`). Only the previously- and
-            // newly-hovered card (at most two, usually the same one)
-            // are repainted, not every card visual.
-            super::overview_gpu::paint_root(gpu, monitor, ov);
-            if let Some(drag) = ov.window_drag.as_ref() {
-                if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
-                    if let OverviewMode::Open { thumbs, .. } = &ov.mode {
-                        let (card_rect, _) = card_layout(monitor);
-                        let intensity = ease_out(progress_dur(drag.hover_started, WINDOW_HOVER_GLOW_DURATION));
-                        repaint_card_hover_diff(gpu, monitor, thumbs, card_rect, old_page, drag.hover_page, intensity);
+        match kind {
+            MoveKind::Window { old_page } => {
+                // A real window drag: the ghost follows the cursor (root
+                // content) and the card currently under it gets the
+                // whole-card hover glow (card content — see
+                // `overview_gpu::HoverTarget`). Only the previously- and
+                // newly-hovered card (at most two, usually the same one)
+                // are repainted, not every card visual.
+                super::overview_gpu::paint_root(gpu, monitor, ov);
+                if let Some(drag) = ov.window_drag.as_ref() {
+                    if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+                        if let OverviewMode::Open { thumbs, .. } = &ov.mode {
+                            let (card_rect, _) = card_layout(monitor);
+                            let intensity = ease_out(progress_dur(drag.hover_started, WINDOW_HOVER_GLOW_DURATION));
+                            repaint_card_hover_diff(gpu, monitor, thumbs, card_rect, old_page, drag.hover_page, intensity);
+                        }
                     }
                 }
             }
+            MoveKind::Dock => {
+                // The dock-drag ghost lives on root content; the
+                // carousel position/zoom never changes during a dock
+                // drag, so `update_transforms` above is the only other
+                // thing this tick needs.
+                super::overview_gpu::paint_root(gpu, monitor, ov);
+            }
+            MoveKind::Carousel => {}
         }
         Some(())
     });
@@ -1354,6 +1391,21 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
 /// card moves the window to that workspace; a carousel drag snaps to
 /// whichever page ended up nearest the release point.
 pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
+    let dock_drag = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|st| st.overviews.get_mut(monitor))
+            .and_then(|ov| ov.dock_drag.take())
+    });
+    if let Some(drag) = dock_drag {
+        if drag.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
+            on_overview_click(monitor, x, y);
+        } else {
+            super::dock::on_dock_drag_end(monitor, drag, x, y);
+        }
+        return;
+    }
+
     let window_drag = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
@@ -1986,7 +2038,10 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         // dropdown underneath it only appears once there's an actual
         // query (see the paint site).
         let search = ov.search_query.clone();
-        Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, dock, search))
+        let dock_drag_ghost = ov.dock_drag.as_ref().and_then(|drag| {
+            drag.icon.map(|icon| (drag.cur_x, drag.cur_y, icon))
+        });
+        Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, dock, search, dock_drag_ghost))
     });
 
     // Double-buffered: everything is composed into a memory bitmap and
@@ -2014,7 +2069,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         FillRect(mem, &client, backdrop_brush);
         let _ = DeleteObject(backdrop_brush);
 
-        if let Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, dock, search)) = content {
+        if let Some((cards, snapshots, placeholders, icons, ghost, hover_glow, thumb_hover_glow, dock, search, dock_drag_ghost)) = content {
             let dpi = reference_dpi();
             let card_radius = scaled(CARD_CORNER_RADIUS, dpi);
             let thumb_radius = scaled(THUMB_CORNER_RADIUS, dpi);
@@ -2313,6 +2368,15 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                         let _ = DeleteDC(src);
                     }
                 }
+            }
+
+            // The dock-drag ghost: a plain icon following the cursor,
+            // no pop-in/out animation (unlike the window-drag ghost) —
+            // simpler by design, since a dock icon isn't a captured
+            // window snapshot.
+            if let Some((gx, gy, icon)) = dock_drag_ghost {
+                let size = scaled(40, dpi);
+                let _ = DrawIconEx(mem, gx - size / 2, gy - size / 2, icon, size, size, 0, None, DI_NORMAL);
             }
         }
 

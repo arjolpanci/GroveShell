@@ -37,6 +37,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu,
     MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
 };
+use windows::Win32::System::Threading::GetProcessId;
+use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS};
 
 use super::state::scaled;
 
@@ -488,6 +490,118 @@ pub(crate) fn show_context_menu(monitor: &str, overview_hwnd: HWND, index: usize
         }
     }
     super::overview::rebuild_open_overview_pages(monitor);
+}
+
+/// An in-progress drag of a **pinned** dock icon — either reordering it
+/// within the dock, or dragging it out onto a workspace card to open a
+/// new instance there. Which of the two happens is decided purely by
+/// where the pointer releases (see `on_dock_drag_end`), not by anything
+/// decided at drag-start.
+pub(crate) struct DockDrag {
+    pub(crate) start_x: i32,
+    pub(crate) start_y: i32,
+    pub(crate) cur_x: i32,
+    pub(crate) cur_y: i32,
+    pub(crate) max_delta: i32,
+    /// This pin's index among `pinned_paths()` at drag-start (stable for
+    /// the duration of one drag — the pinned list isn't rebuilt mid-drag).
+    pub(crate) from_index: usize,
+    /// Ghost icon to draw at the cursor while dragging.
+    pub(crate) icon: Option<HICON>,
+}
+
+/// Ends a drag that moved past the click threshold (the caller already
+/// handled the below-threshold "was actually just a click" case, same
+/// as `WindowDrag`/`CarouselDrag`'s own end handlers do). Reorders if
+/// dropped within the dock bar; launches assigned to a workspace if
+/// dropped on a card; cancels (no-op) otherwise.
+pub(crate) fn on_dock_drag_end(monitor: &str, drag: DockDrag, x: i32, y: i32) {
+    let pins = pinned_paths();
+    // `dock_layout` must be called with the *total* displayed entry
+    // count (pinned + running-unpinned), exactly like every other
+    // hit-test in this file (`on_overview_click`, `on_overview_hover`)
+    // — using only `pins.len()` would compute a narrower bar than what's
+    // actually on screen (running-unpinned entries widen it), shifting
+    // every slot's x position and silently breaking this hit-test.
+    let total_count = super::state::STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.overviews.get(monitor))
+            .map(|ov| ov.dock_apps.len())
+    });
+    let Some(total_count) = total_count else { return };
+    let (bar_rect, slots) = dock_layout(monitor, total_count.max(1));
+    if x >= bar_rect.left && x < bar_rect.right && y >= bar_rect.top && y < bar_rect.bottom {
+        // Reorder: target index is whichever *pinned* slot's center is
+        // closest to the drop point — only the first `pins.len()` slots
+        // are pinned entries (`build_dock_apps` always places pinned
+        // entries first), so running-unpinned slots (if any) are never
+        // eligible reorder targets.
+        let target = slots
+            .iter()
+            .take(pins.len())
+            .enumerate()
+            .min_by_key(|(_, r)| ((r.left + r.right) / 2 - x).abs())
+            .map(|(i, _)| i)
+            .unwrap_or(drag.from_index);
+        let reordered = super::dock_pins::reorder(&pins, drag.from_index, target);
+        PINNED_PATHS.with(|p| *p.borrow_mut() = reordered.clone());
+        persist_pinned_paths(&reordered);
+        super::overview::rebuild_open_overview_pages(monitor);
+        return;
+    }
+
+    let (card_rect, pitch) = super::overview::card_layout(monitor);
+    let carousel_offset = super::state::STATE.with(|s| {
+        s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).map(|ov| ov.carousel_offset)
+    });
+    let Some(carousel_offset) = carousel_offset else { return };
+    if y < card_rect.top || y >= card_rect.bottom {
+        return; // Released outside any card — cancel.
+    }
+    let card_center_x = (card_rect.left + card_rect.right) / 2;
+    let approx_offset = carousel_offset + (x - card_center_x) as f64 / pitch as f64;
+    let max_page = super::state::STATE
+        .with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|st| st.workspaces.get(monitor))
+                .map(|t| t.workspace_ids().len())
+        })
+        .unwrap_or(0)
+        .saturating_sub(1);
+    let target_page = approx_offset.round().clamp(0.0, max_page as f64) as usize;
+    if (approx_offset - target_page as f64).abs() > 0.5 {
+        return; // Not confidently over any specific card — cancel.
+    }
+
+    let Some(launch_path) = pins.get(drag.from_index).cloned() else { return };
+    let wide: Vec<u16> = launch_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut info = windows::Win32::UI::Shell::SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<windows::Win32::UI::Shell::SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: w!("open"),
+        lpFile: PCWSTR(wide.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a local, fully-initialized struct valid for the
+    // duration of this call; `wide` outlives it. `info.hProcess`, on
+    // success with `SEE_MASK_NOCLOSEPROCESS`, is a process handle this
+    // call site owns and must close.
+    unsafe {
+        if ShellExecuteExW(&mut info).is_ok() && !info.hProcess.is_invalid() {
+            let pid = GetProcessId(info.hProcess);
+            super::pending_launch::register(super::pending_launch::PendingLaunch {
+                process_id: pid,
+                monitor: monitor.to_string(),
+                workspace_index: target_page,
+                expires_at: std::time::Instant::now() + super::pending_launch::PENDING_LAUNCH_TIMEOUT,
+            });
+            let _ = windows::Win32::Foundation::CloseHandle(info.hProcess);
+        }
+    }
+    super::overview::close_overview(monitor, None);
 }
 
 #[cfg(test)]
