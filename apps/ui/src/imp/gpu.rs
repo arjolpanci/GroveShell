@@ -93,6 +93,18 @@ pub(crate) struct GpuSurface {
     #[allow(dead_code)]
     visual: IDCompositionVisual2,
     surface: IDCompositionSurface,
+    width: i32,
+    height: i32,
+}
+
+impl GpuSurface {
+    pub(crate) fn width(&self) -> i32 {
+        self.width
+    }
+
+    pub(crate) fn height(&self) -> i32 {
+        self.height
+    }
 }
 
 /// Creates a `GpuSurface` for `hwnd`, sized `width`×`height`. Returns
@@ -123,7 +135,7 @@ fn try_create_surface(ctx: &GpuContext, hwnd: HWND, width: i32, height: i32) -> 
         visual.SetContent(&surface)?;
         target.SetRoot(&visual)?;
         ctx.dcomp_device.Commit()?;
-        Ok(GpuSurface { target, visual, surface })
+        Ok(GpuSurface { target, visual, surface, width, height })
     }
 }
 

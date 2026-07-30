@@ -12,6 +12,7 @@ mod monitors;
 mod monitor_workspaces;
 mod movesize;
 mod overview;
+mod overview_gpu;
 mod quick_settings;
 mod radios;
 mod state;
