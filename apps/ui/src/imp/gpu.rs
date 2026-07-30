@@ -80,7 +80,7 @@ pub(crate) fn is_enabled() -> bool {
 }
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::DirectComposition::{IDCompositionSurface, IDCompositionTarget, IDCompositionVisual2};
+use windows::Win32::Graphics::DirectComposition::{IDCompositionSurface, IDCompositionTarget, IDCompositionVisual2, IDCompositionVisual3};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
 
 /// One window's GPU-composited surface: a target bound to its `HWND`, a
@@ -128,20 +128,21 @@ fn try_create_surface(ctx: &GpuContext, hwnd: HWND, width: i32, height: i32) -> 
 }
 
 /// Sets `surface`'s root visual opacity (0.0–1.0) and commits. No-op if
-/// the process-wide GPU setup isn't available. Currently a no-op pending
-/// windows-rs bindings update to expose SetOpacity2 on IDCompositionVisual2.
+/// the process-wide GPU setup isn't available.
 #[allow(dead_code)] // will be called by overview GPU state in later tasks
-pub(crate) fn set_opacity(_surface: &GpuSurface, _opacity: f32) {
+pub(crate) fn set_opacity(surface: &GpuSurface, opacity: f32) {
     GPU.with(|g| {
         let g = g.borrow();
         let Some(ctx) = g.as_ref() else { return };
-        // SAFETY: surface.visual was created by this module's own
-        // try_create_surface and is alive for as long as the caller's
-        // GpuSurface is.
+        // SAFETY: `surface.visual` was created by this module's own
+        // `try_create_surface` and is alive for as long as the caller's
+        // `GpuSurface` is. IDCompositionVisual2 can be queried for
+        // IDCompositionVisual3 which exposes SetOpacity2.
         unsafe {
-            // TODO: Uncomment when windows-rs 0.58+ exposes SetOpacity2:
-            // let _ = _surface.visual.SetOpacity2(_opacity);
-            let _ = ctx.dcomp_device.Commit();
+            if let Ok(visual3) = surface.visual.cast::<IDCompositionVisual3>() {
+                let _ = visual3.SetOpacity2(opacity);
+                let _ = ctx.dcomp_device.Commit();
+            }
         }
     });
 }
