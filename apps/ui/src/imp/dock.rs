@@ -4,20 +4,21 @@
 //! project's memory on this decision) — there is no always-visible
 //! desktop dock.
 //!
-//! Two sources feed it, mirrored rather than owned by us, since there's
-//! no settings UI yet to manage pins directly:
-//! - **Pinned apps**: read straight from the real Windows taskbar's own
-//!   pinned-shortcut folder, so it reflects whatever the user already
-//!   pinned to their (now-hidden) taskbar.
+//! Two sources feed it:
+//! - **Pinned apps**: GroveShell's own persisted list (see
+//!   `dock_pins.rs`), seeded once from the real Windows taskbar's pinned
+//!   shortcuts on first run and independent of it from then on — pinning
+//!   or unpinning here never touches the real taskbar.
 //! - **Running-but-unpinned apps**: one entry per distinct executable
 //!   among currently-tracked windows that didn't already match a
 //!   pinned shortcut, so nothing running is ever left off the dock.
 //!
-//! A click launches (pinned, not running) or focuses (running — the
-//! first tracked window for that app); there's no jump-menu/right-click
-//! yet (§10.3's fuller spec), no reordering, and no pin/unpin — all
-//! deferred along with the rest of "settings" per the project's scope
-//! decision for this pass.
+//! A click focuses (running — cycling through its windows on repeat
+//! clicks, see `next_window`) or launches (pinned, not running) an
+//! entry. Right-click offers pin/unpin and "open new window" for pinned
+//! entries (see `show_context_menu`). Dragging a **pinned** entry
+//! reorders the dock, or (dropped on a workspace card) launches it
+//! assigned to that workspace (see `DockDrag`/`on_dock_drag_end`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -32,6 +33,10 @@ use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER, IPersistFile, STGM_READ};
 use windows::Win32::UI::Shell::{SHGetFileInfoW, ShellExecuteW, IShellLinkW, ShellLink, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu,
+    MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN,
+};
 
 use super::state::scaled;
 
@@ -129,7 +134,7 @@ thread_local! {
     /// `dock_pins.rs`'s module doc for why this isn't the real
     /// taskbar's pin folder anymore). Loaded once at startup via
     /// `init_pinned_list`.
-    static PINNED_PATHS: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+    static PINNED_PATHS: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Loads the persisted pinned list (seeding it from the real taskbar's
@@ -419,6 +424,70 @@ pub(crate) fn activate_dock_app(monitor: &str, index: usize) {
         }
         super::overview::close_overview(monitor, None);
     }
+}
+
+const MENU_ID_UNPIN: u32 = 1;
+const MENU_ID_PIN: u32 = 2;
+const MENU_ID_OPEN_NEW_WINDOW: u32 = 3;
+
+/// Shows the right-click context menu for the dock entry at `index`
+/// (already resolved by the caller via `dock_layout`'s slot hit-test),
+/// then performs whichever action was chosen. A running-but-unpinned
+/// entry (no `launch_path`) gets no menu at all — right-clicking it is
+/// a no-op, matching today's behavior — since there's no shortcut to
+/// pin or relaunch from a bare running-window entry.
+pub(crate) fn show_context_menu(monitor: &str, overview_hwnd: HWND, index: usize) {
+    let Some(app_launch_path) = super::state::STATE.with(|s| {
+        let state = s.borrow();
+        let ov = state.as_ref()?.overviews.get(monitor)?;
+        ov.dock_apps.get(index)?.launch_path.clone()
+    }) else {
+        return;
+    };
+
+    // SAFETY: every call here is a standard, synchronous Win32 popup-menu
+    // sequence; `menu` is destroyed before returning on every path.
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return };
+        let is_pinned = pinned_paths().contains(&app_launch_path);
+        let pin_label = if is_pinned { w!("Unpin from dock") } else { w!("Pin to dock") };
+        let pin_id = if is_pinned { MENU_ID_UNPIN } else { MENU_ID_PIN };
+        let _ = AppendMenuW(menu, MF_STRING, pin_id as usize, pin_label);
+        let _ = AppendMenuW(menu, MF_STRING, MENU_ID_OPEN_NEW_WINDOW as usize, w!("Open new window"));
+
+        let mut point = windows::Win32::Foundation::POINT::default();
+        let _ = GetCursorPos(&mut point);
+        let _ = SetForegroundWindow(overview_hwnd);
+        let cmd = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+            point.x,
+            point.y,
+            0,
+            overview_hwnd,
+            None,
+        );
+        let _ = DestroyMenu(menu);
+
+        match cmd.0 as u32 {
+            MENU_ID_UNPIN => unpin_app(&app_launch_path),
+            MENU_ID_PIN => pin_app(app_launch_path),
+            MENU_ID_OPEN_NEW_WINDOW => {
+                let wide: Vec<u16> =
+                    app_launch_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+                let _ = ShellExecuteW(
+                    HWND(std::ptr::null_mut()),
+                    w!("open"),
+                    PCWSTR(wide.as_ptr()),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SW_SHOWNORMAL,
+                );
+            }
+            _ => {}
+        }
+    }
+    super::overview::rebuild_open_overview_pages(monitor);
 }
 
 #[cfg(test)]

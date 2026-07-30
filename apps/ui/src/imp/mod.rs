@@ -59,7 +59,7 @@ use movesize::{
 use overview::{
     close_overview, on_animation_tick, on_overview_arrow, on_overview_char,
     on_overview_drag_end, on_overview_drag_move, on_overview_drag_start, on_overview_hover,
-    paint_overview, repaint_overview,
+    on_overview_right_click, paint_overview, repaint_overview,
 };
 use quick_settings::{
     hide_quick_settings, on_quick_settings_mouse_down, on_quick_settings_mouse_move,
@@ -554,6 +554,14 @@ unsafe extern "system" fn wndproc(
                 }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
+        }
+        WM_RBUTTONDOWN => {
+            if let Role::Overview { monitor } = role {
+                let x = (lparam.0 & 0xFFFF) as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                on_overview_right_click(&monitor, x, y);
+            }
+            LRESULT(0)
         }
         WM_MOUSEMOVE => {
             match role {

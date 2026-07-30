@@ -835,6 +835,27 @@ pub(crate) fn toggle_overview_for(monitor: &str) {
     }
 }
 
+/// A right-click while the overview is open: only dock icons have any
+/// right-click behavior right now — hit-tests the same `dock_layout`
+/// slots the plain click/hover paths already use, and shows the
+/// context menu for whichever one (if any) was clicked.
+pub(crate) fn on_overview_right_click(monitor: &str, x: i32, y: i32) {
+    let hit = STATE.with(|s| {
+        let state = s.borrow();
+        let st = state.as_ref()?;
+        let ov = st.overviews.get(monitor)?;
+        if !matches!(ov.mode, OverviewMode::Open { .. }) {
+            return None;
+        }
+        let (_, slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
+        let index = slots.iter().position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)?;
+        Some((ov.hwnd, index))
+    });
+    if let Some((overview_hwnd, index)) = hit {
+        super::dock::show_context_menu(monitor, overview_hwnd, index);
+    }
+}
+
 /// Hit-tests a click against the overview's current thumbnail/card
 /// rects across *every* carousel page (only meaningful while `Open`),
 /// applying each page's current carousel shift first. Clicking a
