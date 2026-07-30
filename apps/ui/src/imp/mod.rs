@@ -556,6 +556,7 @@ unsafe extern "system" fn wndproc(
             }
         }
         WM_RBUTTONDOWN => {
+            tracing::info!(role = ?role, "wndproc: WM_RBUTTONDOWN");
             if let Role::Overview { monitor } = role {
                 let x = (lparam.0 & 0xFFFF) as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i32;

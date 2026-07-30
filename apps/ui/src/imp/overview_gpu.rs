@@ -320,11 +320,21 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
     let thumb_radius = scaled(8, dpi) as f32;
 
     gpu::redraw(&gpu.chrome, |ctx: &ID2D1DeviceContext| {
-        let (dock_bar_rect, dock_slots) = super::dock::dock_layout(monitor, ov.dock_apps.len());
+        let (dock_bar_rect, dock_slots, dock_divider) =
+            super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
         if !ov.dock_apps.is_empty() {
             let bar = rect_to_d2d(dock_bar_rect, 0, 0);
             gpu::fill_rounded_rect(ctx, bar, dock_radius, 0x002A2A2A);
+
+            // GNOME/macOS-dash-style divider between the pinned section
+            // (left) and the running-but-unpinned section (right), if
+            // there's one to draw.
+            if let Some(divider) = dock_divider {
+                gpu::fill_rounded_rect(ctx, rect_to_d2d(divider, 0, 0), 0.0, 0x00454545);
+            }
+
             let running_dot_radius = super::dock::dock_running_dot_radius();
+            let running_dot_gap = scaled(super::dock::DOCK_RUNNING_DOT_GAP, dpi);
             for (app, slot) in ov.dock_apps.iter().zip(dock_slots.iter()) {
                 let Some(icon) = app.icon else { continue };
                 let size = (slot.right - slot.left).max(1);
@@ -337,19 +347,12 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                         let _ = DeleteObject(icon_bitmap);
                     }
                 }
-                // A small dot beneath any app with at least one
-                // currently-tracked window — a circle is just a
-                // "rounded rect" whose radius is half its own size.
-                if !app.windows.is_empty() {
-                    let cx = (slot.left + slot.right) / 2;
-                    let dot_y = slot.bottom + running_dot_radius + 2;
-                    let dot_rect = D2D_RECT_F {
-                        left: (cx - running_dot_radius) as f32,
-                        top: (dot_y - running_dot_radius) as f32,
-                        right: (cx + running_dot_radius) as f32,
-                        bottom: (dot_y + running_dot_radius) as f32,
-                    };
-                    gpu::fill_rounded_rect(ctx, dot_rect, running_dot_radius as f32, 0x00E0E0E0);
+                // One small dot per open window (capped — see
+                // `running_dot_rects`), GNOME/macOS-dash-style — a
+                // circle is just a "rounded rect" whose radius is half
+                // its own size.
+                for dot in super::dock::running_dot_rects(*slot, app.windows.len(), running_dot_radius, running_dot_gap) {
+                    gpu::fill_rounded_rect(ctx, rect_to_d2d(dot, 0, 0), running_dot_radius as f32, 0x00E0E0E0);
                 }
             }
             // The dock's own hover glow — whichever slot the pointer
