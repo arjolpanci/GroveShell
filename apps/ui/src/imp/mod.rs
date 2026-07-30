@@ -5,6 +5,7 @@
 mod bar;
 mod calendar;
 mod dock;
+mod dock_pins;
 mod gpu;
 mod hotplug;
 mod icons;

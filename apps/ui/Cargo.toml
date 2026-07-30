@@ -13,6 +13,8 @@ path = "src/main.rs"
 groveshell-common = { workspace = true }
 groveshell-window-model = { workspace = true }
 tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
