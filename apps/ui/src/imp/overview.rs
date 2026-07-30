@@ -475,7 +475,7 @@ pub(crate) fn window_icon(hwnd: HWND) -> Option<HICON> {
 /// than its neighbors, smoothly, since it's a pure function of
 /// `offset`). Applied only at the moment a rect is painted or
 /// hit-tested — never baked back into `ThumbAnim`/`CardAnim::rect`.
-fn displayed_rect(base: RECT, page: usize, offset: f64, pitch: i32, card: RECT) -> RECT {
+pub(crate) fn displayed_rect(base: RECT, page: usize, offset: f64, pitch: i32, card: RECT) -> RECT {
     let dx = (page as f64 - offset) * pitch as f64;
     let s = 1.0 - CARD_UNFOCUS_SHRINK * (page as f64 - offset).abs().min(1.0);
     let cx = (card.left + card.right) as f64 / 2.0 + dx;
@@ -493,7 +493,7 @@ fn displayed_rect(base: RECT, page: usize, offset: f64, pitch: i32, card: RECT) 
 /// Scales `r` about `(anchor_x, anchor_y)` by `s` — the open/close
 /// zoom transform, applied on top of `displayed_rect` at paint time
 /// only (input never round-trips, so no drift).
-fn zoom_rect(r: RECT, anchor_x: f64, anchor_y: f64, s: f64) -> RECT {
+pub(crate) fn zoom_rect(r: RECT, anchor_x: f64, anchor_y: f64, s: f64) -> RECT {
     let map_x = |x: i32| (anchor_x + (x as f64 - anchor_x) * s).round() as i32;
     let map_y = |y: i32| (anchor_y + (y as f64 - anchor_y) * s).round() as i32;
     RECT {
@@ -1088,7 +1088,16 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
         Some(ov.hwnd)
     });
     if let Some(overview_hwnd) = overview_hwnd {
-        repaint_overview(overview_hwnd);
+        let gpu_updated = STATE.with(|s| {
+            let state = s.borrow();
+            let ov = state.as_ref()?.overviews.get(monitor)?;
+            let gpu = ov.gpu.as_ref()?;
+            super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+            Some(())
+        });
+        if gpu_updated.is_none() {
+            repaint_overview(overview_hwnd);
+        }
     }
 }
 
@@ -1148,7 +1157,16 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
         unsafe {
             SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
         }
-        repaint_overview(overview_hwnd);
+        let gpu_updated = STATE.with(|s| {
+            let state = s.borrow();
+            let ov = state.as_ref()?.overviews.get(monitor)?;
+            let gpu = ov.gpu.as_ref()?;
+            super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+            Some(())
+        });
+        if gpu_updated.is_none() {
+            repaint_overview(overview_hwnd);
+        }
     }
 }
 
@@ -2530,32 +2548,37 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         }
 
         let mode = std::mem::replace(&mut ov.mode, OverviewMode::Closed);
-        let (new_mode, fade_alpha, fade_running, completion) = match mode {
+        let (new_mode, fade_alpha, zoom, fade_running, completion) = match mode {
             OverviewMode::Opening { started, thumbs, cards } => {
                 let t = progress(started);
-                let alpha = (ease_out(t) * 255.0).round() as u8;
+                let eased = ease_out(t);
+                let alpha = (eased * 255.0).round() as u8;
+                let zoom = OVERVIEW_ZOOM_MAX + (1.0 - OVERVIEW_ZOOM_MAX) * eased;
                 if t >= 1.0 {
-                    (OverviewMode::Open { thumbs, cards }, Some(255u8), false, Some(Completion::Opened))
+                    (OverviewMode::Open { thumbs, cards }, Some(255u8), 1.0, false, Some(Completion::Opened))
                 } else {
-                    (OverviewMode::Opening { started, thumbs, cards }, Some(alpha), true, None)
+                    (OverviewMode::Opening { started, thumbs, cards }, Some(alpha), zoom, true, None)
                 }
             }
             OverviewMode::Closing { started, thumbs, cards, focus_after } => {
                 let t = progress(started);
-                let alpha = ((1.0 - ease_out(t)) * 255.0).round() as u8;
+                let eased = ease_out(t);
+                let alpha = ((1.0 - eased) * 255.0).round() as u8;
+                let zoom = 1.0 + (OVERVIEW_ZOOM_MAX - 1.0) * eased;
                 if t >= 1.0 {
                     let _ = thumbs;
-                    (OverviewMode::Closed, None, false, Some(Completion::Closed { focus_after }))
+                    (OverviewMode::Closed, None, 1.0, false, Some(Completion::Closed { focus_after }))
                 } else {
                     (
                         OverviewMode::Closing { started, thumbs, cards, focus_after },
                         Some(alpha),
+                        zoom,
                         true,
                         None,
                     )
                 }
             }
-            other => (other, None, false, None),
+            other => (other, None, 1.0, false, None),
         };
         ov.mode = new_mode;
 
@@ -2579,10 +2602,12 @@ pub(crate) fn on_animation_tick(monitor: &str) {
             || card_hover_easing
             || thumb_hover_easing
             || dock_hover_easing;
-        Some((ov.hwnd, fade_alpha, completion, carousel_close_after, keep_timer))
+        Some((ov.hwnd, fade_alpha, zoom, ov.carousel_offset, completion, carousel_close_after, keep_timer))
     });
 
-    let Some((overview_hwnd, fade_alpha, completion, carousel_close_after, keep_timer)) = result else {
+    let Some((overview_hwnd, fade_alpha, zoom, carousel_offset, completion, carousel_close_after, keep_timer)) =
+        result
+    else {
         return;
     };
 
@@ -2596,7 +2621,16 @@ pub(crate) fn on_animation_tick(monitor: &str) {
 
     // Repaint with whatever `carousel_offset`/zoom this tick produced,
     // whether or not the fade alpha changed.
-    repaint_overview(overview_hwnd);
+    let gpu_updated = STATE.with(|s| {
+        let state = s.borrow();
+        let ov = state.as_ref()?.overviews.get(monitor)?;
+        let gpu = ov.gpu.as_ref()?;
+        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, zoom);
+        Some(())
+    });
+    if gpu_updated.is_none() {
+        repaint_overview(overview_hwnd);
+    }
 
     if !keep_timer {
         // SAFETY: `overview_hwnd` is a valid, process-lifetime window.

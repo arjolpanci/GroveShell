@@ -90,7 +90,6 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI
 pub(crate) struct GpuSurface {
     #[allow(dead_code)] // kept alive for as long as the surface must render; never read directly
     target: IDCompositionTarget,
-    #[allow(dead_code)]
     visual: IDCompositionVisual2,
     surface: IDCompositionSurface,
     width: i32,
@@ -104,6 +103,10 @@ impl GpuSurface {
 
     pub(crate) fn height(&self) -> i32 {
         self.height
+    }
+
+    pub(crate) fn visual(&self) -> &IDCompositionVisual2 {
+        &self.visual
     }
 }
 
@@ -153,6 +156,23 @@ pub(crate) fn set_opacity(surface: &GpuSurface, opacity: f32) {
         unsafe {
             if let Ok(visual3) = surface.visual.cast::<IDCompositionVisual3>() {
                 let _ = visual3.SetOpacity2(opacity);
+                let _ = ctx.dcomp_device.Commit();
+            }
+        }
+    });
+}
+
+/// Commits the process-wide compositor device. No-op if the process-wide
+/// GPU setup isn't available. Used by callers that only touched visuals
+/// or transforms directly and didn't already go through `redraw`/
+/// `set_opacity`, both of which commit internally.
+pub(crate) fn commit() {
+    GPU.with(|g| {
+        let g = g.borrow();
+        if let Some(ctx) = g.as_ref() {
+            // SAFETY: `ctx.dcomp_device` is the process-wide device,
+            // alive for the process's life.
+            unsafe {
                 let _ = ctx.dcomp_device.Commit();
             }
         }

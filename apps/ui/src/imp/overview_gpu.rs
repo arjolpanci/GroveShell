@@ -8,6 +8,7 @@
 
 use std::ffi::c_void;
 
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
@@ -18,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL, HICON};
 
 use super::gpu::{self, GpuSurface};
-use super::overview::{CardAnim, ThumbAnim};
+use super::overview::{card_layout, displayed_rect, zoom_rect, CardAnim, ThumbAnim};
 use super::state::{reference_dpi, scaled};
 
 /// One workspace card's own composited surface, at the card's natural
@@ -33,7 +34,6 @@ pub(crate) struct CardVisual {
 /// bar, search panel, and drag ghost; `cards` holds one entry per
 /// current `CardAnim`, kept in sync by `rebuild_cards`.
 pub(crate) struct OverviewGpuState {
-    #[allow(dead_code)] // will be painted into by a later task
     pub(crate) root: GpuSurface,
     pub(crate) cards: Vec<CardVisual>,
 }
@@ -75,6 +75,59 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[C
         rebuilt.push(card_visual);
     }
     state.cards = rebuilt;
+    for card_visual in &state.cards {
+        // SAFETY: both visuals belong to the same `IDCompositionDesktopDevice`;
+        // `root.visual()`/`card_visual.surface.visual()` are alive for as
+        // long as `state` is. `AddVisual` on an already-attached visual is
+        // a harmless no-op.
+        unsafe {
+            let _ = state.root.visual().AddVisual(card_visual.surface.visual(), true, None);
+        }
+    }
+}
+
+/// Applies this tick's carousel position/zoom to every card visual —
+/// the GPU-path replacement for `repaint_overview`'s full redraw.
+/// `card_layout`/`displayed_rect`/`zoom_rect` are the exact same pure
+/// functions `paint_overview` already used; only what happens with
+/// their result changes (a transform instead of a redraw).
+pub(crate) fn update_transforms(gpu: &OverviewGpuState, monitor: &str, carousel_offset: f64, zoom: f64) {
+    let (card_rect, pitch) = card_layout(monitor);
+    let anchor_x = (card_rect.left + card_rect.right) as f64 / 2.0;
+    let anchor_y = (card_rect.top + card_rect.bottom) as f64 / 2.0;
+    for card_visual in &gpu.cards {
+        // The card's surface was created at its own natural rect's
+        // top-left; `displayed_rect`/`zoom_rect` operate in the
+        // overview window's coordinate space, so the transform must
+        // carry both the translate-to-displayed-position *and* the
+        // uniform scale, in that surface-local-origin frame.
+        let base = RECT {
+            left: card_rect.left,
+            top: card_rect.top,
+            right: card_rect.right,
+            bottom: card_rect.bottom,
+        };
+        let displayed = displayed_rect(base, card_visual.page, carousel_offset, pitch, card_rect);
+        let zoomed = zoom_rect(displayed, anchor_x, anchor_y, zoom);
+        let (base_w, base_h) = ((base.right - base.left).max(1) as f32, (base.bottom - base.top).max(1) as f32);
+        let scale_x = (zoomed.right - zoomed.left) as f32 / base_w;
+        let scale_y = (zoomed.bottom - zoomed.top) as f32 / base_h;
+        let matrix = Matrix3x2 {
+            M11: scale_x,
+            M12: 0.0,
+            M21: 0.0,
+            M22: scale_y,
+            M31: zoomed.left as f32,
+            M32: zoomed.top as f32,
+        };
+        // SAFETY: `card_visual.surface.visual()` is alive for as long
+        // as `gpu` is; `SetTransform2` takes a plain matrix pointer,
+        // valid for the duration of this synchronous call.
+        unsafe {
+            let _ = card_visual.surface.visual().SetTransform2(&matrix);
+        }
+    }
+    gpu::commit();
 }
 
 fn rect_to_d2d(r: RECT, origin_x: i32, origin_y: i32) -> D2D_RECT_F {
