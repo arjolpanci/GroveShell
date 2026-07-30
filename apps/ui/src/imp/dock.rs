@@ -123,6 +123,56 @@ thread_local! {
     /// they're simply cached forever rather than churned every time the
     /// overview rebuilds, the same tradeoff `WALLPAPER_BITMAP` makes.
     static PINNED_ICON_CACHE: RefCell<HashMap<PathBuf, isize>> = RefCell::new(HashMap::new());
+
+    /// GroveShell's own pinned-app list — the authoritative source for
+    /// `build_dock_apps`'s pinned entries from now on (see
+    /// `dock_pins.rs`'s module doc for why this isn't the real
+    /// taskbar's pin folder anymore). Loaded once at startup via
+    /// `init_pinned_list`.
+    static PINNED_PATHS: RefCell<Vec<PathBuf>> = RefCell::new(Vec::new());
+}
+
+/// Loads the persisted pinned list (seeding it from the real taskbar's
+/// current pins if this is the first run) into `PINNED_PATHS`. Must run
+/// once, at startup, before the first `build_dock_apps` call.
+pub(crate) fn init_pinned_list() {
+    let Some(path) = super::dock_pins::pins_file_path() else { return };
+    let pins = super::dock_pins::load_or_seed(&path, taskbar_pinned_shortcuts);
+    PINNED_PATHS.with(|p| *p.borrow_mut() = pins);
+}
+
+/// The current pinned list, in order — read by `build_dock_apps`.
+pub(crate) fn pinned_paths() -> Vec<PathBuf> {
+    PINNED_PATHS.with(|p| p.borrow().clone())
+}
+
+fn persist_pinned_paths(pins: &[PathBuf]) {
+    if let Some(path) = super::dock_pins::pins_file_path() {
+        super::dock_pins::save(&path, pins);
+    }
+}
+
+/// Adds `path` to the end of the pinned list (a no-op if already
+/// pinned) and persists it.
+pub(crate) fn pin_app(path: PathBuf) {
+    PINNED_PATHS.with(|p| {
+        let mut pins = p.borrow_mut();
+        if !pins.contains(&path) {
+            pins.push(path);
+            persist_pinned_paths(&pins);
+        }
+    });
+}
+
+/// Removes `path` from the pinned list, if present, and persists it.
+pub(crate) fn unpin_app(path: &Path) {
+    PINNED_PATHS.with(|p| {
+        let mut pins = p.borrow_mut();
+        if let Some(i) = pins.iter().position(|p| p == path) {
+            pins.remove(i);
+            persist_pinned_paths(&pins);
+        }
+    });
 }
 
 /// Icon for any file path, via `SHGetFileInfoW` — cached forever per
@@ -203,7 +253,7 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
     let mut apps = Vec::new();
     let mut claimed = vec![false; live.len()];
 
-    for lnk in taskbar_pinned_shortcuts() {
+    for lnk in pinned_paths() {
         if apps.len() >= DOCK_MAX_APPS {
             break;
         }

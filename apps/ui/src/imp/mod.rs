@@ -135,6 +135,9 @@ pub fn main() -> Result<()> {
     // never retried or re-evaluated.
     gpu::init();
 
+    // Must run before the first overview's dock is built.
+    dock::init_pinned_list();
+
     // SAFETY: every Win32 call below either has a call-site safety
     // comment or is a plain value/query with no aliasing or lifetime
     // requirements (e.g. `GetSystemMetrics`).
