@@ -474,6 +474,7 @@ version = "0.1.0"
 dependencies = [
  "groveshell-common",
  "groveshell-config",
+ "groveshell-ipc",
  "groveshell-window-model",
  "serde",
  "serde_json",

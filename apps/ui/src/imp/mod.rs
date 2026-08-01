@@ -113,6 +113,8 @@ pub fn main() -> Result<()> {
     let config = groveshell_config::load_or_default(&config_path);
     tracing::info!(?config, "configuration loaded");
 
+    std::thread::spawn(config_reload_listener);
+
     let _job = groveshell_common::jobobject::ShellJob::create_and_join()?;
     tracing::info!("joined shell job object");
 
@@ -242,9 +244,7 @@ pub fn main() -> Result<()> {
             let _ = DeleteObject(top_square);
             SetWindowRgn(bar_hwnd, region, true);
 
-            if config.appearance.top_bar_blur {
-                enable_blur_behind(bar_hwnd);
-            }
+            set_blur_behind(bar_hwnd, config.appearance.top_bar_blur);
 
             bars.push(BarWindow {
                 hwnd: bar_hwnd,
@@ -302,9 +302,7 @@ pub fn main() -> Result<()> {
                 None,
             )
             .map_err(Error::Windows)?;
-            if config.appearance.overview_blur {
-                enable_blur_behind(overview_hwnd);
-            }
+            set_blur_behind(overview_hwnd, config.appearance.overview_blur);
             overviews.insert(
                 monitor.device_name.clone(),
                 overview::OverviewInstance::new(overview_hwnd, width, height),
@@ -407,6 +405,7 @@ pub fn main() -> Result<()> {
             .map(|m| m.device_name.clone())
             .unwrap_or_else(|| monitors[0].device_name.clone());
 
+        state::set_primary_bar_hwnd(primary_bar_hwnd);
         STATE.with(|s| {
             *s.borrow_mut() = Some(AppState {
                 bars,
@@ -483,22 +482,67 @@ unsafe fn register_class(
     Ok(())
 }
 
-/// Enables the simplest DWM blur-behind for `hwnd` — matches BlurMyShell's
-/// simplest "blur what's behind" mode, not a Mica/acrylic material (see
-/// the design doc's explicit scope decision). Best-effort: failure just
-/// means no blur, same treatment as every other cosmetic Win32 call in
-/// this file.
-fn enable_blur_behind(hwnd: HWND) {
+/// Enables or disables the simplest DWM blur-behind for `hwnd` — see
+/// Task 13's original doc comment on `enable_blur_behind` for why this
+/// isn't a Mica/acrylic material. `enabled = false` sends `fEnable =
+/// false`, which is the documented way to turn blur-behind back off,
+/// unlike simply not calling this function again.
+fn set_blur_behind(hwnd: HWND, enabled: bool) {
     use windows::Win32::Graphics::Dwm::{DwmEnableBlurBehindWindow, DWM_BLURBEHIND, DWM_BB_ENABLE};
     let bb = DWM_BLURBEHIND {
         dwFlags: DWM_BB_ENABLE,
-        fEnable: true.into(),
+        fEnable: enabled.into(),
         ..Default::default()
     };
-    // SAFETY: `hwnd` is a valid, just-created window; `bb` is a local
-    // outliving this synchronous call.
+    // SAFETY: `hwnd` is caller-supplied and must be a valid window (both
+    // call sites — startup and live reload — satisfy this); `bb` is a
+    // local outliving this synchronous call.
     unsafe {
         let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
+    }
+}
+
+/// Not a real Win32-defined message; app-private, matching the pattern
+/// `apps/settings/src/imp/tray.rs`'s `WM_TRAYICON` uses.
+const WM_APP_CONFIG_RELOADED: u32 = WM_APP + 1;
+
+/// Binds the `groveshell-ui` pipe and, on each `config.reload` message,
+/// reloads `config.toml` and posts `WM_APP_CONFIG_RELOADED` to the
+/// primary bar's window so the actual re-apply happens on the main
+/// thread. Mirrors `apps/host`'s `serve_ping` shape (bind-accept loop,
+/// one thread per connection) but only ever expects this one message
+/// type.
+fn config_reload_listener() {
+    loop {
+        let conn = match groveshell_ipc::pipe::bind_and_accept("groveshell-ui") {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to bind groveshell-ui pipe; retrying");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        std::thread::spawn(move || handle_config_reload_connection(conn));
+    }
+}
+
+fn handle_config_reload_connection(mut conn: std::fs::File) {
+    let Ok(request) = groveshell_ipc::framing::read_envelope(&mut conn) else { return };
+    if request.message_type != groveshell_ipc::message_type::CONFIG_RELOAD {
+        return;
+    }
+    // Deliberately `state::primary_bar_hwnd()` (a plain atomic), not
+    // `STATE.with(...)`: this runs on a pipe-connection thread, and
+    // `STATE` is thread-local to the UI thread — reading it here would
+    // silently and permanently see `None` instead of the real value. See
+    // `state::PRIMARY_BAR_HWND`'s doc comment.
+    if let Some(hwnd) = state::primary_bar_hwnd() {
+        // SAFETY: `hwnd` is a valid, process-lifetime window; posting a
+        // message across threads is the documented, safe way to hand
+        // work back to a window's owning thread.
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_APP_CONFIG_RELOADED, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -709,6 +753,40 @@ unsafe extern "system" fn wndproc(
                 }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_APP_CONFIG_RELOADED => {
+            let config_path = groveshell_common::paths::data_dir()
+                .map(|d| d.join("config.toml"));
+            if let Ok(path) = config_path {
+                let new_config = groveshell_config::load_or_default(&path);
+                tracing::info!(config = ?new_config, "config.reload: reapplying");
+                STATE.with(|s| {
+                    if let Some(state) = s.borrow_mut().as_mut() {
+                        state.config = new_config;
+                    }
+                });
+                // Re-run blur (idempotent: re-enabling an already-enabled
+                // blur, or "enabling" with fEnable now false via a second
+                // DwmEnableBlurBehindWindow call, both work correctly).
+                let (bars_snapshot, overviews_snapshot, blur_bar, blur_overview) = STATE.with(|s| {
+                    let state = s.borrow();
+                    let st = state.as_ref();
+                    (
+                        st.map(|st| st.bars.iter().map(|b| b.hwnd).collect::<Vec<_>>()).unwrap_or_default(),
+                        st.map(|st| st.overviews.values().map(|o| o.hwnd).collect::<Vec<_>>()).unwrap_or_default(),
+                        st.map(|st| st.config.appearance.top_bar_blur).unwrap_or(false),
+                        st.map(|st| st.config.appearance.overview_blur).unwrap_or(false),
+                    )
+                });
+                for bar_hwnd in &bars_snapshot {
+                    set_blur_behind(*bar_hwnd, blur_bar);
+                    let _ = InvalidateRect(*bar_hwnd, None, true);
+                }
+                for overview_hwnd in &overviews_snapshot {
+                    set_blur_behind(*overview_hwnd, blur_overview);
+                }
+            }
+            LRESULT(0)
         }
         WM_HOTKEY => {
             match wparam.0 as i32 {

@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::{HWND, RECT};
 
@@ -85,6 +86,35 @@ pub(crate) struct AppState {
 
 thread_local! {
     pub(crate) static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
+}
+
+/// The current primary bar's `HWND`, mirrored outside the thread-local
+/// `STATE` cell (0 means "not yet known") so background threads — namely
+/// `config_reload_listener`'s pipe-listener thread — can read it without
+/// touching `STATE`'s `RefCell`, which belongs exclusively to the UI
+/// thread. `STATE.with` from a non-UI thread wouldn't panic, but it also
+/// wouldn't see the UI thread's data: thread-locals are per-thread
+/// storage, so the pipe thread would silently and permanently read back
+/// `None` instead of the real value. Kept in sync with
+/// `AppState::primary_bar_hwnd` at every write site (initial startup in
+/// `main`, and `hotplug::reconcile_monitors`'s primary-promotion path)
+/// via `set_primary_bar_hwnd`.
+static PRIMARY_BAR_HWND: AtomicIsize = AtomicIsize::new(0);
+
+/// Updates the cross-thread mirror of the primary bar's `HWND`. Call
+/// this every time `AppState::primary_bar_hwnd` is written.
+pub(crate) fn set_primary_bar_hwnd(hwnd: HWND) {
+    PRIMARY_BAR_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+}
+
+/// Reads the cross-thread mirror of the primary bar's `HWND`. Safe to
+/// call from any thread, including background IPC-listener threads that
+/// must never touch `STATE` directly.
+pub(crate) fn primary_bar_hwnd() -> Option<HWND> {
+    match PRIMARY_BAR_HWND.load(Ordering::Relaxed) {
+        0 => None,
+        raw => Some(HWND(raw as *mut std::ffi::c_void)),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -82,6 +82,7 @@ pub(crate) fn reconcile_monitors(hinstance: HINSTANCE) -> Result<()> {
                 if let Some(bar) = state.bars.iter().find(|b| b.monitor == primary.device_name) {
                     state.primary_bar_hwnd = bar.hwnd;
                     state.primary_bar_rect = bar.rect;
+                    super::state::set_primary_bar_hwnd(bar.hwnd);
                 }
             }
         }
