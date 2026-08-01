@@ -1,5 +1,6 @@
 //! Process bootstrap for `groveshell-settings`.
 
+mod health;
 mod process;
 mod tray;
 mod window;
