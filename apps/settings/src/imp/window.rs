@@ -77,6 +77,7 @@ pub(crate) fn open_settings_window() {
             WINDOW_HWND.with(|w| *w.borrow_mut() = Some(hwnd));
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
+            windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, 1, 2000, None);
         }
     }
 }
@@ -130,6 +131,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
                 // Tasks 15-18 add the remaining `selected == 1..=4` arms here.
             }
+            let _ = InvalidateRect(hwnd, None, true);
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER => {
             let _ = InvalidateRect(hwnd, None, true);
             LRESULT(0)
         }
