@@ -54,11 +54,30 @@ fn acquire_single_instance_lock() -> Result<SingleInstanceGuard> {
     // SAFETY: `GetLastError` reads thread-local state set by the
     // immediately preceding `CreateMutexW` call above, which succeeded.
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        tracing::info!("another groveshell-settings instance is already running; exiting");
+        tracing::info!("another groveshell-settings instance is already running; asking it to show its window");
+        request_existing_instance_show_window();
         std::process::exit(0);
     }
 
     Ok(SingleInstanceGuard(handle))
+}
+
+/// Best-effort: asks whichever instance holds the single-instance mutex
+/// to show its settings window, so a second launch (a stray
+/// `groveshell-settings.exe`, or `apps/ui`'s top-bar settings button)
+/// actually does something visible instead of silently exiting. If the
+/// pipe isn't reachable for any reason, this just gives up — the running
+/// instance's tray icon is still there as a fallback.
+fn request_existing_instance_show_window() {
+    let Ok(mut conn) = groveshell_ipc::pipe::connect("groveshell-settings") else {
+        return;
+    };
+    let envelope = groveshell_ipc::Envelope::new(
+        "groveshell-settings",
+        groveshell_ipc::message_type::SETTINGS_SHOW,
+        serde_json::json!({}),
+    );
+    let _ = groveshell_ipc::framing::write_envelope(&mut conn, &envelope);
 }
 
 struct SingleInstanceGuard(windows::Win32::Foundation::HANDLE);

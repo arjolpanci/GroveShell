@@ -50,6 +50,13 @@ pub mod message_type {
     /// trusting an embedded copy, so this message can never carry a
     /// version that's already stale by the time it's read.
     pub const CONFIG_RELOAD: &str = "config.reload";
+    /// Sent to the `groveshell-settings` pipe to ask the already-running
+    /// instance to open (or foreground) its settings window. Sent by a
+    /// second `groveshell-settings.exe` launch that lost the
+    /// single-instance mutex race (instead of just silently exiting), and
+    /// by `apps/ui`'s top-bar settings button. No payload, no response
+    /// expected — the sender doesn't wait for one.
+    pub const SETTINGS_SHOW: &str = "settings.show";
 }
 
 #[cfg(test)]
@@ -59,5 +66,10 @@ mod tests {
     #[test]
     fn config_reload_message_type_is_stable() {
         assert_eq!(message_type::CONFIG_RELOAD, "config.reload");
+    }
+
+    #[test]
+    fn settings_show_message_type_is_stable() {
+        assert_eq!(message_type::SETTINGS_SHOW, "settings.show");
     }
 }
