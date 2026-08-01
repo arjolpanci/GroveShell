@@ -1,6 +1,8 @@
 //! Process bootstrap for `groveshell-settings`.
 
 mod process;
+mod tray;
+mod window;
 
 use groveshell_common::Result;
 use process::ManagedProcesses;
@@ -22,14 +24,7 @@ pub fn run() -> Result<()> {
     let mut processes = ManagedProcesses::new();
     processes.spawn_all();
 
-    // Task 6 replaces this with a real Win32 message loop driving the
-    // tray icon; for now, idle so the spawned children keep running under
-    // this process's supervision (and this process's own exit, e.g.
-    // Ctrl+C in a foreground dev run, doesn't leave them behind untracked
-    // — Task 6's WM_DESTROY-equivalent handles a clean stop).
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
-    }
+    tray::run_message_loop(processes)
 }
 
 /// Acquires a session-local named mutex so at most one `groveshell-settings`
