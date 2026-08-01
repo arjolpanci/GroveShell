@@ -2,7 +2,7 @@
 //! `groveshell-settings.exe` at login — the process that then launches
 //! everything else (see Task 5), not `groveshell-host` directly.
 
-use windows::core::{w, PCWSTR};
+use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
     KEY_READ, KEY_WRITE, REG_SZ,
@@ -91,6 +91,3 @@ pub fn set_enabled(enabled: bool) {
     // this point.
     unsafe { let _ = RegCloseKey(key); }
 }
-
-#[allow(unused_imports)]
-use w as _; // silences an unused-import lint if `w!` ends up unused on some feature combination

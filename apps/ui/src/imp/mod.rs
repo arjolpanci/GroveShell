@@ -67,7 +67,7 @@ use quick_settings::{
     QS_WIDTH,
 };
 use state::{
-    role_of, scaled, AppState, BarWindow, Role, ANIM_TIMER_ID, BAR_CORNER_RADIUS,
+    role_of, scaled, AppState, BarWindow, Role, ANIM_TIMER_ID, BAR_CORNER_RADIUS, BAR_HEIGHT,
     CLOCK_TIMER_ID, STATE,
 };
 use taskbar::{
@@ -768,22 +768,56 @@ unsafe extern "system" fn wndproc(
                 // Re-run blur (idempotent: re-enabling an already-enabled
                 // blur, or "enabling" with fEnable now false via a second
                 // DwmEnableBlurBehindWindow call, both work correctly).
-                let (bars_snapshot, overviews_snapshot, blur_bar, blur_overview) = STATE.with(|s| {
+                let (bars_snapshot, overviews_snapshot, blur_bar, blur_overview, new_bar_height) = STATE.with(|s| {
                     let state = s.borrow();
                     let st = state.as_ref();
                     (
-                        st.map(|st| st.bars.iter().map(|b| b.hwnd).collect::<Vec<_>>()).unwrap_or_default(),
+                        st.map(|st| st.bars.iter().map(|b| (b.hwnd, b.rect)).collect::<Vec<_>>()).unwrap_or_default(),
                         st.map(|st| st.overviews.values().map(|o| o.hwnd).collect::<Vec<_>>()).unwrap_or_default(),
                         st.map(|st| st.config.appearance.top_bar_blur).unwrap_or(false),
                         st.map(|st| st.config.appearance.overview_blur).unwrap_or(false),
+                        st.map(|st| st.config.appearance.top_bar_height).unwrap_or(BAR_HEIGHT as u32),
                     )
                 });
-                for bar_hwnd in &bars_snapshot {
+                for (bar_hwnd, bar_rect) in &bars_snapshot {
                     set_blur_behind(*bar_hwnd, blur_bar);
+
+                    // Resize the live bar window to the new height: keep
+                    // its existing x/y/width (the AppBar-assigned rect
+                    // from creation, mirrored in `BarWindow::rect`), only
+                    // change the height. Uses this bar's own monitor's
+                    // DPI, since different monitors can be scaled
+                    // differently — mirrors the creation-time
+                    // `scaled(config.appearance.top_bar_height, monitor.dpi)`
+                    // math in `main()`.
+                    let dpi = GetDpiForWindow(*bar_hwnd).max(96);
+                    let region_w = bar_rect.right - bar_rect.left;
+                    let region_h = scaled(new_bar_height as i32, dpi);
+                    let _ = SetWindowPos(
+                        *bar_hwnd,
+                        None,
+                        0,
+                        0,
+                        region_w,
+                        region_h,
+                        SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+
+                    // Recompute the rounded-bottom-corners region the same
+                    // way the creation path does (see `main`'s bar-creation
+                    // loop) — the old region was sized for the old height.
+                    let radius = scaled(BAR_CORNER_RADIUS, dpi);
+                    let region = CreateRoundRectRgn(0, 0, region_w + 1, region_h + 1, radius * 2, radius * 2);
+                    let top_square = CreateRectRgn(0, 0, region_w + 1, (region_h - radius).max(0));
+                    CombineRgn(region, region, top_square, RGN_OR);
+                    let _ = DeleteObject(top_square);
+                    SetWindowRgn(*bar_hwnd, region, true);
+
                     let _ = InvalidateRect(*bar_hwnd, None, true);
                 }
                 for overview_hwnd in &overviews_snapshot {
                     set_blur_behind(*overview_hwnd, blur_overview);
+                    let _ = InvalidateRect(*overview_hwnd, None, true);
                 }
             }
             LRESULT(0)
