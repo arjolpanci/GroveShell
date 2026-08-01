@@ -183,7 +183,16 @@ fn show_context_menu(hwnd: HWND) {
             MENU_ID_OPEN => super::window::open_settings_window(),
             MENU_ID_TOGGLE => toggle_groveshell(),
             MENU_ID_EXIT => {
-                toggle_groveshell(); // stops everything if running; no-op if already stopped
+                // Always stop, never start: `stop_all` is a safe no-op when
+                // nothing is running (its callees early-return on a `None`
+                // tracked child), unlike `toggle_groveshell`, which would
+                // spawn fresh, now-unsupervised processes if GroveShell were
+                // already stopped.
+                PROCESSES.with(|p| {
+                    if let Some(proc) = p.borrow_mut().as_mut() {
+                        proc.stop_all();
+                    }
+                });
                 PostQuitMessage(0);
             }
             _ => {}
