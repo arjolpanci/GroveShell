@@ -424,12 +424,20 @@ fn corner_hit(pt: POINT, m: &RECT) -> Option<usize> {
 /// `"none"`, matching how `apps/settings`'s Input page defaults an
 /// absent entry — the only other action this UI currently offers is
 /// `"activities"`.
+/// Whether corner `index` should open the overview. A corner with an
+/// explicit `HotCornerConfig` entry always follows its configured
+/// `action`. A corner with *no* entry — the default, empty-map state for
+/// every fresh install and every pre-existing `config.toml` written
+/// before hot corners became configurable — falls back to this feature's
+/// original, unconfigurable behavior: only the top-left corner was ever
+/// active. Defaulting every corner to inactive here would silently turn
+/// hot corners off for everyone until they found the (currently
+/// hard-to-reach) settings page and configured it by hand.
 fn corner_action_is_activities(config: &groveshell_config::Config, index: usize) -> bool {
-    config
-        .hot_corners
-        .get(CORNER_KEYS[index])
-        .map(|c| c.action == "activities")
-        .unwrap_or(false)
+    match config.hot_corners.get(CORNER_KEYS[index]) {
+        Some(c) => c.action == "activities",
+        None => CORNER_KEYS[index] == "top_left",
+    }
 }
 
 pub(crate) fn check_hot_corners() {
@@ -514,8 +522,32 @@ mod tests {
     }
 
     #[test]
-    fn corner_action_defaults_to_none_when_entry_missing() {
+    fn corner_action_defaults_top_left_to_activities_when_entry_missing() {
+        // Backward compat: top-left was always active before hot corners
+        // became configurable, and the config map is empty by default.
         let config = groveshell_config::Config::default();
+        assert!(corner_action_is_activities(&config, 0));
+    }
+
+    #[test]
+    fn corner_action_defaults_other_corners_to_none_when_entry_missing() {
+        let config = groveshell_config::Config::default();
+        assert!(!corner_action_is_activities(&config, 1)); // top_right
+        assert!(!corner_action_is_activities(&config, 2)); // bottom_left
+        assert!(!corner_action_is_activities(&config, 3)); // bottom_right
+    }
+
+    #[test]
+    fn corner_action_explicit_none_overrides_the_top_left_default() {
+        let mut config = groveshell_config::Config::default();
+        config.hot_corners.insert(
+            "top_left".to_string(),
+            groveshell_config::HotCornerConfig {
+                action: "none".to_string(),
+                delay_ms: 150,
+                disable_in_fullscreen: true,
+            },
+        );
         assert!(!corner_action_is_activities(&config, 0));
     }
 
