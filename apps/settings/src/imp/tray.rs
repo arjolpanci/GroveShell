@@ -1,6 +1,7 @@
 //! The system tray icon and its right-click context menu.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
@@ -11,7 +12,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, LoadCursorW, LoadImageW, PostQuitMessage,
+    GetCursorPos, GetMessageW, LoadCursorW, LoadImageW, PostMessageW, PostQuitMessage,
     SetForegroundWindow, TrackPopupMenu, TranslateMessage, IDC_ARROW, IMAGE_ICON, LR_DEFAULTSIZE,
     MF_STRING, MSG, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WM_APP, WM_DESTROY,
     WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
@@ -20,6 +21,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::process::ManagedProcesses;
 
 pub(crate) const WM_TRAYICON: u32 = WM_APP + 1;
+/// Posted (from `settings_pipe_listener`'s spawned thread, via
+/// `PostMessageW` — never a direct Win32 call off the UI thread, same
+/// rule `apps/ui`'s `config_reload_listener` follows) when another
+/// process asks this already-running instance to show its settings
+/// window, instead of spawning a second, redundant one.
+const WM_SETTINGS_SHOW: u32 = WM_APP + 2;
 const MENU_ID_OPEN: u32 = 1;
 const MENU_ID_TOGGLE: u32 = 2;
 const MENU_ID_EXIT: u32 = 3;
@@ -27,6 +34,12 @@ const MENU_ID_EXIT: u32 = 3;
 thread_local! {
     static PROCESSES: RefCell<Option<ManagedProcesses>> = const { RefCell::new(None) };
 }
+
+/// Mirrors the tray window's `HWND` outside any thread-local, so
+/// `settings_pipe_listener`'s spawned thread can `PostMessageW` to it —
+/// same pattern and same reasoning as `apps/ui/src/imp/state.rs`'s
+/// `PRIMARY_BAR_HWND`.
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 
 /// Loads the icon this exe embedded as resource ID 1 (see `build.rs`) at
 /// the small size appropriate for a tray icon / window class icon.
@@ -91,6 +104,8 @@ pub fn run_message_loop(processes: ManagedProcesses) -> groveshell_common::Resul
         .map_err(groveshell_common::Error::Windows)?;
 
         add_tray_icon(hwnd);
+        TRAY_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+        std::thread::spawn(settings_pipe_listener);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -118,6 +133,43 @@ fn add_tray_icon(hwnd: HWND) {
     // the duration of this synchronous call.
     unsafe {
         let _ = Shell_NotifyIconW(NIM_ADD, &data);
+    }
+}
+
+/// Binds the `groveshell-settings` pipe and, on each `settings.show`
+/// message, posts `WM_SETTINGS_SHOW` to the tray window so the actual
+/// window-open call happens on the UI thread. Mirrors
+/// `apps/ui/src/imp/mod.rs`'s `config_reload_listener` shape exactly.
+fn settings_pipe_listener() {
+    loop {
+        let conn = match groveshell_ipc::pipe::bind_and_accept("groveshell-settings") {
+            Ok(conn) => conn,
+            Err(e) => {
+                tracing::error!(error = ?e, "failed to bind groveshell-settings pipe; retrying");
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+        std::thread::spawn(move || handle_settings_show_connection(conn));
+    }
+}
+
+fn handle_settings_show_connection(mut conn: std::fs::File) {
+    let Ok(request) = groveshell_ipc::framing::read_envelope(&mut conn) else { return };
+    if request.message_type != groveshell_ipc::message_type::SETTINGS_SHOW {
+        return;
+    }
+    let raw = TRAY_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut std::ffi::c_void);
+    // SAFETY: `hwnd` is a valid, process-lifetime window (set once, right
+    // after creation, before this thread is spawned); posting a message
+    // across threads is the documented, safe way to hand work back to a
+    // window's owning thread.
+    unsafe {
+        let _ = PostMessageW(hwnd, WM_SETTINGS_SHOW, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -213,6 +265,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             } else if event == WM_RBUTTONUP {
                 show_context_menu(hwnd);
             }
+            LRESULT(0)
+        }
+        WM_SETTINGS_SHOW => {
+            super::window::open_settings_window();
             LRESULT(0)
         }
         WM_DESTROY => {

@@ -37,6 +37,15 @@ const QS_ICON_GAP: i32 = 10;
 const QS_PILL_RADIUS: i32 = 10;
 const QS_PILL_RIGHT_MARGIN: i32 = 10;
 
+/// The settings-gear glyph that opens `groveshell-settings`'s settings
+/// window — the only way to reach it once this bar has hidden the real
+/// Windows taskbar (and, with it, the system tray `groveshell-settings`
+/// would otherwise show its own icon in). Sits just left of the status
+/// pill, same row.
+const SETTINGS_GLYPH: &str = "\u{2699}"; // U+2699 GEAR
+const SETTINGS_BUTTON_WIDTH: i32 = 20;
+const SETTINGS_BUTTON_GAP: i32 = 6;
+
 /// The status pill's own rect and its three icon slots, in physical
 /// pixels at `dpi` — a pure function of `bar_width`/`dpi` so painting
 /// and hit-testing can never disagree, same pattern as the overview's
@@ -61,6 +70,20 @@ fn qs_pill_layout(bar_width: i32, dpi: u32, bar_h: i32) -> (RECT, [RECT; 3]) {
         *slot = RECT { left, top: icon_top, right: left + icon, bottom: icon_top + icon };
     }
     (pill, slots)
+}
+
+/// The settings button's rect, just left of the status pill — a pure
+/// function of the pill's own rect so painting and hit-testing can
+/// never disagree, same pattern as `qs_pill_layout`.
+fn settings_button_rect(pill: RECT, dpi: u32, bar_h: i32) -> RECT {
+    let w = scaled(SETTINGS_BUTTON_WIDTH, dpi);
+    let gap = scaled(SETTINGS_BUTTON_GAP, dpi);
+    RECT {
+        left: pill.left - gap - w,
+        top: 0,
+        right: pill.left - gap,
+        bottom: bar_h,
+    }
 }
 
 /// Hit-test region for the painted (not native controls — there isn't
@@ -225,6 +248,9 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
             draw_icon(hdc, slots[1], vol_icon, glyph_color);
             let (pct, charging) = battery_status().unwrap_or((100, false));
             draw_icon(hdc, slots[2], battery_icon(pct, charging), glyph_color);
+
+            let settings_rect = settings_button_rect(pill, dpi, bar_h);
+            draw_text_in(hdc, settings_rect, SETTINGS_GLYPH, format);
         }
 
         SelectObject(hdc, previous_font);
@@ -291,6 +317,42 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
     let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
     if (pill.left..pill.right).contains(&x) {
         toggle_quick_settings();
+        return;
+    }
+
+    let settings_rect = settings_button_rect(pill, dpi, bar_h);
+    if (settings_rect.left..settings_rect.right).contains(&x) {
+        open_settings_app();
+    }
+}
+
+/// Opens `groveshell-settings`'s settings window: asks an already-running
+/// instance to show it over IPC, or launches a fresh one if none is
+/// running. A freshly launched instance detects `ui` is already up (see
+/// `apps/settings/src/imp/process.rs`'s `groveshell_already_running`) and
+/// skips spawning a duplicate watchdog/host/ui trio — so this is safe to
+/// call regardless of whether GroveShell was originally started via
+/// `groveshell-settings.exe` or `scripts/dev-start.ps1`.
+fn open_settings_app() {
+    if let Ok(mut conn) = groveshell_ipc::pipe::connect("groveshell-settings") {
+        let envelope = groveshell_ipc::Envelope::new(
+            "groveshell-ui",
+            groveshell_ipc::message_type::SETTINGS_SHOW,
+            serde_json::json!({}),
+        );
+        if groveshell_ipc::framing::write_envelope(&mut conn, &envelope).is_ok() {
+            return;
+        }
+    }
+
+    let Ok(mut exe) = std::env::current_exe() else {
+        tracing::error!("could not resolve current_exe to find groveshell-settings.exe");
+        return;
+    };
+    exe.pop();
+    exe.push("groveshell-settings.exe");
+    if let Err(e) = std::process::Command::new(&exe).spawn() {
+        tracing::error!(error = ?e, path = ?exe, "failed to launch groveshell-settings.exe");
     }
 }
 
