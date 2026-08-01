@@ -82,13 +82,27 @@ pub fn sample_process(pid: u32) -> Option<ProcessSample> {
         ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
     }
 
+    // RAII guard so `handle` is closed on every return path, including the
+    // early `?` returns below if the target process exits mid-sample.
+    struct HandleGuard(windows::Win32::Foundation::HANDLE);
+
+    impl Drop for HandleGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was opened by `OpenProcess` below and is
+            // owned exclusively by this guard.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
     // SAFETY: `pid` is caller-supplied; `OpenProcess` documented-fails
     // (returns `Err`) for an invalid or inaccessible pid rather than
     // aliasing anything.
-    let handle = unsafe {
-        OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid)
-    }
-    .ok()?;
+    let handle = HandleGuard(
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid) }
+            .ok()?,
+    );
 
     let read_times = |h: windows::Win32::Foundation::HANDLE| -> Option<(u64, u64)> {
         let (mut creation, mut exit, mut kernel, mut user) =
@@ -99,9 +113,9 @@ pub fn sample_process(pid: u32) -> Option<ProcessSample> {
         Some((filetime_to_u64(kernel), filetime_to_u64(user)))
     };
 
-    let (kernel_before, user_before) = read_times(handle)?;
+    let (kernel_before, user_before) = read_times(handle.0)?;
     std::thread::sleep(Duration::from_millis(200));
-    let (kernel_after, user_after) = read_times(handle)?;
+    let (kernel_after, user_after) = read_times(handle.0)?;
 
     let mut counters = PROCESS_MEMORY_COUNTERS {
         cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
@@ -110,16 +124,13 @@ pub fn sample_process(pid: u32) -> Option<ProcessSample> {
     // SAFETY: `handle` is still valid; `counters` is a local outliving
     // the call.
     let working_set_bytes = unsafe {
-        GetProcessMemoryInfo(handle, &mut counters, counters.cb)
+        GetProcessMemoryInfo(handle.0, &mut counters, counters.cb)
     }
     .map(|_| counters.WorkingSetSize as u64)
     .unwrap_or(0);
 
-    // SAFETY: `handle` was opened by this function and is not used past
-    // this point.
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
+    // `handle`'s `Drop` impl closes the underlying HANDLE when it goes out
+    // of scope at the end of this function (or on any earlier `?` return).
 
     Some(ProcessSample {
         pid,
