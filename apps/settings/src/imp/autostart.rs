@@ -62,11 +62,16 @@ pub fn set_enabled(enabled: bool) {
 
     if enabled {
         let Ok(exe_path) = std::env::current_exe() else {
+            // SAFETY: `key` was opened by this function and is not used past
+            // this point.
             unsafe { let _ = RegCloseKey(key); }
             return;
         };
         let quoted = format!("\"{}\"", exe_path.display());
         let value: Vec<u16> = quoted.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `value` is a live Vec<u16>; reinterpreting as &[u8] with
+        // length doubled is valid because each u16 is 2 bytes. The slice is
+        // used synchronously and does not outlive `value`.
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(value.as_ptr() as *const u8, value.len() * 2)
         };
