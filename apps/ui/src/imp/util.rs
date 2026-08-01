@@ -51,7 +51,16 @@ pub(crate) fn ease_out(t: f64) -> f64 {
 }
 
 pub(crate) fn progress_dur(started: std::time::Instant, duration: std::time::Duration) -> f64 {
-    (started.elapsed().as_secs_f64() / duration.as_secs_f64()).min(1.0)
+    let (scale, reduced) = super::state::STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|st| (st.config.appearance.animation_scale, st.config.appearance.reduced_motion))
+    }).unwrap_or((1.0, false));
+    if reduced {
+        return 1.0; // instant: always report "animation complete"
+    }
+    let effective_duration = duration.mul_f32(scale.max(0.01));
+    (started.elapsed().as_secs_f64() / effective_duration.as_secs_f64()).min(1.0)
 }
 
 pub(crate) fn progress(started: std::time::Instant) -> f64 {

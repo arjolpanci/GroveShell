@@ -67,7 +67,7 @@ use quick_settings::{
     QS_WIDTH,
 };
 use state::{
-    role_of, scaled, AppState, BarWindow, Role, ANIM_TIMER_ID, BAR_CORNER_RADIUS, BAR_HEIGHT,
+    role_of, scaled, AppState, BarWindow, Role, ANIM_TIMER_ID, BAR_CORNER_RADIUS,
     CLOCK_TIMER_ID, STATE,
 };
 use taskbar::{
@@ -108,6 +108,10 @@ pub fn main() -> Result<()> {
 
     let _log_guard = groveshell_common::logging::init("ui")?;
     tracing::info!("groveshell-ui starting");
+
+    let config_path = groveshell_common::paths::data_dir()?.join("config.toml");
+    let config = groveshell_config::load_or_default(&config_path);
+    tracing::info!(?config, "configuration loaded");
 
     let _job = groveshell_common::jobobject::ShellJob::create_and_join()?;
     tracing::info!("joined shell job object");
@@ -192,7 +196,7 @@ pub fn main() -> Result<()> {
         let mut bars = Vec::new();
         for monitor in &monitors {
             let width = monitor.rect.right - monitor.rect.left;
-            let bar_height = scaled(BAR_HEIGHT, monitor.dpi);
+            let bar_height = scaled(config.appearance.top_bar_height as i32, monitor.dpi);
             let bar_hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 w!("GroveShellBar"),
@@ -399,6 +403,7 @@ pub fn main() -> Result<()> {
         STATE.with(|s| {
             *s.borrow_mut() = Some(AppState {
                 bars,
+                config,
                 primary_bar_hwnd,
                 primary_bar_rect,
                 primary_monitor,

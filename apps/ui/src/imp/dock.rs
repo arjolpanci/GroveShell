@@ -99,10 +99,26 @@ pub(crate) fn pinned_count(apps: &[DockApp]) -> usize {
 /// changes either. `pinned_count` must be the number of the first
 /// `pinned_count` slots (by index) that are pinned entries — the rest
 /// are running-unpinned, matching `pinned_count()`'s own contract.
+/// The dock bar's left edge given a work area's horizontal span, the
+/// bar's total content width, and a horizontal alignment — "left"/"right"
+/// hug the work area's exact edge; any unrecognized alignment string
+/// falls back to "center" rather than panicking, since `Config::validate()`
+/// is the actual gate on invalid values and this function must stay total.
+pub(crate) fn anchor_x(work_area_left: i32, work_area_right: i32, content_w: i32, alignment: &str) -> i32 {
+    match alignment {
+        "left" => work_area_left,
+        "right" => (work_area_right - content_w).max(work_area_left),
+        _ => (work_area_left + work_area_right) / 2 - content_w / 2,
+    }
+}
+
 pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize) -> (RECT, Vec<RECT>, Option<RECT>) {
     let (card_rect, _) = super::overview::card_layout(monitor);
     let dpi = super::state::reference_dpi();
-    let icon_size = scaled(DOCK_ICON_SIZE, dpi);
+    let icon_size_cfg = super::state::STATE.with(|s| {
+        s.borrow().as_ref().map(|st| st.config.appearance.dock_icon_size as i32)
+    }).unwrap_or(DOCK_ICON_SIZE);
+    let icon_size = scaled(icon_size_cfg, dpi);
     let gap = scaled(DOCK_ICON_GAP, dpi);
     let pad_x = scaled(DOCK_PADDING_X, dpi);
     let pad_y = scaled(DOCK_PADDING_Y, dpi);
@@ -117,8 +133,10 @@ pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize
     let bar_w = content_w + pad_x * 2;
     let bar_h = icon_size + pad_y * 2;
 
-    let cx = (card_rect.left + card_rect.right) / 2;
-    let bar_left = cx - bar_w / 2;
+    let alignment = super::state::STATE.with(|s| {
+        s.borrow().as_ref().map(|st| st.config.appearance.dock_alignment.clone())
+    }).unwrap_or_else(|| "center".to_string());
+    let bar_left = anchor_x(card_rect.left, card_rect.right, bar_w, &alignment);
     let bar_bottom = card_rect.bottom + scaled(super::overview::CARD_MARGIN_BOTTOM, dpi)
         - scaled(DOCK_MARGIN_BOTTOM, dpi);
     let bar_top = bar_bottom - bar_h;
@@ -828,5 +846,26 @@ mod tests {
             DockApp { icon: None, launch_path: None, windows: vec![1] },
         ];
         assert_eq!(pinned_count(&apps), 2);
+    }
+
+    #[test]
+    fn anchor_x_center_centers_content_in_the_work_area() {
+        // work area 0..200, content 40 wide -> left edge at 80
+        assert_eq!(anchor_x(0, 200, 40, "center"), 80);
+    }
+
+    #[test]
+    fn anchor_x_left_hugs_the_left_edge() {
+        assert_eq!(anchor_x(0, 200, 40, "left"), 0);
+    }
+
+    #[test]
+    fn anchor_x_right_hugs_the_right_edge() {
+        assert_eq!(anchor_x(0, 200, 40, "right"), 160);
+    }
+
+    #[test]
+    fn anchor_x_falls_back_to_center_for_an_unknown_alignment() {
+        assert_eq!(anchor_x(0, 200, 40, "bogus"), 80);
     }
 }

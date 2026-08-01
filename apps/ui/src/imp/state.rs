@@ -52,6 +52,7 @@ pub(crate) struct BarWindow {
 
 pub(crate) struct AppState {
     pub(crate) bars: Vec<BarWindow>,
+    pub(crate) config: groveshell_config::Config,
     pub(crate) primary_bar_hwnd: HWND,
     pub(crate) primary_bar_rect: RECT,
     /// The primary monitor's device name — the fallback target for

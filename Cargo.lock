@@ -473,6 +473,7 @@ name = "groveshell-ui"
 version = "0.1.0"
 dependencies = [
  "groveshell-common",
+ "groveshell-config",
  "groveshell-window-model",
  "serde",
  "serde_json",
