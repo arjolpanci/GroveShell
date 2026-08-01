@@ -1,6 +1,7 @@
 //! Process bootstrap for `groveshell-settings`.
 
 mod autostart;
+mod config_store;
 mod health;
 mod nav;
 mod pages;
@@ -23,9 +24,8 @@ pub fn run() -> Result<()> {
     let _job = groveshell_common::jobobject::ShellJob::create_and_join()?;
     tracing::info!("joined shell job object");
 
-    let config_path = groveshell_common::paths::data_dir()?.join("config.toml");
-    let config = groveshell_config::load_or_default(&config_path);
-    tracing::info!(?config, "configuration loaded");
+    config_store::init();
+    tracing::info!(config = ?config_store::current(), "configuration loaded");
 
     let mut processes = ManagedProcesses::new();
     processes.spawn_all();

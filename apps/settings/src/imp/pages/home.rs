@@ -99,7 +99,11 @@ impl Page for HomePage {
         }
         let toggle = self.autostart_toggle_rect(content_rect);
         if hit_toggle(toggle, x, y) {
-            autostart::set_enabled(!autostart::is_enabled());
+            let new_state = !autostart::is_enabled();
+            autostart::set_enabled(new_state);
+            crate::imp::config_store::update(|config| {
+                config.general.start_with_windows = new_state;
+            });
         }
     }
 }
