@@ -4,6 +4,7 @@
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::HDC;
 
+pub(crate) mod dock;
 pub(crate) mod home;
 
 pub(crate) trait Page {

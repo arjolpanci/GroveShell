@@ -17,6 +17,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::nav::{nav_hit_test, nav_layout, NAV_ITEMS};
 use super::pages::Page;
+use super::pages::dock::DockPage;
 use super::pages::home::HomePage;
 use super::theme::{BG_NAV, BG_WINDOW, NAV_WIDTH};
 use super::util_text::draw_centered_text;
@@ -25,6 +26,7 @@ thread_local! {
     static WINDOW_HWND: RefCell<Option<HWND>> = const { RefCell::new(None) };
     static SELECTED_NAV: RefCell<usize> = const { RefCell::new(0) };
     static HOME_PAGE: RefCell<HomePage> = RefCell::new(HomePage::new());
+    static DOCK_PAGE: RefCell<DockPage> = RefCell::new(DockPage::new());
 }
 
 const WINDOW_WIDTH: i32 = 780;
@@ -108,10 +110,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
 
             let content = content_rect(client);
-            if selected == 0 {
-                HOME_PAGE.with(|p| p.borrow().paint(hdc, content));
+            match selected {
+                0 => HOME_PAGE.with(|p| p.borrow().paint(hdc, content)),
+                1 => DOCK_PAGE.with(|p| p.borrow().paint(hdc, content)),
+                _ => {}
             }
-            // Tasks 15-18 add the remaining `selected == 1..=4` arms here.
+            // Tasks 16-18 add the remaining `selected == 2..=4` arms here.
 
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
@@ -126,10 +130,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let _ = GetClientRect(hwnd, &mut client);
                 let content = content_rect(client);
                 let selected = SELECTED_NAV.with(|s| *s.borrow());
-                if selected == 0 {
-                    HOME_PAGE.with(|p| p.borrow_mut().on_click(x, y, content));
+                match selected {
+                    0 => HOME_PAGE.with(|p| p.borrow_mut().on_click(x, y, content)),
+                    1 => DOCK_PAGE.with(|p| p.borrow_mut().on_click(x, y, content)),
+                    _ => {}
                 }
-                // Tasks 15-18 add the remaining `selected == 1..=4` arms here.
+                // Tasks 16-18 add the remaining `selected == 2..=4` arms here.
             }
             let _ = InvalidateRect(hwnd, None, true);
             LRESULT(0)
