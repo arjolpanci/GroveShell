@@ -147,3 +147,44 @@ fn save_creates_a_backup_of_the_previous_file() {
     let backup_config = load(&backup_path).expect("backup should be valid config");
     assert_eq!(backup_config, Config::default());
 }
+
+#[test]
+fn default_config_has_sane_defaults_for_new_appearance_and_input_fields() {
+    let config = Config::default();
+    assert_eq!(config.appearance.dock_icon_size, 44);
+    assert_eq!(config.appearance.dock_alignment, "center");
+    assert!(!config.appearance.top_bar_blur);
+    assert!(!config.appearance.overview_blur);
+    assert!(!config.appearance.reduced_motion);
+    assert_eq!(config.input.overview_modifier, "Super");
+}
+
+#[test]
+fn load_rejects_unknown_dock_alignment() {
+    let file = write_temp_toml(
+        "schema_version = 1\n[appearance]\ndock_alignment = \"top\"\n",
+    );
+    assert!(load(file.path()).is_err());
+}
+
+#[test]
+fn load_rejects_unknown_overview_modifier() {
+    let file = write_temp_toml(
+        "schema_version = 1\n[input]\noverview_modifier = \"Ctrl\"\n",
+    );
+    assert!(load(file.path()).is_err());
+}
+
+#[test]
+fn load_accepts_every_valid_dock_alignment_and_overview_modifier() {
+    for alignment in ["left", "center", "right"] {
+        let toml = format!("schema_version = 1\n[appearance]\ndock_alignment = \"{alignment}\"\n");
+        let file = write_temp_toml(&toml);
+        assert!(load(file.path()).is_ok(), "{alignment} should be accepted");
+    }
+    for modifier in ["Super", "Alt", "CtrlAlt"] {
+        let toml = format!("schema_version = 1\n[input]\noverview_modifier = \"{modifier}\"\n");
+        let file = write_temp_toml(&toml);
+        assert!(load(file.path()).is_ok(), "{modifier} should be accepted");
+    }
+}
