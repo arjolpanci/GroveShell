@@ -242,6 +242,10 @@ pub fn main() -> Result<()> {
             let _ = DeleteObject(top_square);
             SetWindowRgn(bar_hwnd, region, true);
 
+            if config.appearance.top_bar_blur {
+                enable_blur_behind(bar_hwnd);
+            }
+
             bars.push(BarWindow {
                 hwnd: bar_hwnd,
                 rect: bar_rect,
@@ -298,6 +302,9 @@ pub fn main() -> Result<()> {
                 None,
             )
             .map_err(Error::Windows)?;
+            if config.appearance.overview_blur {
+                enable_blur_behind(overview_hwnd);
+            }
             overviews.insert(
                 monitor.device_name.clone(),
                 overview::OverviewInstance::new(overview_hwnd, width, height),
@@ -474,6 +481,25 @@ unsafe fn register_class(
         return Err(Error::Windows(windows::core::Error::from_win32()));
     }
     Ok(())
+}
+
+/// Enables the simplest DWM blur-behind for `hwnd` — matches BlurMyShell's
+/// simplest "blur what's behind" mode, not a Mica/acrylic material (see
+/// the design doc's explicit scope decision). Best-effort: failure just
+/// means no blur, same treatment as every other cosmetic Win32 call in
+/// this file.
+fn enable_blur_behind(hwnd: HWND) {
+    use windows::Win32::Graphics::Dwm::{DwmEnableBlurBehindWindow, DWM_BLURBEHIND, DWM_BB_ENABLE};
+    let bb = DWM_BLURBEHIND {
+        dwFlags: DWM_BB_ENABLE,
+        fEnable: true.into(),
+        ..Default::default()
+    };
+    // SAFETY: `hwnd` is a valid, just-created window; `bb` is a local
+    // outliving this synchronous call.
+    unsafe {
+        let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
+    }
 }
 
 /// Registers the primary-bar-owned hotkeys (workspace-switch,

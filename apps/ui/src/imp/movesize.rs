@@ -138,6 +138,24 @@ pub(crate) fn uninstall_move_size_hooks() {
     }
 }
 
+/// Which raw vkcodes should be treated as "the overview/move-resize
+/// modifier," per `config.toml`'s `input.overview_modifier`. `"Super"`
+/// (the default) matches both Windows keys, matching this module's
+/// original hardcoded behavior. `"Alt"` matches both Alt keys. `"CtrlAlt"`
+/// is documented in `docs/superpowers/specs/2026-07-30-tray-settings-app-design.md`
+/// as a preset requiring both Ctrl and Alt; this hook's single-key-family
+/// state machine (`WIN_HELD`/`WIN_USED`) only tracks one key family being
+/// pressed/released at a time, so as a scoped simplification "CtrlAlt"
+/// arms on Alt alone here (Alt is already one of the two keys), same as
+/// the "Alt" case — a true two-key chord would need a second held-state
+/// cell and is left as a documented follow-up, not attempted in this pass.
+fn vk_codes_for_modifier(modifier: &str) -> Vec<u32> {
+    match modifier {
+        "Alt" | "CtrlAlt" => vec![0xA4, 0xA5], // VK_LMENU, VK_RMENU
+        _ => vec![VK_LWIN, VK_RWIN],           // "Super" and any unknown value
+    }
+}
+
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(None, code, wparam, lparam);
@@ -145,7 +163,11 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
     // SAFETY: a low-level keyboard hook's `lparam` always points to a
     // live `KBDLLHOOKSTRUCT` for the duration of this call.
     let info = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    if info.vkCode == VK_LWIN || info.vkCode == VK_RWIN {
+    let modifier = super::state::STATE.with(|s| {
+        s.borrow().as_ref().map(|st| st.config.input.overview_modifier.clone())
+    }).unwrap_or_else(|| "Super".to_string());
+    let codes = vk_codes_for_modifier(&modifier);
+    if codes.contains(&info.vkCode) {
         let msg = wparam.0 as u32;
         if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
             if !WIN_HELD.with(|h| h.get()) {
@@ -385,5 +407,25 @@ pub(crate) fn check_hot_corners() {
         if let Some(m) = corner_monitor {
             super::overview::open_overview(&m.device_name);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn super_modifier_maps_to_both_win_keys() {
+        assert_eq!(vk_codes_for_modifier("Super"), vec![VK_LWIN, VK_RWIN]);
+    }
+
+    #[test]
+    fn alt_modifier_maps_to_the_alt_key() {
+        assert_eq!(vk_codes_for_modifier("Alt"), vec![0xA4, 0xA5]); // VK_LMENU, VK_RMENU
+    }
+
+    #[test]
+    fn unknown_modifier_falls_back_to_super() {
+        assert_eq!(vk_codes_for_modifier("bogus"), vec![VK_LWIN, VK_RWIN]);
     }
 }
