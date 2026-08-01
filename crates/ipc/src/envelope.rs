@@ -43,4 +43,21 @@ pub mod message_type {
     pub const SHUTDOWN_ACK: &str = "host.shutdown_ack";
     pub const WATCHDOG_SHUTDOWN: &str = "watchdog.shutdown";
     pub const WATCHDOG_SHUTDOWN_ACK: &str = "watchdog.shutdown_ack";
+    /// Pushed by `groveshell-settings` to the `groveshell-ui` pipe after
+    /// every successful `config.toml` save, so `groveshell-ui` can reload
+    /// and re-apply settings live without a restart. No payload; the
+    /// receiver always re-reads the config file itself rather than
+    /// trusting an embedded copy, so this message can never carry a
+    /// version that's already stale by the time it's read.
+    pub const CONFIG_RELOAD: &str = "config.reload";
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_reload_message_type_is_stable() {
+        assert_eq!(message_type::CONFIG_RELOAD, "config.reload");
+    }
 }
