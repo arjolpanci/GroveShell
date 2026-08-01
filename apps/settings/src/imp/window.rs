@@ -19,6 +19,7 @@ use super::nav::{nav_hit_test, nav_layout, NAV_ITEMS};
 use super::pages::Page;
 use super::pages::dock::DockPage;
 use super::pages::home::HomePage;
+use super::pages::input::InputPage;
 use super::pages::overview::OverviewPage;
 use super::pages::top_bar::TopBarPage;
 use super::theme::{BG_NAV, BG_WINDOW, NAV_WIDTH};
@@ -31,6 +32,7 @@ thread_local! {
     static DOCK_PAGE: RefCell<DockPage> = RefCell::new(DockPage::new());
     static TOP_BAR_PAGE: RefCell<TopBarPage> = RefCell::new(TopBarPage::new());
     static OVERVIEW_PAGE: RefCell<OverviewPage> = RefCell::new(OverviewPage::new());
+    static INPUT_PAGE: RefCell<InputPage> = RefCell::new(InputPage::new());
 }
 
 const WINDOW_WIDTH: i32 = 780;
@@ -119,9 +121,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 1 => DOCK_PAGE.with(|p| p.borrow().paint(hdc, content)),
                 2 => TOP_BAR_PAGE.with(|p| p.borrow().paint(hdc, content)),
                 3 => OVERVIEW_PAGE.with(|p| p.borrow().paint(hdc, content)),
+                4 => INPUT_PAGE.with(|p| p.borrow().paint(hdc, content)),
                 _ => {}
             }
-            // Tasks 16-18 add the remaining `selected == 2..=4` arms here.
 
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
@@ -141,9 +143,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     1 => DOCK_PAGE.with(|p| p.borrow_mut().on_click(x, y, content)),
                     2 => TOP_BAR_PAGE.with(|p| p.borrow_mut().on_click(x, y, content)),
                     3 => OVERVIEW_PAGE.with(|p| p.borrow_mut().on_click(x, y, content)),
+                    4 => INPUT_PAGE.with(|p| p.borrow_mut().on_click(x, y, content)),
                     _ => {}
                 }
-                // Tasks 16-18 add the remaining `selected == 2..=4` arms here.
             }
             let _ = InvalidateRect(hwnd, None, true);
             LRESULT(0)
