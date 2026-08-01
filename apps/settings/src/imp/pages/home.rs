@@ -75,7 +75,7 @@ impl Page for HomePage {
             }
 
             let button = self.restore_button_rect(content_rect);
-            let running = crate::imp::tray::is_ui_running_for_home_page();
+            let running = crate::imp::tray::is_ui_running();
             let label = if running { "Restore Explorer" } else { "Start GroveShell" };
             super::super::theme::fill_round_rect(hdc, button, 8, ACCENT);
             draw_centered_text(hdc, button, label, COLORREF(0x00202020));

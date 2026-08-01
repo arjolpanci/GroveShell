@@ -134,12 +134,8 @@ fn remove_tray_icon(hwnd: HWND) {
     }
 }
 
-fn is_ui_running() -> bool {
+pub(crate) fn is_ui_running() -> bool {
     PROCESSES.with(|p| p.borrow_mut().as_mut().map(|proc| proc.is_ui_running()).unwrap_or(false))
-}
-
-pub(crate) fn is_ui_running_for_home_page() -> bool {
-    is_ui_running()
 }
 
 pub(crate) fn pid_for(name: &str) -> Option<u32> {

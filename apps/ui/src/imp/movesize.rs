@@ -374,18 +374,62 @@ fn end_drag() -> bool {
     had
 }
 
-/// Hot corners (Phase 2): dwelling in a monitor's top-left pixel opens
-/// the Activities overview, same trigger as GNOME's default corner.
-/// Polled off the existing 1s clock timer would be too coarse to feel
-/// responsive, so this runs on its own fast timer instead — see
-/// `HOTCORNER_TIMER_ID` in `mod.rs`. Edge-triggered (only fires the
-/// instant the cursor arrives, not on every tick while it sits there),
-/// so leaving the mouse parked in the corner doesn't reopen the
-/// overview right after closing it.
+/// Hot corners (Phase 2): dwelling in one of a monitor's four corner
+/// pixels triggers that corner's configured action (`config.hot_corners`,
+/// keyed `"top_left"`/`"top_right"`/`"bottom_left"`/`"bottom_right"`) —
+/// same trigger as GNOME's default corner, extended to all four and to
+/// actually honor the configured action instead of always opening the
+/// overview. Polled off the existing 1s clock timer would be too coarse
+/// to feel responsive, so this runs on its own fast timer instead — see
+/// `HOTCORNER_TIMER_ID` in `mod.rs`. Edge-triggered per corner (only
+/// fires the instant the cursor arrives in a given corner, not on every
+/// tick while it sits there), so leaving the mouse parked in a corner
+/// doesn't reopen the overview right after closing it.
 const HOTCORNER_ZONE: i32 = 3;
 
+/// The four corner keys, in the same order `IN_CORNER`'s per-corner
+/// dwell state is indexed by — matching `config.hot_corners`'s keys and
+/// `apps/settings`'s `InputPage::CORNERS`.
+const CORNER_KEYS: [&str; 4] = ["top_left", "top_right", "bottom_left", "bottom_right"];
+
 thread_local! {
-    static IN_HOT_CORNER: Cell<bool> = const { Cell::new(false) };
+    /// Per-corner "was the cursor in this corner last tick" state,
+    /// indexed the same way as `CORNER_KEYS`. Replaces the old single
+    /// `IN_HOT_CORNER` bool now that all four corners are tracked
+    /// independently.
+    static IN_CORNER: [Cell<bool>; 4] = [
+        Cell::new(false),
+        Cell::new(false),
+        Cell::new(false),
+        Cell::new(false),
+    ];
+}
+
+/// Which of a monitor's four `HOTCORNER_ZONE`-sized corner boxes (if
+/// any) contains `pt`, paired with that corner's index into
+/// `CORNER_KEYS`. Pure geometry, factored out so it can be unit tested
+/// without a live cursor/monitor.
+fn corner_hit(pt: POINT, m: &RECT) -> Option<usize> {
+    let boxes = [
+        RECT { left: m.left, top: m.top, right: m.left + HOTCORNER_ZONE, bottom: m.top + HOTCORNER_ZONE }, // top_left
+        RECT { left: m.right - HOTCORNER_ZONE, top: m.top, right: m.right, bottom: m.top + HOTCORNER_ZONE }, // top_right
+        RECT { left: m.left, top: m.bottom - HOTCORNER_ZONE, right: m.left + HOTCORNER_ZONE, bottom: m.bottom }, // bottom_left
+        RECT { left: m.right - HOTCORNER_ZONE, top: m.bottom - HOTCORNER_ZONE, right: m.right, bottom: m.bottom }, // bottom_right
+    ];
+    boxes.iter().position(|b| pt.x >= b.left && pt.x < b.right && pt.y >= b.top && pt.y < b.bottom)
+}
+
+/// Whether corner `index`'s configured action should fire the overview.
+/// A missing map entry (no `HotCornerConfig` for that corner) means
+/// `"none"`, matching how `apps/settings`'s Input page defaults an
+/// absent entry — the only other action this UI currently offers is
+/// `"activities"`.
+fn corner_action_is_activities(config: &groveshell_config::Config, index: usize) -> bool {
+    config
+        .hot_corners
+        .get(CORNER_KEYS[index])
+        .map(|c| c.action == "activities")
+        .unwrap_or(false)
 }
 
 pub(crate) fn check_hot_corners() {
@@ -395,17 +439,23 @@ pub(crate) fn check_hot_corners() {
         return;
     }
     let monitors = super::monitors::monitors_sorted_by_x();
-    let corner_monitor = monitors.iter().find(|m| {
-        pt.x >= m.rect.left
-            && pt.x < m.rect.left + HOTCORNER_ZONE
-            && pt.y >= m.rect.top
-            && pt.y < m.rect.top + HOTCORNER_ZONE
-    });
-    let in_corner = corner_monitor.is_some();
-    let was_in_corner = IN_HOT_CORNER.with(|c| c.replace(in_corner));
-    if in_corner && !was_in_corner {
-        if let Some(m) = corner_monitor {
-            super::overview::open_overview(&m.device_name);
+    let hit = monitors.iter().find_map(|m| corner_hit(pt, &m.rect).map(|i| (m, i)));
+
+    for i in 0..CORNER_KEYS.len() {
+        let in_this_corner = hit.map(|(_, hit_i)| hit_i == i).unwrap_or(false);
+        let was_in_this_corner = IN_CORNER.with(|c| c[i].replace(in_this_corner));
+        if in_this_corner && !was_in_this_corner {
+            if let Some((m, _)) = hit {
+                let should_open = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .map(|st| corner_action_is_activities(&st.config, i))
+                        .unwrap_or(false)
+                });
+                if should_open {
+                    super::overview::open_overview(&m.device_name);
+                }
+            }
         }
     }
 }
@@ -427,5 +477,60 @@ mod tests {
     #[test]
     fn unknown_modifier_falls_back_to_super() {
         assert_eq!(vk_codes_for_modifier("bogus"), vec![VK_LWIN, VK_RWIN]);
+    }
+
+    fn monitor_rect() -> RECT {
+        RECT { left: 100, top: 100, right: 1000, bottom: 800 }
+    }
+
+    #[test]
+    fn corner_hit_detects_top_left() {
+        let m = monitor_rect();
+        assert_eq!(corner_hit(POINT { x: 100, y: 100 }, &m), Some(0));
+    }
+
+    #[test]
+    fn corner_hit_detects_top_right() {
+        let m = monitor_rect();
+        assert_eq!(corner_hit(POINT { x: 999, y: 100 }, &m), Some(1));
+    }
+
+    #[test]
+    fn corner_hit_detects_bottom_left() {
+        let m = monitor_rect();
+        assert_eq!(corner_hit(POINT { x: 100, y: 799 }, &m), Some(2));
+    }
+
+    #[test]
+    fn corner_hit_detects_bottom_right() {
+        let m = monitor_rect();
+        assert_eq!(corner_hit(POINT { x: 999, y: 799 }, &m), Some(3));
+    }
+
+    #[test]
+    fn corner_hit_misses_center() {
+        let m = monitor_rect();
+        assert_eq!(corner_hit(POINT { x: 500, y: 400 }, &m), None);
+    }
+
+    #[test]
+    fn corner_action_defaults_to_none_when_entry_missing() {
+        let config = groveshell_config::Config::default();
+        assert!(!corner_action_is_activities(&config, 0));
+    }
+
+    #[test]
+    fn corner_action_reads_configured_entry() {
+        let mut config = groveshell_config::Config::default();
+        config.hot_corners.insert(
+            "top_left".to_string(),
+            groveshell_config::HotCornerConfig {
+                action: "activities".to_string(),
+                delay_ms: 150,
+                disable_in_fullscreen: true,
+            },
+        );
+        assert!(corner_action_is_activities(&config, 0));
+        assert!(!corner_action_is_activities(&config, 1));
     }
 }
