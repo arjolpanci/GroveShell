@@ -138,6 +138,14 @@ fn is_ui_running() -> bool {
     PROCESSES.with(|p| p.borrow_mut().as_mut().map(|proc| proc.is_ui_running()).unwrap_or(false))
 }
 
+pub(crate) fn is_ui_running_for_home_page() -> bool {
+    is_ui_running()
+}
+
+pub(crate) fn pid_for(name: &str) -> Option<u32> {
+    PROCESSES.with(|p| p.borrow().as_ref().and_then(|proc| proc.pid_of(name)))
+}
+
 /// Restore-Explorer (if `ui` is running) or Start-GroveShell (if it isn't)
 /// — shared by the tray menu's "Toggle" item and Task 9's Home-page
 /// button, both of which call this same function rather than duplicating

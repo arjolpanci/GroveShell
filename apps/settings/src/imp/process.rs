@@ -64,6 +64,16 @@ impl ManagedProcesses {
         matches!(self.ui.as_mut().map(|c| c.try_wait()), Some(Ok(None)))
     }
 
+    pub fn pid_of(&self, name: &str) -> Option<u32> {
+        let child = match name {
+            "watchdog" => self.watchdog.as_ref(),
+            "host" => self.host.as_ref(),
+            "ui" => self.ui.as_ref(),
+            _ => None,
+        }?;
+        Some(child.id())
+    }
+
     /// Stops `ui` gracefully (so it restores the real taskbar/work areas
     /// in its own `WM_DESTROY` handler), then asks `host`/`watchdog` to
     /// shut down over IPC, force-killing anything still alive after a
