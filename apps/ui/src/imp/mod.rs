@@ -112,6 +112,7 @@ pub fn main() -> Result<()> {
     let config_path = groveshell_common::paths::data_dir()?.join("config.toml");
     let config = groveshell_config::load_or_default(&config_path);
     tracing::info!(?config, "configuration loaded");
+    state::set_animation_config(config.appearance.animation_scale, config.appearance.reduced_motion);
 
     std::thread::spawn(config_reload_listener);
 
@@ -302,11 +303,28 @@ pub fn main() -> Result<()> {
                 None,
             )
             .map_err(Error::Windows)?;
-            set_blur_behind(overview_hwnd, config.appearance.overview_blur);
+            // `DwmEnableBlurBehindWindow` must run *after* `OverviewInstance::new`
+            // (which creates the DirectComposition target via
+            // `overview_gpu::create`), and only when blur is actually
+            // wanted: calling it at all — even with `enabled: false`,
+            // which should be a no-op — appears to mark the window as
+            // DWM-composed, which makes `CreateTargetForHwnd` fail with
+            // `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` just like
+            // `WS_EX_LAYERED` does above, silently forcing the slow GDI
+            // fallback for every overview even with blur off (confirmed
+            // live: this was happening on every run regardless of the
+            // `overview_blur` setting, which defaults to `false`). A
+            // freshly created window has nothing to disable, so there's
+            // no need to call this at all when blur starts off; the live
+            // `WM_APP_CONFIG_RELOADED` path still needs to handle both
+            // enabling and disabling blur on an already-running window.
             overviews.insert(
                 monitor.device_name.clone(),
                 overview::OverviewInstance::new(overview_hwnd, width, height),
             );
+            if config.appearance.overview_blur {
+                set_blur_behind(overview_hwnd, true);
+            }
         }
 
         // Calendar + notifications flyout, centered under the primary
@@ -760,6 +778,10 @@ unsafe extern "system" fn wndproc(
             if let Ok(path) = config_path {
                 let new_config = groveshell_config::load_or_default(&path);
                 tracing::info!(config = ?new_config, "config.reload: reapplying");
+                state::set_animation_config(
+                    new_config.appearance.animation_scale,
+                    new_config.appearance.reduced_motion,
+                );
                 STATE.with(|s| {
                     if let Some(state) = s.borrow_mut().as_mut() {
                         state.config = new_config;

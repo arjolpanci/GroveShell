@@ -51,11 +51,11 @@ pub(crate) fn ease_out(t: f64) -> f64 {
 }
 
 pub(crate) fn progress_dur(started: std::time::Instant, duration: std::time::Duration) -> f64 {
-    let (scale, reduced) = super::state::STATE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|st| (st.config.appearance.animation_scale, st.config.appearance.reduced_motion))
-    }).unwrap_or((1.0, false));
+    // Reads a same-thread `Cell` mirror, never `STATE` itself — this is
+    // called from deep inside code that may already hold `STATE`'s
+    // borrow (e.g. `overview::on_animation_tick`), and re-borrowing it
+    // here would panic. See `state::ANIMATION_SCALE`'s doc comment.
+    let (scale, reduced) = super::state::animation_config();
     if reduced {
         return 1.0; // instant: always report "animation complete"
     }

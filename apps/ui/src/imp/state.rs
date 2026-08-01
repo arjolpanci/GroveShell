@@ -2,7 +2,7 @@
 //! mutates through the thread-local `STATE` cell, plus the `Role` lookup
 //! used to dispatch messages in `wndproc`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
@@ -115,6 +115,42 @@ pub(crate) fn primary_bar_hwnd() -> Option<HWND> {
         0 => None,
         raw => Some(HWND(raw as *mut std::ffi::c_void)),
     }
+}
+
+thread_local! {
+    /// Mirrors `AppState.config.appearance.{animation_scale,reduced_motion}`
+    /// outside `STATE`'s `RefCell`, for the same reason `PRIMARY_BAR_HWND`
+    /// mirrors the primary bar's `HWND` above — except the problem here
+    /// isn't cross-thread access, it's *same-thread re-entrancy*:
+    /// `util::progress_dur` is called from deep inside animation code
+    /// (`overview::on_animation_tick` and friends) that already holds
+    /// `STATE`'s borrow for the whole duration of its work, so a second,
+    /// nested `STATE.with(|s| s.borrow())` inside `progress_dur` panics
+    /// with "RefCell already mutably borrowed" the instant an overview
+    /// animates (confirmed live: this crashed the process on the very
+    /// first `WM_TIMER` tick after opening Activities). A separate
+    /// thread-local `Cell` has no aliasing relationship with `STATE`'s
+    /// `RefCell` at all, so `progress_dur` can read it regardless of
+    /// what borrow `STATE` is currently under. Kept in sync at every
+    /// place `AppState.config` is set or replaced (initial load in
+    /// `main`, and the `WM_APP_CONFIG_RELOADED` handler) via
+    /// `set_animation_config`.
+    static ANIMATION_SCALE: Cell<f32> = const { Cell::new(1.0) };
+    static REDUCED_MOTION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Updates the re-entrancy-safe mirror of the animation-affecting config
+/// fields. Call this every time `AppState.config` is set or replaced.
+pub(crate) fn set_animation_config(scale: f32, reduced_motion: bool) {
+    ANIMATION_SCALE.with(|c| c.set(scale));
+    REDUCED_MOTION.with(|c| c.set(reduced_motion));
+}
+
+/// Reads the re-entrancy-safe mirror of the animation-affecting config
+/// fields. Safe to call from anywhere, including from inside an active
+/// `STATE.with` borrow — see `ANIMATION_SCALE`'s doc comment.
+pub(crate) fn animation_config() -> (f32, bool) {
+    (ANIMATION_SCALE.with(|c| c.get()), REDUCED_MOTION.with(|c| c.get()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
