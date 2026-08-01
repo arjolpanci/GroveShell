@@ -1,8 +1,12 @@
 //! Process bootstrap for `groveshell-settings`.
 
 mod health;
+mod nav;
+mod pages;
 mod process;
+mod theme;
 mod tray;
+mod util_text;
 mod window;
 
 use groveshell_common::Result;
