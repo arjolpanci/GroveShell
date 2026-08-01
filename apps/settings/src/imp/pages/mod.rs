@@ -6,6 +6,7 @@ use windows::Win32::Graphics::Gdi::HDC;
 
 pub(crate) mod dock;
 pub(crate) mod home;
+pub(crate) mod overview;
 pub(crate) mod top_bar;
 
 pub(crate) trait Page {
