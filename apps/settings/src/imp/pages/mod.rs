@@ -6,6 +6,7 @@ use windows::Win32::Graphics::Gdi::HDC;
 
 pub(crate) mod dock;
 pub(crate) mod home;
+pub(crate) mod input;
 pub(crate) mod overview;
 pub(crate) mod top_bar;
 
