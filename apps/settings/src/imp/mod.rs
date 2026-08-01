@@ -1,5 +1,6 @@
 //! Process bootstrap for `groveshell-settings`.
 
+mod autostart;
 mod health;
 mod nav;
 mod pages;
