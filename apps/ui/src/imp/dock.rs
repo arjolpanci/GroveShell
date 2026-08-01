@@ -89,16 +89,6 @@ pub(crate) fn pinned_count(apps: &[DockApp]) -> usize {
     apps.iter().filter(|a| a.launch_path.is_some()).count()
 }
 
-/// The page-local dock bar rect, each icon's slot within it, and (if
-/// there's at least one pinned entry *and* at least one running-but-
-/// unpinned entry) the vertical divider rect separating them —
-/// horizontally centered under the focused card, sitting in the
-/// bottom-margin gap `card_layout` already reserves for it. Self-
-/// contained like `card_layout`, for the same reason: cheap to
-/// recompute, and this module doesn't handle live display-topology
-/// changes either. `pinned_count` must be the number of the first
-/// `pinned_count` slots (by index) that are pinned entries — the rest
-/// are running-unpinned, matching `pinned_count()`'s own contract.
 /// The dock bar's left edge given a work area's horizontal span, the
 /// bar's total content width, and a horizontal alignment — "left"/"right"
 /// hug the work area's exact edge; any unrecognized alignment string
@@ -111,6 +101,17 @@ pub(crate) fn anchor_x(work_area_left: i32, work_area_right: i32, content_w: i32
         _ => (work_area_left + work_area_right) / 2 - content_w / 2,
     }
 }
+
+/// The page-local dock bar rect, each icon's slot within it, and (if
+/// there's at least one pinned entry *and* at least one running-but-
+/// unpinned entry) the vertical divider rect separating them —
+/// horizontally centered under the focused card, sitting in the
+/// bottom-margin gap `card_layout` already reserves for it. Self-
+/// contained like `card_layout`, for the same reason: cheap to
+/// recompute, and this module doesn't handle live display-topology
+/// changes either. `pinned_count` must be the number of the first
+/// `pinned_count` slots (by index) that are pinned entries — the rest
+/// are running-unpinned, matching `pinned_count()`'s own contract.
 
 pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize) -> (RECT, Vec<RECT>, Option<RECT>) {
     let (card_rect, _) = super::overview::card_layout(monitor);
