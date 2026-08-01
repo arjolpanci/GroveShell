@@ -1,6 +1,9 @@
 //! Process bootstrap for `groveshell-settings`.
 
+mod process;
+
 use groveshell_common::Result;
+use process::ManagedProcesses;
 
 pub fn run() -> Result<()> {
     let _log_guard = groveshell_common::logging::init("settings")?;
@@ -16,9 +19,14 @@ pub fn run() -> Result<()> {
     let config = groveshell_config::load_or_default(&config_path);
     tracing::info!(?config, "configuration loaded");
 
-    // Task 5 replaces this with real process supervision; Task 6 replaces
-    // the sleep loop with a real Win32 message loop driving the tray icon
-    // and settings window.
+    let mut processes = ManagedProcesses::new();
+    processes.spawn_all();
+
+    // Task 6 replaces this with a real Win32 message loop driving the
+    // tray icon; for now, idle so the spawned children keep running under
+    // this process's supervision (and this process's own exit, e.g.
+    // Ctrl+C in a foreground dev run, doesn't leave them behind untracked
+    // — Task 6's WM_DESTROY-equivalent handles a clean stop).
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
