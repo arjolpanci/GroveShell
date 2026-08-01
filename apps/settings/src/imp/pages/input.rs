@@ -35,12 +35,28 @@ impl InputPage {
         }
     }
 
-    fn corner_rect(&self, content_rect: RECT, index: usize) -> RECT {
+    // Each corner gets its own two-row slot: a label row followed by its
+    // control row, mirroring the label-above-control pairing used by
+    // `TopBarPage`/`OverviewPage`. The base offset advances by 2 rows per
+    // corner (not 1) so no corner's control row coincides with the next
+    // corner's label row.
+    fn corner_label_rect(&self, content_rect: RECT, index: usize) -> RECT {
+        let row = 2 + 2 * index as i32;
         RECT {
             left: content_rect.left + PADDING,
-            top: content_rect.top + PADDING + ROW_HEIGHT * (3 + index as i32),
+            top: content_rect.top + PADDING + ROW_HEIGHT * row,
+            right: content_rect.right - PADDING,
+            bottom: content_rect.top + PADDING + ROW_HEIGHT * row + 24,
+        }
+    }
+
+    fn corner_rect(&self, content_rect: RECT, index: usize) -> RECT {
+        let row = 3 + 2 * index as i32;
+        RECT {
+            left: content_rect.left + PADDING,
+            top: content_rect.top + PADDING + ROW_HEIGHT * row,
             right: content_rect.left + PADDING + CONTROL_WIDTH,
-            bottom: content_rect.top + PADDING + ROW_HEIGHT * (3 + index as i32) + 32,
+            bottom: content_rect.top + PADDING + ROW_HEIGHT * row + 32,
         }
     }
 }
@@ -67,13 +83,7 @@ impl Page for InputPage {
             for (i, corner) in CORNERS.iter().enumerate() {
                 let action = config.hot_corners.get(*corner).map(|c| c.action.clone()).unwrap_or_else(|| "none".to_string());
                 let action_index = CORNER_ACTION_OPTIONS.iter().position(|a| *a == action).unwrap_or(0);
-                let label_rect = RECT {
-                    left: content_rect.left + PADDING,
-                    top: content_rect.top + PADDING + ROW_HEIGHT * (2 + i as i32),
-                    right: content_rect.right - PADDING,
-                    bottom: content_rect.top + PADDING + ROW_HEIGHT * (2 + i as i32) + 24,
-                };
-                draw_centered_text(hdc, label_rect, &corner_display_name(corner), TEXT_MUTED);
+                draw_centered_text(hdc, self.corner_label_rect(content_rect, i), &corner_display_name(corner), TEXT_MUTED);
                 draw_segmented(hdc, self.corner_rect(content_rect, i), &CORNER_ACTION_OPTIONS, action_index);
             }
         }
