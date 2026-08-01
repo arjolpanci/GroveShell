@@ -54,6 +54,7 @@ pub struct InputConfig {
     pub move_modifier: String,
     pub move_button: String,
     pub resize_button: String,
+    pub overview_modifier: String,
 }
 
 impl Default for InputConfig {
@@ -62,6 +63,7 @@ impl Default for InputConfig {
             move_modifier: "Alt".to_string(),
             move_button: "Left".to_string(),
             resize_button: "Right".to_string(),
+            overview_modifier: "Super".to_string(),
         }
     }
 }
@@ -80,6 +82,11 @@ pub struct AppearanceConfig {
     pub top_bar_height: u32,
     pub dock_mode: String,
     pub animation_scale: f32,
+    pub dock_icon_size: u32,
+    pub dock_alignment: String,
+    pub top_bar_blur: bool,
+    pub overview_blur: bool,
+    pub reduced_motion: bool,
 }
 
 impl Default for AppearanceConfig {
@@ -88,6 +95,11 @@ impl Default for AppearanceConfig {
             top_bar_height: 32,
             dock_mode: "overview".to_string(),
             animation_scale: 1.0,
+            dock_icon_size: 44,
+            dock_alignment: "center".to_string(),
+            top_bar_blur: false,
+            overview_blur: false,
+            reduced_motion: false,
         }
     }
 }
@@ -124,6 +136,18 @@ impl Config {
             return Err(Error::InvalidConfig(
                 "appearance.animation_scale must be >= 0".to_string(),
             ));
+        }
+        if !matches!(self.appearance.dock_alignment.as_str(), "left" | "center" | "right") {
+            return Err(Error::InvalidConfig(format!(
+                "appearance.dock_alignment: unknown value '{}'",
+                self.appearance.dock_alignment
+            )));
+        }
+        if !matches!(self.input.overview_modifier.as_str(), "Super" | "Alt" | "CtrlAlt") {
+            return Err(Error::InvalidConfig(format!(
+                "input.overview_modifier: unknown value '{}'",
+                self.input.overview_modifier
+            )));
         }
         Ok(())
     }
