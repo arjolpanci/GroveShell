@@ -64,14 +64,17 @@ impl ManagedProcesses {
         matches!(self.ui.as_mut().map(|c| c.try_wait()), Some(Ok(None)))
     }
 
-    pub fn pid_of(&self, name: &str) -> Option<u32> {
+    pub fn pid_of(&mut self, name: &str) -> Option<u32> {
         let child = match name {
-            "watchdog" => self.watchdog.as_ref(),
-            "host" => self.host.as_ref(),
-            "ui" => self.ui.as_ref(),
+            "watchdog" => self.watchdog.as_mut(),
+            "host" => self.host.as_mut(),
+            "ui" => self.ui.as_mut(),
             _ => None,
         }?;
-        Some(child.id())
+        match child.try_wait() {
+            Ok(None) => Some(child.id()),
+            _ => None,
+        }
     }
 
     /// Stops `ui` gracefully (so it restores the real taskbar/work areas

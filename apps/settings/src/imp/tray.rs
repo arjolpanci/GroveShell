@@ -143,7 +143,7 @@ pub(crate) fn is_ui_running_for_home_page() -> bool {
 }
 
 pub(crate) fn pid_for(name: &str) -> Option<u32> {
-    PROCESSES.with(|p| p.borrow().as_ref().and_then(|proc| proc.pid_of(name)))
+    PROCESSES.with(|p| p.borrow_mut().as_mut().and_then(|proc| proc.pid_of(name)))
 }
 
 /// Restore-Explorer (if `ui` is running) or Start-GroveShell (if it isn't)
