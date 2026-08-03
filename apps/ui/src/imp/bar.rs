@@ -6,7 +6,7 @@ use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteObject, Ellipse, RoundRect, SelectObject, SetBkMode, SetTextColor,
     BeginPaint, EndPaint, PAINTSTRUCT, TRANSPARENT, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
-    HOLLOW_BRUSH, GetStockObject,
+    GetStockObject, NULL_PEN,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
@@ -113,6 +113,53 @@ pub(crate) const WS_DOTS_X: i32 = ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH + 
 pub(crate) const WS_DOT_SLOT_WIDTH: i32 = 14;
 pub(crate) const WS_DOT_RADIUS: i32 = 3;
 
+/// A bar's clickable regions — shared between `on_bar_click` (dispatch),
+/// `on_bar_hover` (hover highlight + hand cursor), and `paint_bar` (the
+/// highlight itself), so all three agree on where a click target
+/// actually is. `Activities`/`Dots` exist on every monitor's bar; the
+/// rest are primary-bar-only (see `region_at`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BarRegion {
+    Activities,
+    Dots,
+    Clock,
+    QsPill,
+    SettingsGear,
+}
+
+/// Which clickable region (if any) `x` falls under, given this bar's
+/// width/dpi/primary-ness and current workspace count — a pure function
+/// of the same inputs `paint_bar` lays out from, so painting, hit-
+/// testing, and hover can never disagree.
+fn region_at(x: i32, dpi: u32, bar_width: i32, bar_h: i32, is_primary: bool, workspace_count: usize) -> Option<BarRegion> {
+    if (scaled(ACTIVITIES_LABEL_X, dpi)..scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi)).contains(&x) {
+        return Some(BarRegion::Activities);
+    }
+    let dots_x = scaled(WS_DOTS_X, dpi);
+    let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
+    let dots_width = workspace_count as i32 * dot_slot_w;
+    if (dots_x..dots_x + dots_width).contains(&x) {
+        return Some(BarRegion::Dots);
+    }
+    if !is_primary {
+        return None;
+    }
+    let clock_w = scaled(CLOCK_LABEL_WIDTH, dpi);
+    let clock_x = bar_width / 2 - clock_w / 2;
+    if (clock_x..clock_x + clock_w).contains(&x) {
+        return Some(BarRegion::Clock);
+    }
+    let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
+    if (pill.left..pill.right).contains(&x) {
+        return Some(BarRegion::QsPill);
+    }
+    let settings_rect = settings_button_rect(pill, dpi, bar_h);
+    if (settings_rect.left..settings_rect.right).contains(&x) {
+        return Some(BarRegion::SettingsGear);
+    }
+    None
+}
+
 /// Registers `bar_hwnd` as a top-edge AppBar and reserves a
 /// `bar_height`-tall strip of the monitor at `(x, y)` for it, returning
 /// the rect the system assigned (per `ABM_SETPOS` semantics, this is
@@ -197,19 +244,35 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
         let previous_font = SelectObject(hdc, font);
         let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
 
+        let hovered_region = STATE.with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|st| st.hovered_bar_region)
+                .filter(|(hover_hwnd, _)| *hover_hwnd == hwnd)
+                .map(|(_, region)| region)
+        });
+        let draw_hover_highlight = |hdc: windows::Win32::Graphics::Gdi::HDC, rect: RECT, radius: i32| {
+            let highlight = CreateSolidBrush(blend_toward_white(0x00202020, 0.15));
+            let previous_brush = SelectObject(hdc, highlight);
+            let previous_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
+            let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
+            SelectObject(hdc, previous_pen);
+            SelectObject(hdc, previous_brush);
+            let _ = DeleteObject(highlight);
+        };
+
         // Activities button + workspace dots: every monitor's bar now,
         // each reading its own monitor's tracker.
-        draw_text_in(
-            hdc,
-            RECT {
-                left: scaled(ACTIVITIES_LABEL_X, dpi),
-                top: 0,
-                right: scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi),
-                bottom: bar_h,
-            },
-            "Activities",
-            format,
-        );
+        let activities_rect = RECT {
+            left: scaled(ACTIVITIES_LABEL_X, dpi),
+            top: 0,
+            right: scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi),
+            bottom: bar_h,
+        };
+        if hovered_region == Some(BarRegion::Activities) {
+            draw_hover_highlight(hdc, activities_rect, scaled(6, dpi));
+        }
+        draw_text_in(hdc, activities_rect, "Activities", format);
 
         let (workspace_count, current_index) = STATE
             .with(|s| {
@@ -219,6 +282,15 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
                     .map(|t| (t.workspace_ids().len(), t.current_index()))
             })
             .unwrap_or((0, 0));
+        if hovered_region == Some(BarRegion::Dots) && workspace_count > 0 {
+            let dots_rect = RECT {
+                left: scaled(WS_DOTS_X, dpi),
+                top: 0,
+                right: scaled(WS_DOTS_X, dpi) + workspace_count as i32 * scaled(WS_DOT_SLOT_WIDTH, dpi),
+                bottom: bar_h,
+            };
+            draw_hover_highlight(hdc, dots_rect, scaled(6, dpi));
+        }
         let dot_mid_y = bar_h / 2;
         let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
         let dot_radius = scaled(WS_DOT_RADIUS, dpi);
@@ -235,24 +307,17 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
         let _ = DeleteObject(empty_brush);
 
         if is_primary {
-            let clock_x = bar_width / 2 - scaled(CLOCK_LABEL_WIDTH, dpi) / 2;
-            draw_text_in(
-                hdc,
-                RECT { left: clock_x, top: 0, right: clock_x + scaled(CLOCK_LABEL_WIDTH, dpi), bottom: bar_h },
-                &clock_text(),
-                format,
-            );
+            let clock_w = scaled(CLOCK_LABEL_WIDTH, dpi);
+            let clock_x = bar_width / 2 - clock_w / 2;
+            let clock_rect = RECT { left: clock_x, top: 0, right: clock_x + clock_w, bottom: bar_h };
+            if hovered_region == Some(BarRegion::Clock) {
+                draw_hover_highlight(hdc, clock_rect, scaled(6, dpi));
+            }
+            draw_text_in(hdc, clock_rect, &clock_text(), format);
 
             let (pill, slots) = qs_pill_layout(bar_width, dpi, bar_h);
-            let hovered = STATE.with(|s| s.borrow().as_ref().map(|st| st.qs_pill_hover)).unwrap_or(false);
-            if hovered {
-                let highlight = CreateSolidBrush(blend_toward_white(0x00202020, 0.15));
-                let previous_brush = SelectObject(hdc, highlight);
-                SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-                let radius = scaled(QS_PILL_RADIUS, dpi);
-                let _ = RoundRect(hdc, pill.left, pill.top, pill.right, pill.bottom, radius * 2, radius * 2);
-                SelectObject(hdc, previous_brush);
-                let _ = DeleteObject(highlight);
+            if hovered_region == Some(BarRegion::QsPill) {
+                draw_hover_highlight(hdc, pill, scaled(QS_PILL_RADIUS, dpi));
             }
 
             let glyph_color = COLORREF(0x00E0E0E0);
@@ -264,6 +329,9 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
             draw_icon(hdc, slots[2], battery_icon(pct, charging), glyph_color);
 
             let settings_rect = settings_button_rect(pill, dpi, bar_h);
+            if hovered_region == Some(BarRegion::SettingsGear) {
+                draw_hover_highlight(hdc, settings_rect, scaled(6, dpi));
+            }
             draw_text_in(hdc, settings_rect, SETTINGS_GLYPH, format);
         }
 
@@ -288,55 +356,33 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
     let Some(bar_width) = bar_width else {
         return;
     };
-
-    if (scaled(ACTIVITIES_LABEL_X, dpi)..scaled(ACTIVITIES_LABEL_X + ACTIVITIES_LABEL_WIDTH, dpi)).contains(&x) {
-        super::overview::toggle_overview_for(monitor);
-        return;
-    }
-
+    let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
     let workspace_count = STATE
         .with(|s| s.borrow().as_ref().and_then(|st| st.workspaces.get(monitor)).map(|t| t.workspace_ids().len()))
         .unwrap_or(0);
-    let dots_x = scaled(WS_DOTS_X, dpi);
-    let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
-    let dots_width = workspace_count as i32 * dot_slot_w;
-    if (dots_x..dots_x + dots_width).contains(&x) {
-        let index = ((x - dots_x) / dot_slot_w) as usize;
-        let overview_open = STATE
-            .with(|s| {
-                s.borrow().as_ref().and_then(|st| st.overviews.get(monitor))
-                    .map(|ov| matches!(ov.mode, OverviewMode::Open { .. }))
-            })
-            .unwrap_or(false);
-        if overview_open {
-            super::overview::snap_carousel_to(monitor, index, None);
-        } else {
-            super::workspaces::commit_workspace_switch(monitor, index);
+
+    match region_at(x, dpi, bar_width, bar_h, is_primary, workspace_count) {
+        Some(BarRegion::Activities) => super::overview::toggle_overview_for(monitor),
+        Some(BarRegion::Dots) => {
+            let dots_x = scaled(WS_DOTS_X, dpi);
+            let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
+            let index = ((x - dots_x) / dot_slot_w) as usize;
+            let overview_open = STATE
+                .with(|s| {
+                    s.borrow().as_ref().and_then(|st| st.overviews.get(monitor))
+                        .map(|ov| matches!(ov.mode, OverviewMode::Open { .. }))
+                })
+                .unwrap_or(false);
+            if overview_open {
+                super::overview::snap_carousel_to(monitor, index, None);
+            } else {
+                super::workspaces::commit_workspace_switch(monitor, index);
+            }
         }
-        return;
-    }
-
-    if !is_primary {
-        return;
-    }
-
-    let clock_w = scaled(CLOCK_LABEL_WIDTH, dpi);
-    let clock_x = bar_width / 2 - clock_w / 2;
-    if (clock_x..clock_x + clock_w).contains(&x) {
-        toggle_calendar();
-        return;
-    }
-
-    let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
-    let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
-    if (pill.left..pill.right).contains(&x) {
-        toggle_quick_settings();
-        return;
-    }
-
-    let settings_rect = settings_button_rect(pill, dpi, bar_h);
-    if (settings_rect.left..settings_rect.right).contains(&x) {
-        open_settings_app();
+        Some(BarRegion::Clock) => toggle_calendar(),
+        Some(BarRegion::QsPill) => toggle_quick_settings(),
+        Some(BarRegion::SettingsGear) => open_settings_app(),
+        None => {}
     }
 }
 
@@ -377,32 +423,32 @@ fn open_settings_app() {
 /// another spot on the bar. The status pill only exists on the primary
 /// bar (Quick Settings stays primary-only), so non-primary bars early
 /// return.
-pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, _y: i32, is_primary: bool) {
-    if !is_primary {
-        return;
-    }
+pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) {
     let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let bar_width = STATE.with(|s| {
-        s.borrow()
-            .as_ref()
-            .map(|st| st.primary_bar_rect.right - st.primary_bar_rect.left)
+        s.borrow().as_ref().and_then(|st| {
+            st.bars.iter().find(|b| b.hwnd == hwnd).map(|b| b.rect.right - b.rect.left)
+        })
     });
     let Some(bar_width) = bar_width else {
         return;
     };
     let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
-    let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
-    let hovered = (pill.left..pill.right).contains(&x);
+    let workspace_count = STATE
+        .with(|s| s.borrow().as_ref().and_then(|st| st.workspaces.get(monitor)).map(|t| t.workspace_ids().len()))
+        .unwrap_or(0);
+    let region = region_at(x, dpi, bar_width, bar_h, is_primary, workspace_count);
 
     let changed = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let Some(state) = state_ref.as_mut() else {
             return false;
         };
-        if state.qs_pill_hover == hovered {
+        let new_value = region.map(|r| (hwnd, r));
+        if state.hovered_bar_region == new_value {
             return false;
         }
-        state.qs_pill_hover = hovered;
+        state.hovered_bar_region = new_value;
         true
     });
     if changed {
@@ -415,33 +461,35 @@ pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, _y: i32, is_primary: bool) {
             let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
         }
     }
-    if hovered {
-        // SAFETY: a plain, fully-initialized local struct passed by
-        // pointer only for the duration of this call.
-        unsafe {
-            let mut tme = TRACKMOUSEEVENT {
-                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: hwnd,
-                dwHoverTime: 0,
-            };
-            let _ = TrackMouseEvent(&mut tme);
-        }
+    // Always re-arm: Windows only fires one `WM_MOUSELEAVE` per
+    // `TrackMouseEvent` call, so this needs to run on every move within
+    // the bar (regardless of which region, if any, is hovered) to keep
+    // tracking active for whenever the pointer actually leaves.
+    // SAFETY: a plain, fully-initialized local struct passed by pointer
+    // only for the duration of this call.
+    unsafe {
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        let _ = TrackMouseEvent(&mut tme);
     }
 }
 
-/// Clears the status pill's hover highlight once the pointer actually
-/// leaves the bar (see `on_bar_hover`).
+/// Clears the hover highlight once the pointer actually leaves the bar
+/// (see `on_bar_hover`).
 pub(crate) fn on_bar_mouse_leave(hwnd: HWND) {
     let changed = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let Some(state) = state_ref.as_mut() else {
             return false;
         };
-        if !state.qs_pill_hover {
+        if state.hovered_bar_region.map_or(true, |(h, _)| h != hwnd) {
             return false;
         }
-        state.qs_pill_hover = false;
+        state.hovered_bar_region = None;
         true
     });
     if changed {

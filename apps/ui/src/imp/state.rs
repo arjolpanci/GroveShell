@@ -80,7 +80,12 @@ pub(crate) struct AppState {
     /// so the same delta can be applied to any of its owned windows
     /// (dialogs) — see `workspaces::sync_workspaces`.
     pub(crate) window_rects: HashMap<isize, Rect>,
-    pub(crate) qs_pill_hover: bool,
+    /// Which bar (by hwnd, since Activities/dots exist on every monitor's
+    /// bar) and which clickable region within it the cursor currently
+    /// sits over — drives both the hover-highlight paint (`bar::paint_bar`)
+    /// and the hand cursor (`WM_SETCURSOR` in `mod.rs`), so a user can
+    /// actually tell something's clickable before clicking it.
+    pub(crate) hovered_bar_region: Option<(HWND, super::bar::BarRegion)>,
     pub(crate) qs_volume_dragging: bool,
 }
 
