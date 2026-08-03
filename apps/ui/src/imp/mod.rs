@@ -443,7 +443,7 @@ pub fn main() -> Result<()> {
                 overviews,
                 window_registry: WindowRegistry::new(),
                 window_rects: std::collections::HashMap::new(),
-                qs_pill_hover: false,
+                hovered_bar_region: None,
                 qs_volume_dragging: false,
             });
         });
@@ -674,18 +674,41 @@ unsafe extern "system" fn wndproc(
                     let x = (lparam.0 & 0xFFFF) as i32;
                     on_quick_settings_mouse_move(hwnd, x);
                 }
-                Role::Bar { is_primary: true, .. } => {
+                Role::Bar { is_primary, monitor } => {
                     let x = (lparam.0 & 0xFFFF) as i32;
-                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
-                    on_bar_hover(hwnd, x, y, true);
+                    on_bar_hover(hwnd, x, is_primary, &monitor);
                 }
                 _ => {}
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSELEAVE => {
-            if let Role::Bar { is_primary: true, .. } = role {
+            if let Role::Bar { .. } = role {
                 on_bar_mouse_leave(hwnd);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SETCURSOR => {
+            // A hand cursor over a clickable bar region — the same
+            // "this hovered rect is what `on_bar_hover` just set" state
+            // the hover-highlight paint reads, so the two always agree.
+            // SAFETY: `LoadCursorW`/`SetCursor` are plain, precondition-
+            // free system calls.
+            if let Role::Bar { .. } = role {
+                let is_hovering_region = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|st| st.hovered_bar_region)
+                        .is_some_and(|(hover_hwnd, _)| hover_hwnd == hwnd)
+                });
+                if is_hovering_region {
+                    unsafe {
+                        if let Ok(cursor) = LoadCursorW(None, IDC_HAND) {
+                            SetCursor(cursor);
+                        }
+                    }
+                    return LRESULT(1);
+                }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }

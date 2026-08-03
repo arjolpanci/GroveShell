@@ -4,15 +4,16 @@
 use std::cell::RefCell;
 
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, EndPaint, FillRect, InvalidateRect, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect,
+    MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, IsWindowVisible, LoadCursorW,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, IsWindowVisible, LoadCursorW,
     RegisterClassW, SetForegroundWindow, ShowWindow, IDC_ARROW, SW_RESTORE, SW_SHOW, WM_DESTROY,
-    WM_LBUTTONDOWN, WM_PAINT, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_LBUTTONDOWN, WM_PAINT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use super::nav::{nav_hit_test, nav_layout, NAV_ITEMS};
@@ -72,13 +73,22 @@ pub(crate) fn open_settings_window() {
         };
         let _ = RegisterClassW(&class);
 
+        // No `WS_EX_TOOLWINDOW`: that style makes `groveshell_window_model`
+        // exclude this window from tracking entirely (see
+        // `crates/window-model/src/lib.rs`'s `inspect`), so it never got
+        // assigned to a workspace (workspace switches didn't park/unpark
+        // it — it just sat wherever it was, on top of whatever workspace
+        // happened to be current) and never appeared as a card in the
+        // Activities overview. A plain overlapped window is what real
+        // application windows use and is what this should behave like.
+        let (x, y) = spawn_position();
         let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
+            Default::default(),
             w!("GroveShellSettingsWindow"),
             w!("GroveShell Settings"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            200,
-            200,
+            x,
+            y,
             WINDOW_WIDTH,
             WINDOW_HEIGHT,
             None,
@@ -91,6 +101,32 @@ pub(crate) fn open_settings_window() {
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = SetForegroundWindow(hwnd);
             windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, 1, 2000, None);
+        }
+    }
+}
+
+/// Top-left corner to create the window at: centered on whichever
+/// monitor the cursor is currently over, not a fixed absolute-screen
+/// point. A fixed `(200, 200)` is always on the *primary* monitor's
+/// virtual-screen origin regardless of where the user actually is —
+/// opening Settings while working on a second monitor made it appear to
+/// jump to the other monitor entirely. Falls back to the primary
+/// monitor if the cursor position can't be read (documented-never-fails
+/// in practice, but `GetCursorPos` is technically fallible).
+fn spawn_position() -> (i32, i32) {
+    // SAFETY: plain geometry queries, no preconditions.
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let hmonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if GetMonitorInfoW(hmonitor, &mut info).as_bool() {
+            let work = info.rcWork;
+            let x = work.left + ((work.right - work.left) - WINDOW_WIDTH).max(0) / 2;
+            let y = work.top + ((work.bottom - work.top) - WINDOW_HEIGHT).max(0) / 2;
+            (x, y)
+        } else {
+            (200, 200)
         }
     }
 }
