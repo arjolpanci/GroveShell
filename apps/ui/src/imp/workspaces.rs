@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowRect, IsIconic, KillTimer, SetTimer, SetWindowPos, ShowWindow,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNA,
+    GetCursorPos, GetForegroundWindow, GetWindowRect, IsIconic, KillTimer, SetTimer, SetWindowPos,
+    ShowWindow, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNA,
 };
 
 use super::bar::refresh_bar_indicator;
@@ -179,11 +179,24 @@ pub(crate) fn commit_workspace_switch(monitor: &str, target_index: usize) {
 /// re-syncs the workspace tracker first (see `sync_workspaces`) so any
 /// window opened since the last sync lands on the workspace being left
 /// rather than silently following onto the new one.
+///
+/// The "active" monitor this switches is whichever one the cursor is
+/// currently over (`monitor_key_at_point`, same convention
+/// `movesize::toggle_overview`/hot corners already use) rather than the
+/// foreground window's monitor: focus doesn't reliably follow the mouse
+/// between monitors (clicking a window on monitor B makes it foreground,
+/// but moving the mouse back to monitor A without clicking anything
+/// doesn't change what's foreground), so keying off foreground window
+/// made this hotkey silently act on whichever monitor was last clicked
+/// into instead of the one the user is actually looking at/pointing at.
 pub(crate) fn switch_workspace_relative(delta: i32) {
     sync_workspaces();
-    // SAFETY: no preconditions.
-    let fg = unsafe { GetForegroundWindow() };
-    let Some(monitor) = super::monitors::monitor_key_of_window(fg) else {
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    // SAFETY: plain query, no preconditions.
+    if unsafe { GetCursorPos(&mut pt) }.is_err() {
+        return;
+    }
+    let Some(monitor) = super::monitors::monitor_key_at_point(pt) else {
         return;
     };
     let (target, overview_open) = STATE.with(|s| {

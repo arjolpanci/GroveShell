@@ -40,7 +40,7 @@ use super::calendar::hide_calendar;
 use super::gpu;
 use super::monitors::monitors_sorted_by_x;
 use super::quick_settings::hide_quick_settings;
-use super::state::{reference_dpi, scaled, STATE, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, BAR_HEIGHT};
+use super::state::{reference_dpi, scaled, STATE, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS};
 use super::util::{bar_font, draw_text_in, ease_out, force_foreground, progress, progress_dur};
 use super::workspaces::commit_workspace_switch;
 
@@ -224,6 +224,15 @@ pub(crate) enum OverviewMode {
         started: Instant,
         thumbs: Vec<ThumbAnim>,
         cards: Vec<CardAnim>,
+        /// Screen point the zoom expands out from/collapses into — the
+        /// on-screen center of the window that was actually focused
+        /// right before Activities opened (its thumb's displayed
+        /// position), or the card's own center as a fallback when that
+        /// window isn't found on any page. Computed once at animation
+        /// start (see `anchor_for_window`) rather than every tick, so it
+        /// stays fixed even if the carousel offset were to change mid-
+        /// animation.
+        anchor: (f64, f64),
     },
     /// Idle, fully visible; `thumbs[].rect`/`cards[].rect` are what
     /// clicks are hit-tested against (after applying the current
@@ -242,6 +251,13 @@ pub(crate) enum OverviewMode {
         /// (Escape / empty-area click — restore whatever was focused
         /// before Activities was opened instead).
         focus_after: Option<HWND>,
+        /// Same idea as `Opening::anchor`, but pointing at whichever
+        /// window is *about* to become focused (`focus_after`, or the
+        /// pre-Activities window it falls back to) — the zoom collapses
+        /// toward that window instead of always the card's center, so
+        /// closing reads as "diving into that window" rather than a
+        /// generic shrink.
+        anchor: (f64, f64),
     },
 }
 
@@ -339,12 +355,18 @@ pub(crate) fn card_layout(monitor: &str) -> (RECT, i32) {
     let ref_aspect = w / h;
     let ref_center_x_abs = (this_monitor.rect.left + this_monitor.rect.right) / 2;
 
+    // The bar's *configured* current height (see `state::bar_height_config`'s
+    // doc comment) — not the `BAR_HEIGHT` constant, which is only the
+    // original tuned default and goes stale the moment the user changes
+    // the Top Bar settings page's height slider, leaving the overview's
+    // card grid starting under a since-resized bar.
+    let bar_height = super::state::bar_height_config();
     let card_w = (w * CARD_WIDTH_FRACTION).round() as i32;
     let max_card_h =
-        (client_h - scaled(BAR_HEIGHT + CARD_MARGIN_TOP + CARD_MARGIN_BOTTOM, dpi)).max(1);
+        (client_h - scaled(bar_height + CARD_MARGIN_TOP + CARD_MARGIN_BOTTOM, dpi)).max(1);
     let card_h = ((card_w as f64 / ref_aspect).round() as i32).min(max_card_h).max(1);
 
-    let card_top = scaled(BAR_HEIGHT + CARD_MARGIN_TOP, dpi) + (max_card_h - card_h) / 2;
+    let card_top = scaled(bar_height + CARD_MARGIN_TOP, dpi) + (max_card_h - card_h) / 2;
     let card_left = (ref_center_x_abs - origin_x) - card_w / 2;
     let rect = RECT {
         left: card_left,
@@ -509,6 +531,30 @@ pub(crate) fn zoom_rect(r: RECT, anchor_x: f64, anchor_y: f64, s: f64) -> RECT {
     }
 }
 
+/// The on-screen center of `target`'s thumb — its `displayed_rect` on
+/// whichever page it lives on, at the carousel's current position — or
+/// the card's own center if `target` is `None` or isn't found among
+/// `thumbs` (e.g. it closed between capture and animation start). Used
+/// to anchor the open/close zoom on the specific window involved rather
+/// than always the card center, so the animation reads as zooming into
+/// that window instead of a generic scale.
+fn anchor_for_window(
+    thumbs: &[ThumbAnim],
+    target: Option<HWND>,
+    carousel_offset: f64,
+    pitch: i32,
+    card_rect: RECT,
+) -> (f64, f64) {
+    let card_center = (
+        (card_rect.left + card_rect.right) as f64 / 2.0,
+        (card_rect.top + card_rect.bottom) as f64 / 2.0,
+    );
+    let Some(target) = target else { return card_center };
+    let Some(thumb) = thumbs.iter().find(|t| t.hwnd == target) else { return card_center };
+    let r = displayed_rect(thumb.rect, thumb.page, carousel_offset, pitch, card_rect);
+    ((r.left + r.right) as f64 / 2.0, (r.top + r.bottom) as f64 / 2.0)
+}
+
 /// Re-syncs the workspace tracker (see `workspaces::sync_workspaces`)
 /// and builds a fresh `(cards, thumbs)` pair covering *every* current
 /// workspace's page — one wallpaper-filled card each (see
@@ -648,6 +694,8 @@ pub(crate) fn open_overview(monitor: &str) {
 
     // SAFETY: no preconditions.
     let previous_foreground = unsafe { GetForegroundWindow() };
+    let (card_rect, pitch) = card_layout(monitor);
+    let anchor = anchor_for_window(&thumbs, Some(previous_foreground), current_pos as f64, pitch, card_rect);
 
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
@@ -663,6 +711,7 @@ pub(crate) fn open_overview(monitor: &str) {
                     started: Instant::now(),
                     thumbs,
                     cards,
+                    anchor,
                 };
             }
         }
@@ -735,8 +784,10 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         // must apply the current carousel position itself rather than
         // waiting for the next tick/mouse-move. Zoom is always `1.0`
         // here since this only ever runs while `Open` (never
-        // `Opening`/`Closing`).
-        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, 1.0);
+        // `Opening`/`Closing`); the anchor is inert at zoom 1.0 (the
+        // zoom transform is the identity there), so its value doesn't
+        // matter.
+        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, 1.0, (0.0, 0.0));
         Some(())
     });
 
@@ -779,16 +830,47 @@ pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
+        let previous_foreground = state.previous_foreground;
+        // Mirrors the same fallback the close *completion* handler uses
+        // once the animation finishes (see `on_animation_tick`'s
+        // `Completion::Closed` arm): only anchor on the pre-Activities
+        // window if it's still on the workspace being closed onto,
+        // otherwise there's no specific window to zoom toward.
+        let previous_still_here = state.workspaces.get(monitor).is_some_and(|t| {
+            !previous_foreground.0.is_null()
+                && t.workspace_of(previous_foreground.0 as isize) == Some(t.current_id())
+        });
+        // Last resort before falling back to the card's plain geometric
+        // center: any window actually on the workspace being closed onto
+        // (its first, for lack of a tracked "most recently active" per
+        // workspace) — covers clicking empty card space on a *different*
+        // workspace than the one Activities opened on, where `focus_after`
+        // is `None` and the pre-Activities window has been left behind on
+        // the old workspace. Anchoring on some real window there still
+        // reads as "zooming into this workspace" instead of a generic
+        // shrink toward empty space.
+        let any_window_here = state
+            .workspaces
+            .get(monitor)
+            .and_then(|t| t.windows_on(t.current_id()).first().copied())
+            .map(|raw| HWND(raw as *mut c_void));
+        let anchor_target =
+            focus_after.or_else(|| previous_still_here.then_some(previous_foreground)).or(any_window_here);
+
         let ov = state.overviews.get_mut(monitor)?;
+        let carousel_offset = ov.carousel_offset;
 
         let mode = std::mem::replace(&mut ov.mode, OverviewMode::Closed);
         match mode {
             OverviewMode::Open { thumbs, cards } | OverviewMode::Opening { thumbs, cards, .. } => {
+                let (card_rect, pitch) = card_layout(monitor);
+                let anchor = anchor_for_window(&thumbs, anchor_target, carousel_offset, pitch, card_rect);
                 ov.mode = OverviewMode::Closing {
                     started: Instant::now(),
                     thumbs,
                     cards,
                     focus_after,
+                    anchor,
                 };
                 // Any in-progress drag/slide/search is moot once we're
                 // fading back out.
@@ -1272,7 +1354,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
         let state = s.borrow();
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
-        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0, (0.0, 0.0));
         match kind {
             MoveKind::Window { old_page } => {
                 // A real window drag: the ghost follows the cursor (root
@@ -1371,7 +1453,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
         let state = s.borrow();
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
-        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0);
+        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel_offset, 1.0, (0.0, 0.0));
         // Dock hover is root content — repaint the chrome surface.
         super::overview_gpu::paint_root(gpu, monitor, ov);
         // Thumbnail hover is card content (see `HoverTarget`) — only
@@ -1758,7 +1840,7 @@ pub(crate) fn search_layout(monitor: &str, dpi: u32, result_count: usize) -> (RE
     let width = scaled(SEARCH_PANEL_WIDTH, dpi);
     let row_h = scaled(SEARCH_ROW_HEIGHT, dpi);
     let left = (card.left + card.right) / 2 - width / 2;
-    let top = scaled(BAR_HEIGHT + SEARCH_PANEL_GAP, dpi);
+    let top = scaled(super::state::bar_height_config() + SEARCH_PANEL_GAP, dpi);
     let rows: Vec<RECT> = (0..result_count + 1)
         .map(|i| RECT {
             left,
@@ -1913,19 +1995,17 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         // center, from "current card blown up to monitor size" at the
         // closed end of the animation to normal carousel size when
         // fully open. Fully `Open` paints with no zoom (s == 1).
-        let zoom = match &ov.mode {
-            OverviewMode::Opening { started, .. } => {
+        let (zoom, (anchor_x, anchor_y)) = match &ov.mode {
+            OverviewMode::Opening { started, anchor, .. } => {
                 let t = ease_out(progress(*started));
-                OVERVIEW_ZOOM_MAX + (1.0 - OVERVIEW_ZOOM_MAX) * t
+                (OVERVIEW_ZOOM_MAX + (1.0 - OVERVIEW_ZOOM_MAX) * t, *anchor)
             }
-            OverviewMode::Closing { started, .. } => {
+            OverviewMode::Closing { started, anchor, .. } => {
                 let t = ease_out(progress(*started));
-                1.0 + (OVERVIEW_ZOOM_MAX - 1.0) * t
+                (1.0 + (OVERVIEW_ZOOM_MAX - 1.0) * t, *anchor)
             }
-            _ => 1.0,
+            _ => (1.0, (0.0, 0.0)),
         };
-        let anchor_x = (card_rect.left + card_rect.right) as f64 / 2.0;
-        let anchor_y = (card_rect.top + card_rect.bottom) as f64 / 2.0;
         let place = |base: RECT, page: usize| {
             let r = displayed_rect(base, page, ov.carousel_offset, pitch, card_rect);
             zoom_rect(r, anchor_x, anchor_y, zoom)
@@ -2847,37 +2927,38 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         }
 
         let mode = std::mem::replace(&mut ov.mode, OverviewMode::Closed);
-        let (new_mode, fade_alpha, zoom, fade_running, completion) = match mode {
-            OverviewMode::Opening { started, thumbs, cards } => {
+        let (new_mode, fade_alpha, zoom, anchor, fade_running, completion) = match mode {
+            OverviewMode::Opening { started, thumbs, cards, anchor } => {
                 let t = progress(started);
                 let eased = ease_out(t);
                 let alpha = (eased * 255.0).round() as u8;
                 let zoom = OVERVIEW_ZOOM_MAX + (1.0 - OVERVIEW_ZOOM_MAX) * eased;
                 if t >= 1.0 {
-                    (OverviewMode::Open { thumbs, cards }, Some(255u8), 1.0, false, Some(Completion::Opened))
+                    (OverviewMode::Open { thumbs, cards }, Some(255u8), 1.0, anchor, false, Some(Completion::Opened))
                 } else {
-                    (OverviewMode::Opening { started, thumbs, cards }, Some(alpha), zoom, true, None)
+                    (OverviewMode::Opening { started, thumbs, cards, anchor }, Some(alpha), zoom, anchor, true, None)
                 }
             }
-            OverviewMode::Closing { started, thumbs, cards, focus_after } => {
+            OverviewMode::Closing { started, thumbs, cards, focus_after, anchor } => {
                 let t = progress(started);
                 let eased = ease_out(t);
                 let alpha = ((1.0 - eased) * 255.0).round() as u8;
                 let zoom = 1.0 + (OVERVIEW_ZOOM_MAX - 1.0) * eased;
                 if t >= 1.0 {
                     let _ = thumbs;
-                    (OverviewMode::Closed, None, 1.0, false, Some(Completion::Closed { focus_after }))
+                    (OverviewMode::Closed, None, 1.0, anchor, false, Some(Completion::Closed { focus_after }))
                 } else {
                     (
-                        OverviewMode::Closing { started, thumbs, cards, focus_after },
+                        OverviewMode::Closing { started, thumbs, cards, focus_after, anchor },
                         Some(alpha),
                         zoom,
+                        anchor,
                         true,
                         None,
                     )
                 }
             }
-            other => (other, None, 1.0, false, None),
+            other => (other, None, 1.0, (0.0, 0.0), false, None),
         };
         ov.mode = new_mode;
 
@@ -2902,6 +2983,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
             ov.hwnd,
             fade_alpha,
             zoom,
+            anchor,
             ov.carousel_offset,
             completion,
             carousel_close_after,
@@ -2917,6 +2999,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         overview_hwnd,
         fade_alpha,
         zoom,
+        anchor,
         carousel_offset,
         completion,
         carousel_close_after,
@@ -2953,7 +3036,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         let state = s.borrow();
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
-        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, zoom);
+        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, zoom, anchor);
         // The drag-pop ghost's scale and the dock's hover-glow both
         // ease continuously while active, so — unlike every other
         // root/card repaint in this module — this one *does* need to

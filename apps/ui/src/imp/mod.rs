@@ -113,6 +113,8 @@ pub fn main() -> Result<()> {
     let config = groveshell_config::load_or_default(&config_path);
     tracing::info!(?config, "configuration loaded");
     state::set_animation_config(config.appearance.animation_scale, config.appearance.reduced_motion);
+    state::set_dock_config(config.appearance.dock_icon_size as i32, &config.appearance.dock_alignment);
+    state::set_bar_height_config(config.appearance.top_bar_height as i32);
 
     std::thread::spawn(config_reload_listener);
 
@@ -782,6 +784,8 @@ unsafe extern "system" fn wndproc(
                     new_config.appearance.animation_scale,
                     new_config.appearance.reduced_motion,
                 );
+                state::set_dock_config(new_config.appearance.dock_icon_size as i32, &new_config.appearance.dock_alignment);
+                state::set_bar_height_config(new_config.appearance.top_bar_height as i32);
                 STATE.with(|s| {
                     if let Some(state) = s.borrow_mut().as_mut() {
                         state.config = new_config;
@@ -878,7 +882,13 @@ unsafe extern "system" fn wndproc(
                     let primary =
                         STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
                     if let Some(primary) = primary {
-                        let _ = InvalidateRect(primary, None, true);
+                        // `bErase: false` — only the clock/tray-icon
+                        // content changes every tick, never the bar's
+                        // static background, so erasing here bought
+                        // nothing but a visible flash every second
+                        // (worst on the icons, which get fully cleared
+                        // then redrawn on top of the flash).
+                        let _ = InvalidateRect(primary, None, false);
                     }
                     // Explorer re-shows an auto-hidden taskbar on edge
                     // hover or the Win key; while this shell runs it

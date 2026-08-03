@@ -20,11 +20,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::icons::{battery_icon, draw_icon, volume_icon, Icon};
 use super::quick_settings::{battery_status, get_mute, get_volume_percent, toggle_quick_settings};
 use super::overview::OverviewMode;
-use super::state::{scaled, STATE};
+use super::state::STATE;
 use super::util::{bar_font, draw_text_in, blend_toward_white};
 use super::wifi::wifi_radio_on;
 use super::calendar::clock_text;
 use super::calendar::toggle_calendar;
+
+/// This file's own DPI-scaling entry point, used instead of
+/// `state::scaled` directly: every 96-DPI constant in this file
+/// (including `state::BAR_HEIGHT` itself, used below for `bar_h`) was
+/// tuned against the bar's *original* fixed height, so scaling by DPI
+/// alone left every icon/glyph/dot the same size when the user grew the
+/// bar via the Top Bar settings page's height slider — only the window
+/// grew, recentring the same-size contents in extra empty space. Scaling
+/// every constant by `bar_content_scale()` first (the ratio between the
+/// configured height and the tuned baseline) before the usual DPI scale
+/// makes the bar's contents actually grow with it.
+fn scaled(v: i32, dpi: u32) -> i32 {
+    super::state::scaled((v as f64 * super::state::bar_content_scale()).round() as i32, dpi)
+}
 
 /// 96-DPI layout of the status pill (Wi-Fi/volume/battery glyphs) that
 /// replaced the old plain "42% Quick Settings" text label — one click
@@ -393,8 +407,12 @@ pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, _y: i32, is_primary: bool) {
     });
     if changed {
         // SAFETY: `hwnd` is the bar window currently handling this move.
+        // `bErase: false` — only the hover highlight changed, not the
+        // bar's static background, so there's nothing to erase; erasing
+        // anyway forces a visible clear-then-redraw flash on every
+        // hover-state change.
         unsafe {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
         }
     }
     if hovered {
@@ -428,19 +446,31 @@ pub(crate) fn on_bar_mouse_leave(hwnd: HWND) {
     });
     if changed {
         // SAFETY: `hwnd` is the bar window that just received
-        // `WM_MOUSELEAVE`.
+        // `WM_MOUSELEAVE`. `bErase: false` — see `on_bar_hover`.
         unsafe {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
         }
     }
 }
 
+/// Repaints every monitor's bar so its workspace dots pick up the change.
+/// Every monitor paints its own Activities/dots from its own monitor's
+/// `STATE.workspaces` entry (see this file's top-of-file doc comment), so
+/// invalidating only `primary_bar_hwnd` left non-primary bars showing
+/// stale dots until something else happened to repaint them.
 pub(crate) fn refresh_bar_indicator() {
-    let primary = STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
-    if let Some(primary) = primary {
-        // SAFETY: `primary` is a valid, process-lifetime window.
-        unsafe {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(primary, None, true);
+    let bar_hwnds: Vec<HWND> = STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|st| st.bars.iter().map(|b| b.hwnd).collect())
+            .unwrap_or_default()
+    });
+    // SAFETY: every bar hwnd is a valid, process-lifetime window.
+    // `bErase: false` — only the workspace dots changed, not the bar's
+    // static background; erasing anyway flickers on every switch.
+    unsafe {
+        for bar_hwnd in bar_hwnds {
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(bar_hwnd, None, false);
         }
     }
 }

@@ -169,6 +169,44 @@ fn find_any_window_by_class(class_name: &str) -> bool {
     state.found
 }
 
+/// `EnumWindows` pass matching only a class name, returning the window
+/// handle instead of just a bool (unlike `find_any_window_by_class`) — used
+/// where the caller needs to post a message to the window it found.
+fn find_any_window_by_class_hwnd(class_name: &str) -> Option<windows::Win32::Foundation::HWND> {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW};
+
+    struct SearchState<'a> {
+        class_name: &'a str,
+        found: Option<HWND>,
+    }
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` was created from a live `&mut SearchState` in
+        // the call below and this callback only runs synchronously within
+        // that call's lifetime.
+        let state = &mut *(lparam.0 as *mut SearchState);
+        let mut buf = [0u16; 256];
+        // SAFETY: `buf` outlives this call and is large enough for any
+        // real window class name.
+        let len = unsafe { GetClassNameW(hwnd, &mut buf) };
+        let name = String::from_utf16_lossy(&buf[..len as usize]);
+        if name == state.class_name {
+            state.found = Some(hwnd);
+            return BOOL(0); // stop enumerating
+        }
+        TRUE
+    }
+
+    let mut state = SearchState { class_name, found: None };
+    // SAFETY: `state`'s address is passed as `lparam` and only read back
+    // by `enum_proc`, synchronously, within this call's lifetime.
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut state as *mut SearchState as isize));
+    }
+    state.found
+}
+
 fn spawn_hidden(exe_name: &str) -> Option<Child> {
     let path = sibling_exe_path(exe_name);
     match Command::new(&path).spawn() {
@@ -183,14 +221,20 @@ fn spawn_hidden(exe_name: &str) -> Option<Child> {
     }
 }
 
-/// Posts `WM_CLOSE` to the `GroveShellBar`-classed window belonging to
-/// `ui_child`'s pid (triggering `ui`'s own taskbar-restore `WM_DESTROY`
-/// logic), waits up to 3 seconds for graceful exit, then force-kills.
+/// Posts `WM_CLOSE` to the `GroveShellBar`-classed window (triggering
+/// `ui`'s own taskbar-restore `WM_DESTROY` logic), then, if this process
+/// tracks `ui` as a `Child`, waits up to 3 seconds for graceful exit before
+/// force-killing it.
+///
+/// The window is found by class name alone rather than by `ui_child`'s pid:
+/// `ui_child` is `None` whenever this `ManagedProcesses` instance adopted an
+/// already-running shell instead of spawning it (see `spawn_all`'s doc
+/// comment), and in that case there is no pid to match against — but the
+/// `WM_CLOSE` still needs to reach the real running bar so the taskbar gets
+/// restored. There is at most one `GroveShellBar` window system-wide, so
+/// matching on class name alone is unambiguous.
 fn stop_ui_gracefully(ui_child: Option<Child>) {
-    let Some(mut child) = ui_child else { return };
-    let pid = child.id();
-
-    if let Some(bar_hwnd) = find_window_by_class_and_pid("GroveShellBar", pid) {
+    if let Some(bar_hwnd) = find_any_window_by_class_hwnd("GroveShellBar") {
         // SAFETY: `bar_hwnd` was just found via `EnumWindows` and is a
         // plain message post with no ownership implications.
         unsafe {
@@ -203,6 +247,7 @@ fn stop_ui_gracefully(ui_child: Option<Child>) {
         }
     }
 
+    let Some(mut child) = ui_child else { return };
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
@@ -215,14 +260,19 @@ fn stop_ui_gracefully(ui_child: Option<Child>) {
     let _ = child.wait();
 }
 
+/// Sends the shutdown message over `pipe_name` regardless of whether this
+/// process tracks `child` — the IPC connection reaches whatever process is
+/// actually listening on that named pipe, tracked or adopted (see
+/// `stop_ui_gracefully`'s doc comment for why `child` can be `None` even
+/// when the real process is alive). Only waits/force-kills when a tracked
+/// `Child` is available to wait on.
 fn stop_via_ipc_or_kill(pipe_name: &str, child: Option<Child>, shutdown_message_type: &str) {
-    let Some(mut child) = child else { return };
-
     if let Ok(mut conn) = groveshell_ipc::pipe::connect(pipe_name) {
         let envelope = groveshell_ipc::Envelope::new("groveshell-settings", shutdown_message_type, serde_json::json!({}));
         let _ = groveshell_ipc::framing::write_envelope(&mut conn, &envelope);
     }
 
+    let Some(mut child) = child else { return };
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
@@ -235,47 +285,3 @@ fn stop_via_ipc_or_kill(pipe_name: &str, child: Option<Child>, shutdown_message_
     let _ = child.wait();
 }
 
-/// `EnumWindows` pass matching both class name and owning pid — the same
-/// two-part match `scripts/dev-start.ps1`'s `Stop-UiGracefully` performs
-/// via .NET interop, ported to a direct Win32 call here.
-fn find_window_by_class_and_pid(class_name: &str, pid: u32) -> Option<windows::Win32::Foundation::HWND> {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW, GetWindowThreadProcessId};
-
-    struct SearchState<'a> {
-        class_name: &'a str,
-        pid: u32,
-        found: Option<HWND>,
-    }
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        // SAFETY: `lparam` was created from a live `&mut SearchState` in
-        // the call below and this callback only runs synchronously within
-        // that call's lifetime.
-        let state = &mut *(lparam.0 as *mut SearchState);
-        let mut window_pid = 0u32;
-        // SAFETY: `hwnd` is supplied live by `EnumWindows`.
-        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut window_pid)) };
-        if window_pid != state.pid {
-            return TRUE;
-        }
-        let mut buf = [0u16; 256];
-        // SAFETY: `buf` outlives this call and is large enough for any
-        // real window class name.
-        let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-        let name = String::from_utf16_lossy(&buf[..len as usize]);
-        if name == state.class_name {
-            state.found = Some(hwnd);
-            return BOOL(0); // stop enumerating
-        }
-        TRUE
-    }
-
-    let mut state = SearchState { class_name, pid, found: None };
-    // SAFETY: `state`'s address is passed as `lparam` and only read back by
-    // `enum_proc`, synchronously, within this call's lifetime.
-    unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut state as *mut SearchState as isize));
-    }
-    state.found
-}
