@@ -138,10 +138,15 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[C
 /// `card_layout`/`displayed_rect`/`zoom_rect` are the exact same pure
 /// functions `paint_overview` already used; only what happens with
 /// their result changes (a transform instead of a redraw).
-pub(crate) fn update_transforms(gpu: &OverviewGpuState, monitor: &str, carousel_offset: f64, zoom: f64) {
+pub(crate) fn update_transforms(
+    gpu: &OverviewGpuState,
+    monitor: &str,
+    carousel_offset: f64,
+    zoom: f64,
+    anchor: (f64, f64),
+) {
     let (card_rect, pitch) = card_layout(monitor);
-    let anchor_x = (card_rect.left + card_rect.right) as f64 / 2.0;
-    let anchor_y = (card_rect.top + card_rect.bottom) as f64 / 2.0;
+    let (anchor_x, anchor_y) = anchor;
     for card_visual in &gpu.cards {
         // The card's surface was created at its own natural rect's
         // top-left; `displayed_rect`/`zoom_rect` operate in the

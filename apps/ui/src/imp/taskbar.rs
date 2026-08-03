@@ -15,7 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::monitors::MonitorInfo;
-use super::state::{scaled, BAR_HEIGHT};
+use super::state::scaled;
 
 thread_local! {
     /// Every monitor's work area exactly as it was before this shell
@@ -122,10 +122,15 @@ pub(crate) fn set_work_area(rect: RECT) {
 /// With the taskbar hidden, its work-area reservation lingers — give
 /// every monitor's apps the full screen minus this shell's own bar.
 pub(crate) fn claim_work_areas(monitors: &[MonitorInfo]) {
+    // The bar's *configured* current height, not the `BAR_HEIGHT` tuned
+    // default — see `state::bar_height_config`'s doc comment; using the
+    // stale constant here reserved the wrong amount of space the moment
+    // the user changed the Top Bar settings page's height slider.
+    let bar_height = super::state::bar_height_config();
     for monitor in monitors {
         set_work_area(RECT {
             left: monitor.rect.left,
-            top: monitor.rect.top + scaled(BAR_HEIGHT, monitor.dpi),
+            top: monitor.rect.top + scaled(bar_height, monitor.dpi),
             right: monitor.rect.right,
             bottom: monitor.rect.bottom,
         });

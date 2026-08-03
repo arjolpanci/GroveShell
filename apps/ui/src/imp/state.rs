@@ -137,6 +137,28 @@ thread_local! {
     /// `set_animation_config`.
     static ANIMATION_SCALE: Cell<f32> = const { Cell::new(1.0) };
     static REDUCED_MOTION: Cell<bool> = const { Cell::new(false) };
+
+    /// Same idea, same reason, for `AppState.config.appearance.{dock_icon_size,dock_alignment}`:
+    /// `dock::dock_layout` used to read these straight out of `STATE`, and
+    /// is itself called from deep inside code that already holds `STATE`'s
+    /// borrow (`overview::on_overview_hover` and several other overview
+    /// call sites) — confirmed live: this crashed the process the moment
+    /// the mouse moved over an open overview, every single time, the same
+    /// "RefCell already mutably borrowed" abort `ANIMATION_SCALE` exists to
+    /// avoid for animation code. Kept in sync at the same two places as
+    /// `ANIMATION_SCALE`/`REDUCED_MOTION` via `set_dock_config`.
+    static DOCK_ICON_SIZE: Cell<i32> = const { Cell::new(44) };
+    static DOCK_ALIGNMENT: RefCell<String> = RefCell::new(String::new());
+
+    /// Same idea again for `AppState.config.appearance.top_bar_height`:
+    /// `overview::card_layout` (which needs the bar's real current height
+    /// to know where the card grid starts) is called from the same
+    /// deeply-nested overview/dock code that already holds `STATE`'s
+    /// borrow, so it reads this mirror instead of `STATE` directly. Kept
+    /// in sync at the same two places as the others, plus the live
+    /// top-bar-resize path in `mod.rs`'s `WM_APP_CONFIG_RELOADED` handler
+    /// (which already resizes the real bar windows to this value).
+    static TOP_BAR_HEIGHT: Cell<i32> = const { Cell::new(BAR_HEIGHT) };
 }
 
 /// Updates the re-entrancy-safe mirror of the animation-affecting config
@@ -151,6 +173,51 @@ pub(crate) fn set_animation_config(scale: f32, reduced_motion: bool) {
 /// `STATE.with` borrow — see `ANIMATION_SCALE`'s doc comment.
 pub(crate) fn animation_config() -> (f32, bool) {
     (ANIMATION_SCALE.with(|c| c.get()), REDUCED_MOTION.with(|c| c.get()))
+}
+
+/// Updates the re-entrancy-safe mirror of the dock-affecting config
+/// fields. Call this every time `AppState.config` is set or replaced.
+pub(crate) fn set_dock_config(icon_size: i32, alignment: &str) {
+    DOCK_ICON_SIZE.with(|c| c.set(icon_size));
+    DOCK_ALIGNMENT.with(|c| *c.borrow_mut() = alignment.to_string());
+}
+
+/// Reads the re-entrancy-safe mirror of the dock-affecting config fields.
+/// Safe to call from anywhere, including from inside an active `STATE.with`
+/// borrow — see `DOCK_ICON_SIZE`'s doc comment. Falls back to "center" if
+/// `set_dock_config` hasn't run yet (shouldn't happen outside tests: `main`
+/// sets it before any window/message loop exists).
+pub(crate) fn dock_config() -> (i32, String) {
+    let alignment = DOCK_ALIGNMENT.with(|c| c.borrow().clone());
+    (DOCK_ICON_SIZE.with(|c| c.get()), if alignment.is_empty() { "center".to_string() } else { alignment })
+}
+
+/// Updates the re-entrancy-safe mirror of the configured top bar height.
+/// Call this every time `AppState.config` is set or replaced, and whenever
+/// the live bars are resized to a new height.
+pub(crate) fn set_bar_height_config(height: i32) {
+    TOP_BAR_HEIGHT.with(|c| c.set(height));
+}
+
+/// Reads the re-entrancy-safe mirror of the configured top bar height —
+/// the bar's *actual* current height (96-DPI reference value, scale with
+/// [`scaled`] same as any other layout constant), not the `BAR_HEIGHT`
+/// constant that value was originally tuned against. Safe to call from
+/// anywhere, including from inside an active `STATE.with` borrow — see
+/// `TOP_BAR_HEIGHT`'s doc comment.
+pub(crate) fn bar_height_config() -> i32 {
+    TOP_BAR_HEIGHT.with(|c| c.get())
+}
+
+/// How much bigger the bar's *contents* (icons, dots, gear glyph, fonts —
+/// everything `bar.rs` sizes off a 96-DPI constant) should be relative to
+/// their originally-tuned size, given the configured height vs. the
+/// `BAR_HEIGHT` constant those sizes were tuned against. Growing only the
+/// bar window (via `bar_height_config`) without this left every icon the
+/// same size, just re-centered in extra empty space — this is what makes
+/// "make the bar bigger" actually make its contents bigger too.
+pub(crate) fn bar_content_scale() -> f64 {
+    bar_height_config() as f64 / BAR_HEIGHT as f64
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

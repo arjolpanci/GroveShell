@@ -43,7 +43,6 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS};
 use super::state::scaled;
 
 /// 96-DPI dock layout metrics.
-const DOCK_ICON_SIZE: i32 = 44;
 const DOCK_ICON_GAP: i32 = 14;
 const DOCK_PADDING_X: i32 = 14;
 const DOCK_PADDING_Y: i32 = 10;
@@ -116,9 +115,12 @@ pub(crate) fn anchor_x(work_area_left: i32, work_area_right: i32, content_w: i32
 pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize) -> (RECT, Vec<RECT>, Option<RECT>) {
     let (card_rect, _) = super::overview::card_layout(monitor);
     let dpi = super::state::reference_dpi();
-    let icon_size_cfg = super::state::STATE.with(|s| {
-        s.borrow().as_ref().map(|st| st.config.appearance.dock_icon_size as i32)
-    }).unwrap_or(DOCK_ICON_SIZE);
+    // Reads the re-entrancy-safe mirror, never `STATE` directly — this is
+    // called from deep inside code that may already hold `STATE`'s borrow
+    // (e.g. `overview::on_overview_hover`), and re-borrowing it here
+    // panicked every time the mouse moved over an open overview. See
+    // `state::DOCK_ICON_SIZE`'s doc comment.
+    let (icon_size_cfg, alignment) = super::state::dock_config();
     let icon_size = scaled(icon_size_cfg, dpi);
     let gap = scaled(DOCK_ICON_GAP, dpi);
     let pad_x = scaled(DOCK_PADDING_X, dpi);
@@ -134,9 +136,6 @@ pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize
     let bar_w = content_w + pad_x * 2;
     let bar_h = icon_size + pad_y * 2;
 
-    let alignment = super::state::STATE.with(|s| {
-        s.borrow().as_ref().map(|st| st.config.appearance.dock_alignment.clone())
-    }).unwrap_or_else(|| "center".to_string());
     let bar_left = anchor_x(card_rect.left, card_rect.right, bar_w, &alignment);
     let bar_bottom = card_rect.bottom + scaled(super::overview::CARD_MARGIN_BOTTOM, dpi)
         - scaled(DOCK_MARGIN_BOTTOM, dpi);

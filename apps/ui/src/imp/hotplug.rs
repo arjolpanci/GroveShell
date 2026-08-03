@@ -20,7 +20,7 @@ use groveshell_window_model::workspace::WorkspaceTracker;
 use super::bar::{register_appbar, unregister_appbar};
 use super::monitors::enumerate_monitors;
 use super::overview::OverviewInstance;
-use super::state::{scaled, BarWindow, BAR_CORNER_RADIUS, BAR_HEIGHT, STATE};
+use super::state::{scaled, BarWindow, BAR_CORNER_RADIUS, STATE};
 use super::workspaces::unpark_window;
 
 /// Re-runs monitor enumeration and diffs it against `AppState.bars` by
@@ -104,7 +104,12 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
     // rounded-corner region), just for one monitor after the fact.
     unsafe {
         let width = monitor.rect.right - monitor.rect.left;
-        let bar_height = scaled(BAR_HEIGHT, monitor.dpi);
+        // The bar's *configured* current height, matching `mod.rs::main`'s
+        // creation-time math (`scaled(config.appearance.top_bar_height, dpi)`)
+        // — using the stale `BAR_HEIGHT` constant here made a hotplugged
+        // monitor's bar the wrong height whenever the user had changed the
+        // Top Bar settings page's height slider from its default.
+        let bar_height = scaled(super::state::bar_height_config(), monitor.dpi);
         let bar_hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("GroveShellBar"),
