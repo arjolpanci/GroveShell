@@ -236,7 +236,7 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
             .unwrap_or(0);
 
         SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(super::palette::text()));
+        SetTextColor(hdc, COLORREF(super::design::color::text()));
         // The DC's default font is the fixed-size legacy "System"
         // font, which neither scales with DPI nor matches the rest
         // of the OS — use Segoe UI sized to the bar's monitor.
@@ -252,7 +252,7 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
                 .map(|(_, region)| region)
         });
         let draw_hover_highlight = |hdc: windows::Win32::Graphics::Gdi::HDC, rect: RECT, radius: i32| {
-            let highlight = CreateSolidBrush(blend_toward_white(super::palette::background(), 0.15));
+            let highlight = CreateSolidBrush(blend_toward_white(super::design::color::surface_base(), 0.15));
             let previous_brush = SelectObject(hdc, highlight);
             let previous_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
             let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
@@ -294,8 +294,8 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
         let dot_mid_y = bar_h / 2;
         let dot_slot_w = scaled(WS_DOT_SLOT_WIDTH, dpi);
         let dot_radius = scaled(WS_DOT_RADIUS, dpi);
-        let filled_brush = CreateSolidBrush(COLORREF(super::palette::accent()));
-        let empty_brush = CreateSolidBrush(COLORREF(super::palette::text_muted()));
+        let filled_brush = CreateSolidBrush(COLORREF(super::design::color::accent()));
+        let empty_brush = CreateSolidBrush(COLORREF(super::design::color::text_muted()));
         for i in 0..workspace_count {
             let cx = scaled(WS_DOTS_X, dpi) + i as i32 * dot_slot_w + dot_slot_w / 2;
             let brush = if i == current_index { filled_brush } else { empty_brush };
@@ -320,7 +320,7 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
                 draw_hover_highlight(hdc, pill, scaled(QS_PILL_RADIUS, dpi));
             }
 
-            let glyph_color = COLORREF(super::palette::text());
+            let glyph_color = COLORREF(super::design::color::text());
             let wifi_icon = if wifi_radio_on().unwrap_or(false) { Icon::Wifi } else { Icon::WifiOff };
             draw_icon(hdc, slots[0], wifi_icon, glyph_color);
             let vol_icon = volume_icon(get_mute().unwrap_or(false), get_volume_percent().unwrap_or(0));

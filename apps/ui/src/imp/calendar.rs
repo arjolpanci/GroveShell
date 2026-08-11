@@ -71,7 +71,7 @@ fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceC
     super::gpu::fill_rect(
         ctx,
         D2D_RECT_F { left: 0.0, top: 0.0, right: CAL_WIDTH as f32, bottom: CAL_HEIGHT as f32 },
-        super::palette::panel(),
+        super::design::color::surface_raised(),
     );
 
     // SAFETY: plain query, no preconditions.

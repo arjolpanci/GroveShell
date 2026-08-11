@@ -4,6 +4,7 @@
 
 mod bar;
 mod calendar;
+mod design;
 mod dock;
 mod dock_pins;
 mod gpu;
@@ -14,7 +15,6 @@ mod monitor_workspaces;
 mod movesize;
 mod overview;
 mod overview_gpu;
-mod palette;
 mod pending_launch;
 mod quick_settings;
 mod radios;
@@ -117,6 +117,7 @@ pub fn main() -> Result<()> {
     state::set_dock_config(config.appearance.dock_icon_size as i32, &config.appearance.dock_alignment);
     state::set_bar_height_config(config.appearance.top_bar_height as i32);
     state::set_compat_a11y_config(config.appearance.high_contrast, &config.compatibility.ignore);
+    design::color::refresh_accent();
 
     std::thread::spawn(config_reload_listener);
 
