@@ -5,6 +5,7 @@
 mod bar;
 mod calendar;
 mod design;
+mod desktop_dock;
 mod dock;
 mod dock_pins;
 mod flyout;
