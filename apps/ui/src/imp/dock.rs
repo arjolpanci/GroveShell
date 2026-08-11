@@ -31,7 +31,11 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER, IPersistFile, STGM_READ};
-use windows::Win32::UI::Shell::{SHGetFileInfoW, ShellExecuteW, IShellLinkW, ShellLink, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+use windows::Win32::UI::Shell::{
+    SHGetFileInfoW, SHGetImageList, ShellExecuteW, IShellLinkW, ShellLink, SHFILEINFOW, SHGFI_ICON,
+    SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHIL_JUMBO,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, SetForegroundWindow, TrackPopupMenu,
@@ -300,12 +304,56 @@ pub(crate) fn unpin_app(path: &Path) {
     });
 }
 
-/// Icon for any file path, via `SHGetFileInfoW` — cached forever per
-/// path, same tradeoff as `PINNED_ICON_CACHE`'s doc comment explains.
-/// Also usable for search results' app icons, not just the dock.
+/// The shell's 256x256 "jumbo" icon for `path`, via the system image
+/// list — much higher resolution than `SHGFI_LARGEICON`'s ~32x32, which
+/// left dock/search icons visibly blocky once stretched up to the
+/// configured `DOCK_ICON_SIZE` (44px and up, more at higher DPI or a
+/// larger configured size). `icon_to_hbitmap`/D2D's linear interpolation
+/// downscale a jumbo icon cleanly; GDI's `DrawIconEx` upscaling a small
+/// one cannot. `None` if the path has no shell icon or the jumbo image
+/// list is unavailable (older Windows) — `file_icon` falls back to the
+/// smaller icon in that case.
+fn jumbo_icon(path: &Path) -> Option<HICON> {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut info = SHFILEINFOW::default();
+    // SAFETY: `wide` is nul-terminated and outlives the call; `info` is a
+    // local, zeroed struct outliving it too. `SHGFI_SYSICONINDEX` (no
+    // `SHGFI_ICON`) only fills `info.iIcon`, allocating no icon handle.
+    let result = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            Default::default(),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        )
+    };
+    if result == 0 {
+        return None;
+    }
+    // SAFETY: `SHGetImageList` is a standard, precondition-free shell32
+    // query; the returned `IImageList` is released when it goes out of
+    // scope. `GetIcon`'s returned `HICON`, on success, is a new icon
+    // this process owns.
+    unsafe {
+        let image_list: IImageList = SHGetImageList(SHIL_JUMBO as i32).ok()?;
+        let icon = image_list.GetIcon(info.iIcon, ILD_TRANSPARENT.0).ok()?;
+        (!icon.is_invalid()).then_some(icon)
+    }
+}
+
+/// Icon for any file path — the shell's jumbo icon (`jumbo_icon`) if
+/// available, falling back to `SHGetFileInfoW`'s smaller large icon
+/// otherwise. Cached forever per path, same tradeoff as
+/// `PINNED_ICON_CACHE`'s doc comment explains. Also usable for search
+/// results' app icons, not just the dock.
 pub(crate) fn file_icon(path: &Path) -> Option<HICON> {
     if let Some(cached) = PINNED_ICON_CACHE.with(|c| c.borrow().get(path).copied()) {
         return Some(HICON(cached as *mut c_void));
+    }
+    if let Some(icon) = jumbo_icon(path) {
+        PINNED_ICON_CACHE.with(|c| c.borrow_mut().insert(path.to_path_buf(), icon.0 as isize));
+        return Some(icon);
     }
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
     let mut info = SHFILEINFOW::default();
@@ -491,7 +539,7 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
             })
             .map(|(_, w)| w.hwnd)
             .collect();
-        let icon = super::overview::window_icon(HWND(window.hwnd as *mut c_void));
+        let icon = super::overview::window_icon_large(HWND(window.hwnd as *mut c_void));
         apps.push(DockApp {
             icon,
             launch_path: None,
