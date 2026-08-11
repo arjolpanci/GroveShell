@@ -18,6 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::nav::{nav_hit_test, nav_layout, NAV_ITEMS};
 use super::pages::Page;
+use super::pages::accessibility::AccessibilityPage;
 use super::pages::dock::DockPage;
 use super::pages::home::HomePage;
 use super::pages::input::InputPage;
@@ -34,6 +35,7 @@ thread_local! {
     static TOP_BAR_PAGE: RefCell<TopBarPage> = RefCell::new(TopBarPage::new());
     static OVERVIEW_PAGE: RefCell<OverviewPage> = RefCell::new(OverviewPage::new());
     static INPUT_PAGE: RefCell<InputPage> = RefCell::new(InputPage::new());
+    static ACCESSIBILITY_PAGE: RefCell<AccessibilityPage> = RefCell::new(AccessibilityPage::new());
 }
 
 const WINDOW_WIDTH: i32 = 780;
@@ -204,6 +206,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 2 => TOP_BAR_PAGE.with(|p| p.borrow().paint(hdc, card)),
                 3 => OVERVIEW_PAGE.with(|p| p.borrow().paint(hdc, card)),
                 4 => INPUT_PAGE.with(|p| p.borrow().paint(hdc, card)),
+                5 => ACCESSIBILITY_PAGE.with(|p| p.borrow().paint(hdc, card)),
                 _ => {}
             }
 
@@ -226,6 +229,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     2 => TOP_BAR_PAGE.with(|p| p.borrow_mut().on_click(x, y, card)),
                     3 => OVERVIEW_PAGE.with(|p| p.borrow_mut().on_click(x, y, card)),
                     4 => INPUT_PAGE.with(|p| p.borrow_mut().on_click(x, y, card)),
+                    5 => ACCESSIBILITY_PAGE.with(|p| p.borrow_mut().on_click(x, y, card)),
                     _ => {}
                 }
             }
