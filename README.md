@@ -148,9 +148,12 @@ Condensed, with current status:
 - [x] Windows taskbar hidden while running, restored on exit
 - [x] Dock (pinned and running apps), overview-only, mirrored from the real taskbar's pins
 - [x] GNOME-style Quick Settings: rounded card with a drop shadow, status pill with Wi-Fi/volume/battery glyphs, working Wi-Fi/Dark Mode/Bluetooth/Airplane Mode toggles, draggable volume slider
+- [x] Unified design language: a `design::` token module (color/metrics/motion) every surface draws from, with the shell's active/focus accents following the **live Windows accent color** (updates when you change it) and high-contrast support
+- [x] System tray: a bar chevron that **hosts the real Windows hidden-icons overflow window** (best-effort across Win11 builds; hidden when no overflow window is found) alongside the curated Wi-Fi/volume/battery indicators
+- [x] Session/power menu on the bar (lock, sleep, sign out, restart, shut down) with confirms on the destructive actions
+- [x] Central settings UI — the `groveshell-settings` tray app (bar height, dock, overview, input, accessibility pages)
 - [ ] Do Not Disturb, Night Light toggles, and a brightness slider (no public API for the first two; brightness needs WMI and is unreliable on laptop panels; deferred)
-- [ ] Mirroring real system tray icons into the bar (feasibility being checked against this Windows 11 build's actual tray internals, which may need a different technique on newer builds)
-- [ ] Central settings UI (bar height, keybindings, dock pin management)
+- [~] Motion polish: shared easing/duration system and unit-tested flyout + desktop-dock-reveal state machines are in (`design::motion`, `flyout`, `desktop_dock`); wiring the grow-from-anchor animation into the existing flyout windows and building the opt-in floating desktop-dock window (`dock_mode = always`/`autohide`) are the remaining pieces, deferred for live visual verification
 
 ### Phase 5: Activities overview (done)
 - [x] One Activities overview per monitor, each with its own carousel
