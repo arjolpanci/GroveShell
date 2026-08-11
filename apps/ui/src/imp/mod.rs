@@ -19,6 +19,7 @@ mod overview_gpu;
 mod pending_launch;
 mod quick_settings;
 mod radios;
+mod session_menu;
 mod state;
 mod taskbar;
 mod theme;
