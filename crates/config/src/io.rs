@@ -41,9 +41,18 @@ pub fn save(path: &Path, config: &Config) -> Result<()> {
     }
 
     let tmp_path = path.with_extension("toml.tmp");
-    fs::write(&tmp_path, &text)?;
     {
-        let f = fs::File::open(&tmp_path)?;
+        use std::io::Write;
+        // Write and fsync through the *same write handle*. Writing with
+        // `fs::write` and then reopening via `fs::File::open` (read-only)
+        // to `sync_all` fails on Windows with ERROR_ACCESS_DENIED: there,
+        // `sync_all` calls `FlushFileBuffers`, which requires write access
+        // on the handle, so flushing a read-only handle is rejected. That
+        // made every `save` abort at the flush — before the rename — which
+        // is why settings changes silently never persisted and a stray
+        // `.tmp` was left behind with no `config.toml` written.
+        let mut f = fs::File::create(&tmp_path)?;
+        f.write_all(text.as_bytes())?;
         f.sync_all()?;
     }
     fs::rename(&tmp_path, path)?;
