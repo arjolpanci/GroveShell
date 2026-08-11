@@ -2313,10 +2313,10 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
             // Placeholder chips: fallback for windows with no snapshot
             // (capture failed, window died, or it was minimized when
             // parked) — just their last-known title.
-            let chip_brush = CreateSolidBrush(COLORREF(0x00303030));
+            let chip_brush = CreateSolidBrush(COLORREF(super::design::color::surface_overlay()));
             let null_pen = GetStockObject(NULL_PEN);
             SetBkMode(mem, TRANSPARENT);
-            SetTextColor(mem, COLORREF(0x00E0E0E0));
+            SetTextColor(mem, COLORREF(super::design::color::text()));
             for (rect, title) in &placeholders {
                 draw_shadow(mem, *rect, thumb_radius, 4);
                 let previous_brush = SelectObject(mem, chip_brush);
@@ -2361,7 +2361,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
             // any that are currently running, then its own hover glow.
             if let Some((bar_rect, dock_icons, dock_hover_glow, dock_divider)) = dock {
                 draw_shadow(mem, bar_rect, dock_radius, 4);
-                let dock_brush = CreateSolidBrush(COLORREF(0x002A2A2A));
+                let dock_brush = CreateSolidBrush(COLORREF(super::design::color::surface_raised()));
                 let null_pen = GetStockObject(NULL_PEN);
                 let previous_brush = SelectObject(mem, dock_brush);
                 let previous_pen = SelectObject(mem, null_pen);
@@ -2382,12 +2382,12 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                 // section (left) and the running-but-unpinned section
                 // (right), if there's one to draw.
                 if let Some(divider) = dock_divider {
-                    let divider_brush = CreateSolidBrush(COLORREF(0x00454545));
+                    let divider_brush = CreateSolidBrush(COLORREF(super::design::color::stroke()));
                     FillRect(mem, &divider, divider_brush);
                     let _ = DeleteObject(divider_brush);
                 }
 
-                let running_dot_brush = CreateSolidBrush(COLORREF(0x00E0E0E0));
+                let running_dot_brush = CreateSolidBrush(COLORREF(super::design::color::text()));
                 let running_dot_radius = super::dock::dock_running_dot_radius();
                 let running_dot_gap = scaled(super::dock::DOCK_RUNNING_DOT_GAP, dpi);
                 for (rect, icon, window_count) in &dock_icons {
@@ -2417,7 +2417,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                 let results = if search.is_empty() { Vec::new() } else { search_results(monitor, &search) };
                 let (panel, rows) = search_layout(monitor, dpi, results.len());
                 draw_shadow(mem, panel, thumb_radius, 4);
-                let panel_brush = CreateSolidBrush(COLORREF(0x002A2A2A));
+                let panel_brush = CreateSolidBrush(COLORREF(super::design::color::surface_raised()));
                 let null_pen = GetStockObject(NULL_PEN);
                 let previous_brush = SelectObject(mem, panel_brush);
                 let previous_pen = SelectObject(mem, null_pen);
@@ -2436,7 +2436,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
 
                 // First result gets a highlight — it's what Enter runs.
                 if !results.is_empty() {
-                    let hl_brush = CreateSolidBrush(COLORREF(0x003C3C3C));
+                    let hl_brush = CreateSolidBrush(COLORREF(super::design::color::surface_overlay()));
                     FillRect(mem, &rows[1], hl_brush);
                     let _ = DeleteObject(hl_brush);
                 }
@@ -2452,7 +2452,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                     bottom: r.bottom,
                 };
                 if search.is_empty() {
-                    SetTextColor(mem, COLORREF(0x00707070));
+                    SetTextColor(mem, COLORREF(super::design::color::text_muted()));
                     draw_text_in(
                         mem,
                         inset(&rows[0]),
@@ -2460,7 +2460,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                     );
                 } else {
-                    SetTextColor(mem, COLORREF(0x00A0A0A0));
+                    SetTextColor(mem, COLORREF(super::design::color::text_muted()));
                     draw_text_in(
                         mem,
                         inset(&rows[0]),
@@ -2468,7 +2468,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                     );
                 }
-                SetTextColor(mem, COLORREF(0x00E0E0E0));
+                SetTextColor(mem, COLORREF(super::design::color::text()));
                 let icon_size = scaled(SEARCH_ICON_SIZE, dpi);
                 let icon_gap = scaled(SEARCH_ICON_TEXT_GAP, dpi);
                 for (i, result) in results.iter().enumerate() {

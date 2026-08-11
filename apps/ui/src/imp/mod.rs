@@ -529,6 +529,33 @@ fn set_blur_behind(hwnd: HWND, enabled: bool) {
 /// `apps/settings/src/imp/tray.rs`'s `WM_TRAYICON` uses.
 const WM_APP_CONFIG_RELOADED: u32 = WM_APP + 1;
 
+/// Sent by DWM to every top-level window when the user changes their
+/// Windows accent color. Not surfaced by the `windows` crate under a
+/// friendly name, so it's defined here (the documented value).
+const WM_DWMCOLORIZATIONCOLORCHANGED: u32 = 0x0320;
+
+/// Invalidates every shell window (bars, overviews, and the two flyouts)
+/// so a palette-affecting change — currently a live accent-color update —
+/// repaints them all. Reads only HWNDs out of `STATE`, briefly.
+fn invalidate_all_shell_windows() {
+    let hwnds: Vec<HWND> = STATE.with(|s| {
+        let state = s.borrow();
+        let Some(st) = state.as_ref() else { return Vec::new() };
+        let mut v: Vec<HWND> = st.bars.iter().map(|b| b.hwnd).collect();
+        v.extend(st.overviews.values().map(|o| o.hwnd));
+        v.push(st.calendar_hwnd);
+        v.push(st.quick_settings_hwnd);
+        v
+    });
+    for hwnd in hwnds {
+        // SAFETY: each hwnd is a live shell window owned by this process;
+        // `InvalidateRect` on a stale handle is a harmless no-op.
+        unsafe {
+            let _ = InvalidateRect(hwnd, None, true);
+        }
+    }
+}
+
 /// Binds the `groveshell-ui` pipe and, on each `config.reload` message,
 /// reloads `config.toml` and posts `WM_APP_CONFIG_RELOADED` to the
 /// primary bar's window so the actual re-apply happens on the main
@@ -884,6 +911,14 @@ unsafe extern "system" fn wndproc(
                     let _ = InvalidateRect(*overview_hwnd, None, true);
                 }
             }
+            LRESULT(0)
+        }
+        WM_DWMCOLORIZATIONCOLORCHANGED => {
+            // The user changed their Windows accent — re-read it and
+            // repaint every shell surface so active dots, focus rings, and
+            // toggles pick up the new color live (spec §3.1 / §6.2).
+            design::color::refresh_accent();
+            invalidate_all_shell_windows();
             LRESULT(0)
         }
         WM_HOTKEY => {
