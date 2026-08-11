@@ -18,6 +18,65 @@ $hostErrLog = "$repoRoot\target\groveshell-host.stderr.log"
 $watchdogErrLog = "$repoRoot\target\groveshell-watchdog.stderr.log"
 $uiErrLog = "$repoRoot\target\groveshell-ui.stderr.log"
 
+# Interop for gracefully closing a running groveshell-ui by posting WM_CLOSE
+# to its bar window (used by Stop-ExistingGroveShell and Stop-UiGracefully).
+# Defined before the build because the build has to stop a previous run
+# first: a running groveshell-*.exe locks its own file, so cargo's relink
+# fails with "Access is denied" (the error this script used to die on when
+# groveshell-settings.exe was still resident in the tray).
+Add-Type @"
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public class GroveNative {
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
+    public delegate bool EnumProc(IntPtr hwnd, IntPtr lp);
+    [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hwnd, StringBuilder sb, int max);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
+}
+"@
+
+# Stop any groveshell-* processes left over from a previous run before
+# building. groveshell-ui is closed via WM_CLOSE first so it restores the
+# Windows taskbar/work areas (a force kill would leave the taskbar hidden);
+# every other groveshell-* process (settings, host, watchdog) is stopped
+# outright. Without this, cargo can't overwrite a running .exe.
+function Stop-ExistingGroveShell {
+    $ui = Get-Process -Name 'groveshell-ui' -ErrorAction SilentlyContinue
+    foreach ($p in $ui) {
+        $uiPid = $p.Id
+        $cb = {
+            param($hwnd, $lp)
+            $windowPid = [uint32]0
+            [GroveNative]::GetWindowThreadProcessId($hwnd, [ref]$windowPid) | Out-Null
+            if ($windowPid -eq $uiPid) {
+                $sb = New-Object System.Text.StringBuilder 256
+                [GroveNative]::GetClassName($hwnd, $sb, 256) | Out-Null
+                if ($sb.ToString() -eq 'GroveShellBar') {
+                    [GroveNative]::PostMessage($hwnd, 0x10, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+                }
+            }
+            return $true
+        }
+        [GroveNative]::EnumWindows($cb, [IntPtr]::Zero) | Out-Null
+    }
+    if ($ui) {
+        $deadline = (Get-Date).AddSeconds(3)
+        while ((Get-Date) -lt $deadline -and (Get-Process -Name 'groveshell-ui' -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    $remaining = Get-Process -Name 'groveshell-*' -ErrorAction SilentlyContinue
+    if ($remaining) {
+        Write-Host "Stopping $($remaining.Count) leftover GroveShell process(es) before build..."
+        $remaining | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+    }
+}
+
+Stop-ExistingGroveShell
+
 Write-Host "Building workspace..."
 cargo build --workspace --manifest-path "$repoRoot\Cargo.toml"
 if ($LASTEXITCODE -ne 0) {
@@ -32,18 +91,7 @@ $script:uiProc = $null
 # groveshell-ui restores the Windows taskbar/work areas in its WM_DESTROY
 # handler, so it must be closed via WM_CLOSE, not Stop-Process — a force
 # kill leaves the real taskbar hidden and the desktop without a Start menu.
-Add-Type @"
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public class GroveNative {
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
-    public delegate bool EnumProc(IntPtr hwnd, IntPtr lp);
-    [DllImport("user32.dll")] public static extern int GetClassName(IntPtr hwnd, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
-    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
-}
-"@
+# (The GroveNative interop it uses is defined above, before the build.)
 
 function Stop-UiGracefully {
     if (-not (Test-Alive $script:uiProc)) { return $false }

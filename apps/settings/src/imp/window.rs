@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, IsWindowVisible, LoadCursorW,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, LoadCursorW,
     RegisterClassW, SetForegroundWindow, ShowWindow, IDC_ARROW, SW_RESTORE, SW_SHOW, WM_DESTROY,
     WM_LBUTTONDOWN, WM_PAINT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
@@ -246,12 +246,4 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
-}
-
-pub(crate) fn is_settings_window_open() -> bool {
-    WINDOW_HWND.with(|w| {
-        w.borrow()
-            .map(|hwnd| unsafe { IsWindowVisible(hwnd) }.as_bool())
-            .unwrap_or(false)
-    })
 }
