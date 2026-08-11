@@ -22,6 +22,7 @@ mod radios;
 mod state;
 mod taskbar;
 mod theme;
+mod tray;
 mod util;
 mod wifi;
 mod workspaces;
