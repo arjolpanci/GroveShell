@@ -174,6 +174,27 @@ thread_local! {
     /// the same two places as the others via `set_compat_a11y_config`.
     static HIGH_CONTRAST: Cell<bool> = const { Cell::new(false) };
     static IGNORE_RULES: RefCell<Vec<groveshell_config::IgnoreRule>> = const { RefCell::new(Vec::new()) };
+
+    /// The live Windows accent color as a `COLORREF`, read from the DWM
+    /// registry by `design::color::refresh_accent` at startup and whenever
+    /// Windows broadcasts a colorization change. Same re-entrancy-safe
+    /// mirror pattern as above so `design::color::accent()` — called from
+    /// deep inside bar/flyout painting that already holds `STATE`'s borrow —
+    /// can read it without touching `STATE`. Defaults to the fallback accent
+    /// (`#4CC2FF`) until the first read.
+    static ACCENT: Cell<u32> = const { Cell::new(0x00FF_C24C) };
+}
+
+/// Stores the current accent `COLORREF`. Called by
+/// `design::color::refresh_accent` after reading the registry.
+pub(crate) fn set_accent(colorref: u32) {
+    ACCENT.with(|c| c.set(colorref));
+}
+
+/// The live accent `COLORREF`. Safe to call from inside a held `STATE`
+/// borrow — see the mirror's doc comment.
+pub(crate) fn accent() -> u32 {
+    ACCENT.with(|c| c.get())
 }
 
 /// Updates the re-entrancy-safe mirror of the high-contrast flag and the
