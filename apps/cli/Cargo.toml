@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 groveshell-common = { workspace = true }
+groveshell-config = { workspace = true }
 groveshell-ipc = { workspace = true }
 groveshell-window-model = { workspace = true }
 serde_json = { workspace = true }

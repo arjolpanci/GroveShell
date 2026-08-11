@@ -25,8 +25,19 @@ mod imp {
         Shutdown,
         /// Lists eligible top-level windows (the same set the shell manages).
         ListWindows,
-        /// Lists connected monitors with their bounds and work areas.
+        /// Lists connected monitors with their bounds, work areas, and DPI.
         ListMonitors,
+        /// Prints a JSON snapshot of windows + monitors to stdout, honoring
+        /// the configured privacy redaction of window titles.
+        DumpState,
+        /// Collects config, logs, and a state dump into a timestamped
+        /// diagnostics bundle for attaching to a bug report.
+        Diagnostics {
+            /// Directory to write the bundle into (a timestamped subfolder
+            /// is created inside it). Defaults to `<data_dir>/diagnostics`.
+            #[arg(long)]
+            out: Option<std::path::PathBuf>,
+        },
     }
 
     pub fn main() -> Result<()> {
@@ -38,6 +49,8 @@ mod imp {
             Command::Shutdown => shutdown(),
             Command::ListWindows => list_windows(),
             Command::ListMonitors => list_monitors(),
+            Command::DumpState => dump_state(),
+            Command::Diagnostics { out } => diagnostics(out),
         }
     }
 
@@ -69,7 +82,7 @@ mod imp {
     fn list_monitors() -> Result<()> {
         groveshell_window_model::make_process_dpi_aware();
         let monitors = groveshell_window_model::monitors();
-        println!("{:<8} {:<26} {:<26}", "PRIMARY", "BOUNDS", "WORK AREA");
+        println!("{:<8} {:<26} {:<26} {:<10}", "PRIMARY", "BOUNDS", "WORK AREA", "DPI/SCALE");
         for m in &monitors {
             let bounds = format!(
                 "({},{})-({},{})",
@@ -79,9 +92,127 @@ mod imp {
                 "({},{})-({},{})",
                 m.work.left, m.work.top, m.work.right, m.work.bottom
             );
-            println!("{:<8} {:<26} {:<26}", if m.is_primary { "yes" } else { "no" }, bounds, work);
+            let dpi = format!("{} ({:.0}%)", m.dpi, groveshell_window_model::scale_for_dpi(m.dpi) * 100.0);
+            println!(
+                "{:<8} {:<26} {:<26} {:<10}",
+                if m.is_primary { "yes" } else { "no" },
+                bounds,
+                work,
+                dpi
+            );
         }
         println!("{} monitor(s)", monitors.len());
+        Ok(())
+    }
+
+    /// Whether window titles should be redacted anywhere this process
+    /// writes them out, per the on-disk config's `[privacy]` section
+    /// (defaults to redacting, so a missing/unreadable config is treated
+    /// as the private choice).
+    fn redact_titles() -> bool {
+        match groveshell_common::paths::data_dir() {
+            Ok(dir) => groveshell_config::load_or_default(&dir.join("config.toml"))
+                .privacy
+                .redact_window_titles,
+            Err(_) => true,
+        }
+    }
+
+    /// A JSON value describing the current window + monitor state, with
+    /// window titles redacted when `redact` is set. Shared by `dump-state`
+    /// (stdout) and `diagnostics` (bundle file) so both stay consistent.
+    fn state_json(redact: bool) -> serde_json::Value {
+        groveshell_window_model::make_process_dpi_aware();
+        let windows: Vec<serde_json::Value> = groveshell_window_model::snapshot()
+            .into_iter()
+            .map(|w| {
+                serde_json::json!({
+                    "hwnd": format!("{:#x}", w.hwnd),
+                    "pid": w.pid,
+                    "exe": w.exe_name,
+                    "class": w.class,
+                    "title": if redact { "<redacted>".to_string() } else { w.title },
+                    "rect": [w.rect.left, w.rect.top, w.rect.right, w.rect.bottom],
+                })
+            })
+            .collect();
+        let monitors: Vec<serde_json::Value> = groveshell_window_model::monitors()
+            .into_iter()
+            .map(|m| {
+                serde_json::json!({
+                    "primary": m.is_primary,
+                    "dpi": m.dpi,
+                    "scale": groveshell_window_model::scale_for_dpi(m.dpi),
+                    "bounds": [m.rect.left, m.rect.top, m.rect.right, m.rect.bottom],
+                    "work": [m.work.left, m.work.top, m.work.right, m.work.bottom],
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "windows": windows,
+            "monitors": monitors,
+            "titles_redacted": redact,
+        })
+    }
+
+    fn dump_state() -> Result<()> {
+        let state = state_json(redact_titles());
+        println!("{}", serde_json::to_string_pretty(&state)?);
+        Ok(())
+    }
+
+    /// Collects config (+ backup), all rotating log files, and a state dump
+    /// into a fresh timestamped folder, then prints its path. Titles in the
+    /// state dump follow the privacy setting; the raw log files are copied
+    /// verbatim (they already avoid recording titles, per PROJECT_PLAN §12).
+    fn diagnostics(out: Option<std::path::PathBuf>) -> Result<()> {
+        use std::fs;
+
+        let data_dir = groveshell_common::paths::data_dir()?;
+        let base = out.unwrap_or_else(|| data_dir.join("diagnostics"));
+        // Seconds since the epoch keeps the folder name sortable and needs
+        // no date-formatting dependency.
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bundle = base.join(format!("groveshell-diagnostics-{stamp}"));
+        fs::create_dir_all(&bundle)?;
+
+        // Config and its known-good backup, if present.
+        for name in ["config.toml", "config.toml.bak"] {
+            let src = data_dir.join(name);
+            if src.exists() {
+                let _ = fs::copy(&src, bundle.join(name));
+            }
+        }
+
+        // Every rotating log file.
+        let mut log_count = 0;
+        if let Ok(log_dir) = groveshell_common::paths::log_dir() {
+            if let Ok(entries) = fs::read_dir(&log_dir) {
+                for entry in entries.flatten() {
+                    if entry.path().is_file() {
+                        if let Some(name) = entry.path().file_name() {
+                            if fs::copy(entry.path(), bundle.join(name)).is_ok() {
+                                log_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // State dump (privacy-aware).
+        let redact = redact_titles();
+        let state = serde_json::to_string_pretty(&state_json(redact))?;
+        fs::write(bundle.join("state.json"), state)?;
+
+        println!("diagnostics bundle written to {}", bundle.display());
+        println!(
+            "  config + backup, {log_count} log file(s), state.json (titles {})",
+            if redact { "redacted" } else { "included" }
+        );
         Ok(())
     }
 
