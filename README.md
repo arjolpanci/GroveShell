@@ -163,10 +163,12 @@ Condensed, with current status:
 - [x] Application and window search, always visible, not just while typing (type to search, Enter activates the top result)
 
 ### Phase 6: Hardening and accessibility
-- [ ] Mixed-DPI and display-topology testing
-- [ ] UI Automation semantics, keyboard-only traversal
-- [ ] High-contrast and reduced-motion options
-- [ ] Compatibility rules and ignore list
+- [x] Mixed-DPI handling with tested logical/physical conversion helpers; `groveshell-cli list-monitors` shows per-monitor DPI and scale
+- [x] Accessible window names; reduced-motion and high-contrast options (Settings → Accessibility)
+- [x] Compatibility rules and ignore list (`[compatibility]` in config), with a [published compatibility matrix](docs/compatibility.md)
+- [x] Diagnostics bundle (`groveshell-cli diagnostics`) and privacy controls (window-title redaction, telemetry off by default)
+- [x] Recovery-matrix, soak, and crash-injection scripts under `scripts/`
+- [ ] Full multi-monitor / Narrator / long-soak sign-off on real hardware (see [docs/compatibility.md](docs/compatibility.md), "pending hardware")
 
 ### Phase 7: Optional Explorer replacement
 - [ ] Opt-in shell mode for a dedicated test account, with safe mode and full uninstall
