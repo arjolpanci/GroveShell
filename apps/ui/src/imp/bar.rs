@@ -531,12 +531,18 @@ pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
     });
     if changed {
         // SAFETY: `hwnd` is the bar window currently handling this move.
-        // `bErase: false` — only the hover highlight changed, not the
-        // bar's static background, so there's nothing to erase; erasing
-        // anyway forces a visible clear-then-redraw flash on every
-        // hover-state change.
+        // `bErase: true` is required for *correctness*, not just cleanliness:
+        // `paint_bar` draws with `SetBkMode(TRANSPARENT)` and never fills the
+        // bar background itself, so the only thing that clears a previously
+        // drawn hover highlight is the class-brush erase `BeginPaint` does
+        // when the update region was invalidated with erase requested. With
+        // `bErase: false` the old rounded highlight was left painted on the
+        // bar after the pointer moved off a region (the reported "hover
+        // never fades out" bug). Erasing only fires here on an actual
+        // hover-state *change* (guarded by `changed`), not every pixel of
+        // movement, so there's no continuous flicker.
         unsafe {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
         }
     }
     // Always re-arm: Windows only fires one `WM_MOUSELEAVE` per
@@ -572,9 +578,10 @@ pub(crate) fn on_bar_mouse_leave(hwnd: HWND) {
     });
     if changed {
         // SAFETY: `hwnd` is the bar window that just received
-        // `WM_MOUSELEAVE`. `bErase: false` — see `on_bar_hover`.
+        // `WM_MOUSELEAVE`. `bErase: true` so the class-brush erase clears
+        // the highlight that was under the pointer — see `on_bar_hover`.
         unsafe {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, false);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(hwnd, None, true);
         }
     }
 }
