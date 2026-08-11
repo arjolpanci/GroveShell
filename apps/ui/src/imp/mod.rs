@@ -7,6 +7,7 @@ mod calendar;
 mod design;
 mod dock;
 mod dock_pins;
+mod flyout;
 mod gpu;
 mod hotplug;
 mod icons;
