@@ -60,6 +60,21 @@ const SETTINGS_GLYPH: &str = "\u{2699}"; // U+2699 GEAR
 const SETTINGS_BUTTON_WIDTH: i32 = 20;
 const SETTINGS_BUTTON_GAP: i32 = 6;
 
+/// The tray-overflow chevron, sitting just left of the settings gear. Only
+/// painted/hit-tested when a real overflow window exists to host (see
+/// `tray::overflow_available`).
+const TRAY_CHEVRON_GLYPH: &str = "\u{25BE}"; // U+25BE BLACK DOWN-POINTING SMALL TRIANGLE
+const TRAY_CHEVRON_WIDTH: i32 = 18;
+const TRAY_CHEVRON_GAP: i32 = 4;
+
+/// The tray chevron's rect, just left of the settings button — a pure
+/// function of the settings rect so paint and hit-test agree.
+fn tray_chevron_rect(settings_rect: RECT, dpi: u32, bar_h: i32) -> RECT {
+    let w = scaled(TRAY_CHEVRON_WIDTH, dpi);
+    let gap = scaled(TRAY_CHEVRON_GAP, dpi);
+    RECT { left: settings_rect.left - gap - w, top: 0, right: settings_rect.left - gap, bottom: bar_h }
+}
+
 /// The status pill's own rect and its three icon slots, in physical
 /// pixels at `dpi` — a pure function of `bar_width`/`dpi` so painting
 /// and hit-testing can never disagree, same pattern as the overview's
@@ -125,6 +140,7 @@ pub(crate) enum BarRegion {
     Clock,
     QsPill,
     SettingsGear,
+    TrayChevron,
 }
 
 /// Which clickable region (if any) `x` falls under, given this bar's
@@ -156,6 +172,12 @@ fn region_at(x: i32, dpi: u32, bar_width: i32, bar_h: i32, is_primary: bool, wor
     let settings_rect = settings_button_rect(pill, dpi, bar_h);
     if (settings_rect.left..settings_rect.right).contains(&x) {
         return Some(BarRegion::SettingsGear);
+    }
+    if super::tray::overflow_available() {
+        let chevron = tray_chevron_rect(settings_rect, dpi, bar_h);
+        if (chevron.left..chevron.right).contains(&x) {
+            return Some(BarRegion::TrayChevron);
+        }
     }
     None
 }
@@ -333,6 +355,14 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
                 draw_hover_highlight(hdc, settings_rect, scaled(6, dpi));
             }
             draw_text_in(hdc, settings_rect, SETTINGS_GLYPH, format);
+
+            if super::tray::overflow_available() {
+                let chevron = tray_chevron_rect(settings_rect, dpi, bar_h);
+                if hovered_region == Some(BarRegion::TrayChevron) {
+                    draw_hover_highlight(hdc, chevron, scaled(6, dpi));
+                }
+                draw_text_in(hdc, chevron, TRAY_CHEVRON_GLYPH, format);
+            }
         }
 
         SelectObject(hdc, previous_font);
@@ -382,6 +412,27 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
         Some(BarRegion::Clock) => toggle_calendar(),
         Some(BarRegion::QsPill) => toggle_quick_settings(),
         Some(BarRegion::SettingsGear) => open_settings_app(),
+        Some(BarRegion::TrayChevron) => {
+            // Host the real Windows overflow window under the chevron. Needs
+            // the chevron's screen rect and this bar's monitor span, which
+            // the bar's own rect provides.
+            let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
+            let settings_rect = settings_button_rect(pill, dpi, bar_h);
+            let chevron = tray_chevron_rect(settings_rect, dpi, bar_h);
+            if let Some((bar_left, bar_top, bar_right, bar_bottom)) = STATE.with(|s| {
+                s.borrow().as_ref().and_then(|st| {
+                    st.bars.iter().find(|b| b.hwnd == hwnd).map(|b| (b.rect.left, b.rect.top, b.rect.right, b.rect.bottom))
+                })
+            }) {
+                let screen = RECT {
+                    left: bar_left + chevron.left,
+                    top: bar_top,
+                    right: bar_left + chevron.right,
+                    bottom: bar_bottom,
+                };
+                super::tray::toggle_overflow(screen, bar_left, bar_right);
+            }
+        }
         None => {}
     }
 }
