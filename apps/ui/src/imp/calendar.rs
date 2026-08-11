@@ -87,7 +87,7 @@ fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceC
         ctx,
         D2D_RECT_F { left: CAL_PADDING as f32, top: 8.0, right: (CAL_WIDTH - CAL_PADDING) as f32, bottom: 32.0 },
         &format!("{} {year}", month_name(month)),
-        0x00FFFFFF,
+        super::design::color::text(),
         16.0,
         true,
     );
@@ -100,7 +100,7 @@ fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceC
             ctx,
             D2D_RECT_F { left: x as f32, top: 40.0, right: (x + cell_w) as f32, bottom: 60.0 },
             label,
-            0x00A0A0A0,
+            super::design::color::text_muted(),
             12.0,
             true,
         );
@@ -112,7 +112,7 @@ fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceC
     while day <= days {
         let x = CAL_PADDING + col * cell_w;
         let y = 64 + row * CAL_CELL_HEIGHT;
-        let color = if day == today { 0x0040A0FF } else { 0x00E0E0E0 };
+        let color = if day == today { super::design::color::accent() } else { super::design::color::text() };
         super::gpu::draw_text(
             ctx,
             D2D_RECT_F {
@@ -146,7 +146,7 @@ fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceC
             bottom: (CAL_CALENDAR_HEIGHT + 34) as f32,
         },
         "Notifications",
-        0x00FFFFFF,
+        super::design::color::text(),
         14.0,
         false,
     );
@@ -159,7 +159,7 @@ fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceC
             bottom: (CAL_CALENDAR_HEIGHT + 64) as f32,
         },
         "No new notifications",
-        0x00A0A0A0,
+        super::design::color::text_muted(),
         12.0,
         false,
     );
@@ -198,7 +198,7 @@ pub(crate) fn paint_calendar(hwnd: HWND) {
 
         let format = DT_SINGLELINE | DT_VCENTER | DT_CENTER;
 
-        SetTextColor(hdc, COLORREF(0x00FFFFFF));
+        SetTextColor(hdc, COLORREF(super::design::color::text()));
         draw_text_in(
             hdc,
             RECT {
@@ -213,7 +213,7 @@ pub(crate) fn paint_calendar(hwnd: HWND) {
 
         let cell_w = (CAL_WIDTH - CAL_PADDING * 2) / 7;
         const DOW_LABELS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
-        SetTextColor(hdc, COLORREF(0x00A0A0A0));
+        SetTextColor(hdc, COLORREF(super::design::color::text_muted()));
         for (i, label) in DOW_LABELS.iter().enumerate() {
             let x = CAL_PADDING + i as i32 * cell_w;
             draw_text_in(
@@ -238,9 +238,9 @@ pub(crate) fn paint_calendar(hwnd: HWND) {
             SetTextColor(
                 hdc,
                 if day == today {
-                    COLORREF(0x0040A0FF)
+                    COLORREF(super::design::color::accent())
                 } else {
-                    COLORREF(0x00E0E0E0)
+                    COLORREF(super::design::color::text())
                 },
             );
             draw_text_in(
@@ -263,7 +263,7 @@ pub(crate) fn paint_calendar(hwnd: HWND) {
         }
 
         let notif_format = DT_SINGLELINE | DT_VCENTER;
-        SetTextColor(hdc, COLORREF(0x00FFFFFF));
+        SetTextColor(hdc, COLORREF(super::design::color::text()));
         draw_text_in(
             hdc,
             RECT {
@@ -275,7 +275,7 @@ pub(crate) fn paint_calendar(hwnd: HWND) {
             "Notifications",
             notif_format,
         );
-        SetTextColor(hdc, COLORREF(0x00A0A0A0));
+        SetTextColor(hdc, COLORREF(super::design::color::text_muted()));
         draw_text_in(
             hdc,
             RECT {

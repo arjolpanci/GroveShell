@@ -262,7 +262,7 @@ pub(crate) fn paint_card(
         // drag currently sits over.
         if let Some((HoverTarget::Card(page), intensity)) = &hover {
             if *page == card_visual.page && *intensity > 0.001 {
-                gpu::stroke_rounded_rect(ctx, full, card_radius, 0x0060A8FF, *intensity as f32, 2.0);
+                gpu::stroke_rounded_rect(ctx, full, card_radius, super::design::color::accent(), *intensity as f32, 2.0);
             }
         }
 
@@ -279,8 +279,8 @@ pub(crate) fn paint_card(
                     }
                 }
             } else {
-                gpu::fill_rounded_rect(ctx, rect, thumb_radius, 0x00303030);
-                gpu::draw_text(ctx, rect, &th.title, 0x00E0E0E0, 13.0, true);
+                gpu::fill_rounded_rect(ctx, rect, thumb_radius, super::design::color::surface_overlay());
+                gpu::draw_text(ctx, rect, &th.title, super::design::color::text(), 13.0, true);
             }
             if let Some(icon) = th.icon {
                 let icon_rect = rect_to_d2d(th.icon_rect, origin_x, origin_y);
@@ -300,7 +300,7 @@ pub(crate) fn paint_card(
             // dragging anything.
             if let Some((HoverTarget::Thumb(hovered_hwnd), intensity)) = &hover {
                 if *hovered_hwnd == hwnd && *intensity > 0.001 {
-                    gpu::stroke_rounded_rect(ctx, rect, thumb_radius, 0x0060A8FF, *intensity as f32, 2.0);
+                    gpu::stroke_rounded_rect(ctx, rect, thumb_radius, super::design::color::accent(), *intensity as f32, 2.0);
                 }
             }
         }
@@ -329,13 +329,13 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
         if !ov.dock_apps.is_empty() {
             let bar = rect_to_d2d(dock_bar_rect, 0, 0);
-            gpu::fill_rounded_rect(ctx, bar, dock_radius, 0x002A2A2A);
+            gpu::fill_rounded_rect(ctx, bar, dock_radius, super::design::color::surface_raised());
 
             // GNOME/macOS-dash-style divider between the pinned section
             // (left) and the running-but-unpinned section (right), if
             // there's one to draw.
             if let Some(divider) = dock_divider {
-                gpu::fill_rounded_rect(ctx, rect_to_d2d(divider, 0, 0), 0.0, 0x00454545);
+                gpu::fill_rounded_rect(ctx, rect_to_d2d(divider, 0, 0), 0.0, super::design::color::stroke());
             }
 
             let running_dot_radius = super::dock::dock_running_dot_radius();
@@ -357,7 +357,7 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                 // circle is just a "rounded rect" whose radius is half
                 // its own size.
                 for dot in super::dock::running_dot_rects(*slot, app.windows.len(), running_dot_radius, running_dot_gap) {
-                    gpu::fill_rounded_rect(ctx, rect_to_d2d(dot, 0, 0), running_dot_radius as f32, 0x00E0E0E0);
+                    gpu::fill_rounded_rect(ctx, rect_to_d2d(dot, 0, 0), running_dot_radius as f32, super::design::color::text());
                 }
             }
             // The dock's own hover glow — whichever slot the pointer
@@ -371,7 +371,7 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                             ctx,
                             rect_to_d2d(*slot, 0, 0),
                             thumb_radius,
-                            0x0060A8FF,
+                            super::design::color::accent(),
                             intensity,
                             2.0,
                         );
@@ -386,13 +386,13 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             super::overview::search_results(monitor, &ov.search_query)
         };
         let (panel, rows) = super::overview::search_layout(monitor, dpi, results.len());
-        gpu::fill_rounded_rect(ctx, rect_to_d2d(panel, 0, 0), thumb_radius, 0x002A2A2A);
+        gpu::fill_rounded_rect(ctx, rect_to_d2d(panel, 0, 0), thumb_radius, super::design::color::surface_raised());
         let header_text = if ov.search_query.is_empty() {
             "Type to search".to_string()
         } else {
             format!("Search: {}", ov.search_query)
         };
-        gpu::draw_text(ctx, rect_to_d2d(rows[0], 0, 0), &header_text, 0x00A0A0A0, 14.0, false);
+        gpu::draw_text(ctx, rect_to_d2d(rows[0], 0, 0), &header_text, super::design::color::text_muted(), 14.0, false);
         let icon_size = scaled(super::overview::SEARCH_ICON_SIZE, dpi);
         let icon_gap = scaled(super::overview::SEARCH_ICON_TEXT_GAP, dpi);
         for (i, result) in results.iter().enumerate() {
@@ -421,7 +421,7 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                 }
                 row.left += icon_size + icon_gap;
             }
-            gpu::draw_text(ctx, rect_to_d2d(row, 0, 0), &label, 0x00E0E0E0, 14.0, false);
+            gpu::draw_text(ctx, rect_to_d2d(row, 0, 0), &label, super::design::color::text(), 14.0, false);
         }
 
         // The ghost itself: a live drag follows the cursor at full size

@@ -62,7 +62,6 @@ const QS_ICON_SIZE: i32 = 20;
 /// uses for hover glows elsewhere) — reused here for the volume fill
 /// and the "on" chip state so Quick Settings reads as part of the same
 /// design language instead of introducing a second accent color.
-const QS_ACCENT: u32 = 0x00FFA860;
 
 /// Below this battery percentage the glyph and text turn a warning red
 /// rather than the normal foreground color.
@@ -216,15 +215,15 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
 
         let card_radius = scaled(QS_CARD_RADIUS, dpi);
         draw_shadow(hdc, layout.card, card_radius, 6);
-        fill_round_rect(hdc, layout.card, card_radius, COLORREF(0x00262626));
+        fill_round_rect(hdc, layout.card, card_radius, COLORREF(super::design::color::surface_raised()));
 
-        let text_color = COLORREF(0x00E0E0E0);
-        let muted_text_color = COLORREF(0x00A0A0A0);
-        let accent = COLORREF(QS_ACCENT);
+        let text_color = COLORREF(super::design::color::text());
+        let muted_text_color = COLORREF(super::design::color::text_muted());
+        let accent = COLORREF(super::design::color::accent());
         let hollow = GetStockObject(HOLLOW_BRUSH);
 
         let draw_chip = |on: bool, available: bool, rect: RECT, icon_fn: &dyn Fn(), label: &str| {
-            let bg = if on { COLORREF(0x00203A52) } else { COLORREF(0x00383838) };
+            let bg = if on { COLORREF(super::design::color::accent()) } else { COLORREF(super::design::color::surface_overlay()) };
             let radius = scaled(QS_CHIP_RADIUS, dpi);
             fill_round_rect(hdc, rect, radius, bg);
             if on {
@@ -347,7 +346,7 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
             right: layout.volume_track.right - percent_label_w,
             bottom: (layout.volume_track.top + layout.volume_track.bottom) / 2 + track_h / 2,
         };
-        fill_round_rect(hdc, track, track_h / 2, COLORREF(0x00383838));
+        fill_round_rect(hdc, track, track_h / 2, COLORREF(super::design::color::surface_overlay()));
 
         let percent = get_volume_percent().unwrap_or(0);
         let fill_right = track.left + ((track.right - track.left) as f64 * percent as f64 / 100.0).round() as i32;
@@ -360,7 +359,7 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
         fill_ellipse(
             hdc,
             RECT { left: fill_right - thumb_r, top: thumb_cy - thumb_r, right: fill_right + thumb_r, bottom: thumb_cy + thumb_r },
-            COLORREF(0x00FFFFFF),
+            COLORREF(super::design::color::text()),
         );
 
         SetTextColor(hdc, text_color);
