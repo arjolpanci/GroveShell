@@ -1,5 +1,5 @@
 use std::io::Write;
-use groveshell_config::{load, load_or_default, save, Config};
+use groveshell_config::{load, load_or_default, save, Config, IgnoreRule};
 
 const EXAMPLE_TOML: &str = r#"
 schema_version = 1
@@ -173,6 +173,103 @@ fn load_rejects_unknown_overview_modifier() {
         "schema_version = 1\n[input]\noverview_modifier = \"Ctrl\"\n",
     );
     assert!(load(file.path()).is_err());
+}
+
+#[test]
+fn default_config_has_private_defaults_and_no_ignore_rules() {
+    let config = Config::default();
+    assert!(
+        config.privacy.redact_window_titles,
+        "window titles must be redacted by default"
+    );
+    assert!(!config.privacy.telemetry, "telemetry must be off by default");
+    assert!(!config.appearance.high_contrast);
+    assert!(config.compatibility.ignore.is_empty());
+}
+
+#[test]
+fn load_parses_privacy_and_compatibility_sections() {
+    let toml = r#"
+schema_version = 1
+
+[privacy]
+redact_window_titles = false
+telemetry = true
+
+[appearance]
+high_contrast = true
+
+[[compatibility.ignore]]
+exe = "Widgets.exe"
+
+[[compatibility.ignore]]
+class = "Shell_TrayWnd"
+title = "Taskbar"
+"#;
+    let file = write_temp_toml(toml);
+    let config = load(file.path()).expect("valid config should load");
+
+    assert!(!config.privacy.redact_window_titles);
+    assert!(config.privacy.telemetry);
+    assert!(config.appearance.high_contrast);
+    assert_eq!(config.compatibility.ignore.len(), 2);
+    assert_eq!(config.compatibility.ignore[0].exe.as_deref(), Some("Widgets.exe"));
+    assert_eq!(config.compatibility.ignore[1].class.as_deref(), Some("Shell_TrayWnd"));
+    assert_eq!(config.compatibility.ignore[1].title.as_deref(), Some("Taskbar"));
+}
+
+#[test]
+fn load_rejects_an_empty_ignore_rule() {
+    // A `[[compatibility.ignore]]` with no keys would otherwise match
+    // nothing, but it's a config mistake worth catching loudly rather than
+    // silently doing nothing.
+    let toml = "schema_version = 1\n[[compatibility.ignore]]\n";
+    let file = write_temp_toml(toml);
+    assert!(load(file.path()).is_err());
+}
+
+#[test]
+fn ignore_rule_matching_honors_and_of_present_fields() {
+    // exe only, case-insensitive.
+    let exe_rule = IgnoreRule { exe: Some("Widgets.exe".into()), ..Default::default() };
+    assert!(exe_rule.matches(Some("widgets.exe"), "AnyClass", "any title"));
+    assert!(!exe_rule.matches(Some("notepad.exe"), "AnyClass", "any title"));
+    assert!(!exe_rule.matches(None, "AnyClass", "any title"));
+
+    // exe AND title: both must hold.
+    let combo = IgnoreRule {
+        exe: Some("game.exe".into()),
+        title: Some("overlay".into()),
+        ..Default::default()
+    };
+    assert!(combo.matches(Some("game.exe"), "UnrealWindow", "Steam Overlay"));
+    assert!(!combo.matches(Some("game.exe"), "UnrealWindow", "Main Window"));
+
+    // class exact, title substring.
+    let class_rule = IgnoreRule { class: Some("Shell_TrayWnd".into()), ..Default::default() };
+    assert!(class_rule.matches(None, "shell_traywnd", ""));
+    assert!(!class_rule.matches(None, "Shell_TrayWnd_Extra", ""));
+
+    // Empty rule never matches.
+    let empty = IgnoreRule::default();
+    assert!(!empty.matches(Some("anything.exe"), "AnyClass", "any title"));
+}
+
+#[test]
+fn privacy_and_compatibility_round_trip_through_save_and_load() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let path = dir.path().join("config.toml");
+    let mut config = Config::default();
+    config.privacy.redact_window_titles = false;
+    config.appearance.high_contrast = true;
+    config.compatibility.ignore.push(IgnoreRule {
+        exe: Some("obs64.exe".into()),
+        ..Default::default()
+    });
+
+    save(&path, &config).expect("save should succeed");
+    let loaded = load(&path).expect("load should succeed");
+    assert_eq!(loaded, config);
 }
 
 #[test]
