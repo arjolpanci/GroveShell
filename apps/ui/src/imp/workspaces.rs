@@ -436,7 +436,7 @@ fn on_foreground_changed(hwnd: HWND) {
 /// Returns the live snapshot taken to do this, for callers that also
 /// need it (building overview pages).
 pub(crate) fn sync_workspaces() -> Vec<groveshell_window_model::WindowRecord> {
-    let live = groveshell_window_model::snapshot();
+    let live = super::state::filter_ignored(groveshell_window_model::snapshot());
     let monitors = monitors_sorted_by_x();
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {

@@ -113,7 +113,7 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
         let bar_hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             w!("GroveShellBar"),
-            w!("GroveShell"),
+            w!("GroveShell Top Bar"),
             WS_POPUP | WS_VISIBLE,
             monitor.rect.left,
             monitor.rect.top,
