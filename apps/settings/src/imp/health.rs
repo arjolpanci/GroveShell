@@ -61,7 +61,6 @@ mod tests {
 }
 
 pub struct ProcessSample {
-    pub pid: u32,
     pub cpu_percent: f32,
     pub working_set_bytes: u64,
 }
@@ -133,7 +132,6 @@ pub fn sample_process(pid: u32) -> Option<ProcessSample> {
     // of scope at the end of this function (or on any earlier `?` return).
 
     Some(ProcessSample {
-        pid,
         cpu_percent: cpu_percent_from_times(kernel_before, user_before, kernel_after, user_after, Duration::from_millis(200)),
         working_set_bytes,
     })
