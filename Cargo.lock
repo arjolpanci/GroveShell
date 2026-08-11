@@ -399,6 +399,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "groveshell-common",
+ "groveshell-config",
  "groveshell-ipc",
  "groveshell-window-model",
  "serde_json",
