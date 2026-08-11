@@ -15,9 +15,11 @@
 //! overview dock's app model (`dock::build_dock_apps`) rather than
 //! duplicating icon logic.
 
-// The reveal state machine is complete and tested; the window creation/
-// paint that consumes it follows in the next commit. Allowed module-wide so
-// this commit banks the tested core cleanly.
+// The reveal state machine and slide geometry are complete and unit-tested;
+// the floating dock window that consumes them is the remaining build-out,
+// deferred because a new always-on-top surface needs live verification of
+// its placement, autohide feel, and click routing. Allowed module-wide
+// until that window lands.
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant};

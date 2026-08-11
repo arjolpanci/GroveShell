@@ -9,10 +9,12 @@
 //! duration collapses `Opening`/`Closing` straight to their terminal state
 //! so there is never a stuck half-open frame.
 
-// Consumed by the session-menu and tray-overflow flyouts in the following
-// Phase 4 tasks; allowed module-wide so this task's commit stays
-// warning-clean rather than landing a half-wired consumer just to satisfy
-// the linter. Removed once those flyouts are in.
+// A complete, unit-tested flyout lifecycle ready to drive the visual
+// redesign of the existing flyout windows (Quick Settings, calendar) — the
+// grow-from-anchor motion that needs live verification to wire cleanly into
+// their layered/DirectComposition paint. Not yet consumed by the binary
+// (the session menu ships as a native TrackPopupMenu), so allowed
+// module-wide; the redesign that consumes it removes this.
 #![allow(dead_code)]
 
 use std::time::{Duration, Instant};

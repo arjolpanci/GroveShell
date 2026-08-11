@@ -15,6 +15,28 @@ and `desktop_dock` modules add features, reusing an extracted `dock_render`.
 **Tech Stack:** Rust, `windows` crate (Win32 GDI/Direct2D, DWM, Registry, Shell,
 Power), existing `groveshell-config`/`groveshell-common` crates. No new runtime deps.
 
+## Execution status (2026-08-11, branch `phase-4-shell-ui`)
+
+Implemented inline with build + unit-test gates on each commit; visual
+surfaces still need a live pass (`scripts/dev-start.ps1`), per the agreed
+"continue inline, verify later" approach.
+
+- **Done & verified (build + tests):** Task 1 (design tokens + live accent),
+  Task 2 (token migration + accent-change handler), Task 4 (tray-overflow
+  chevron hosting the real Windows overflow window), Task 5 (session/power
+  menu). Task 3's `flyout` lifecycle and Task 6's `desktop_dock` reveal state
+  machine are implemented and unit-tested.
+- **Deferred for live verification (tested cores in place):** wiring the
+  flyout grow-from-anchor motion into the existing Quick Settings / calendar
+  windows (`flyout` module ready), and building the opt-in floating
+  desktop-dock window that consumes the `desktop_dock` reveal SM. The Dock
+  settings page already exposes `always`/`autohide`, which stay inert until
+  that window lands.
+- **Notifications:** the calendar flyout's notifications section exists and is
+  token-styled; a dedicated bar bell indicator is deferred (glyph choice best
+  confirmed live).
+- **Explicitly out of scope (unchanged):** DND / Night Light / brightness.
+
 ## Global Constraints
 
 - Windows-only; every new source file is under `apps/ui/src/imp/` and gated like its neighbors.
