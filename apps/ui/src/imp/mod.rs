@@ -14,6 +14,7 @@ mod monitor_workspaces;
 mod movesize;
 mod overview;
 mod overview_gpu;
+mod palette;
 mod pending_launch;
 mod quick_settings;
 mod radios;
@@ -57,9 +58,9 @@ use movesize::{
     DRAG_TIMER_ID, HOTCORNER_INTERVAL_MS, HOTCORNER_TIMER_ID,
 };
 use overview::{
-    close_overview, on_animation_tick, on_overview_arrow, on_overview_char,
-    on_overview_drag_end, on_overview_drag_move, on_overview_drag_start, on_overview_hover,
-    on_overview_right_click, paint_overview, repaint_overview,
+    close_overview, on_animation_tick, on_overview_arrow, on_overview_capture_lost,
+    on_overview_char, on_overview_drag_end, on_overview_drag_move, on_overview_drag_start,
+    on_overview_hover, on_overview_right_click, paint_overview, repaint_overview,
 };
 use quick_settings::{
     hide_quick_settings, on_quick_settings_mouse_down, on_quick_settings_mouse_move,
@@ -115,6 +116,7 @@ pub fn main() -> Result<()> {
     state::set_animation_config(config.appearance.animation_scale, config.appearance.reduced_motion);
     state::set_dock_config(config.appearance.dock_icon_size as i32, &config.appearance.dock_alignment);
     state::set_bar_height_config(config.appearance.top_bar_height as i32);
+    state::set_compat_a11y_config(config.appearance.high_contrast, &config.compatibility.ignore);
 
     std::thread::spawn(config_reload_listener);
 
@@ -205,7 +207,7 @@ pub fn main() -> Result<()> {
             let bar_hwnd = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 w!("GroveShellBar"),
-                w!("GroveShell"),
+                w!("GroveShell Top Bar"),
                 WS_POPUP | WS_VISIBLE,
                 monitor.rect.left,
                 monitor.rect.top,
@@ -407,7 +409,7 @@ pub fn main() -> Result<()> {
                 WorkspaceTracker::with_monitor_workspaces(1, 0),
             );
         }
-        for window in groveshell_window_model::snapshot() {
+        for window in state::filter_ignored(groveshell_window_model::snapshot()) {
             let center_x = (window.rect.left + window.rect.right) / 2;
             let center_y = (window.rect.top + window.rect.bottom) / 2;
             let target_monitor = monitor_index_for_center(&monitors, center_x, center_y)
@@ -688,6 +690,17 @@ unsafe extern "system" fn wndproc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_CAPTURECHANGED => {
+            // Mouse capture moved to some other window (or none) without
+            // this one seeing the matching `WM_LBUTTONUP` first — see
+            // `on_overview_capture_lost`'s doc comment for why an
+            // in-progress overview drag must be dropped here rather than
+            // left dangling.
+            if let Role::Overview { monitor } = role {
+                on_overview_capture_lost(&monitor);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_SETCURSOR => {
             // A hand cursor over a clickable bar region — the same
             // "this hovered rect is what `on_bar_hover` just set" state
@@ -809,6 +822,7 @@ unsafe extern "system" fn wndproc(
                 );
                 state::set_dock_config(new_config.appearance.dock_icon_size as i32, &new_config.appearance.dock_alignment);
                 state::set_bar_height_config(new_config.appearance.top_bar_height as i32);
+                state::set_compat_a11y_config(new_config.appearance.high_contrast, &new_config.compatibility.ignore);
                 STATE.with(|s| {
                     if let Some(state) = s.borrow_mut().as_mut() {
                         state.config = new_config;

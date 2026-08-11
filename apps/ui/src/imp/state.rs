@@ -164,6 +164,55 @@ thread_local! {
     /// top-bar-resize path in `mod.rs`'s `WM_APP_CONFIG_RELOADED` handler
     /// (which already resizes the real bar windows to this value).
     static TOP_BAR_HEIGHT: Cell<i32> = const { Cell::new(BAR_HEIGHT) };
+
+    /// Same re-entrancy-safe mirror pattern for the two Phase 6 config
+    /// fields the render/reconcile paths read from inside a held `STATE`
+    /// borrow: the high-contrast flag (read by every `palette::*` accessor,
+    /// which is called from deep inside bar/overview painting) and the
+    /// compatibility ignore list (read by `filter_ignored`, called on the
+    /// window snapshot before it's folded into `STATE`). Kept in sync at
+    /// the same two places as the others via `set_compat_a11y_config`.
+    static HIGH_CONTRAST: Cell<bool> = const { Cell::new(false) };
+    static IGNORE_RULES: RefCell<Vec<groveshell_config::IgnoreRule>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Updates the re-entrancy-safe mirror of the high-contrast flag and the
+/// compatibility ignore list. Call this every time `AppState.config` is set
+/// or replaced.
+pub(crate) fn set_compat_a11y_config(high_contrast: bool, ignore: &[groveshell_config::IgnoreRule]) {
+    HIGH_CONTRAST.with(|c| c.set(high_contrast));
+    IGNORE_RULES.with(|c| *c.borrow_mut() = ignore.to_vec());
+}
+
+/// Whether the high-contrast palette is active. Safe to call from anywhere,
+/// including from inside an active `STATE.with` borrow — see the mirror's
+/// doc comment.
+pub(crate) fn high_contrast() -> bool {
+    HIGH_CONTRAST.with(|c| c.get())
+}
+
+/// Drops every window matching a compatibility ignore rule, so ignored
+/// windows are never assigned to a workspace, hidden, or shown in the
+/// overview (PROJECT_PLAN §16 ignore list). Applied to the raw snapshot at
+/// both `snapshot()` call sites before the records reach any workspace
+/// bookkeeping.
+pub(crate) fn filter_ignored(
+    records: Vec<groveshell_window_model::WindowRecord>,
+) -> Vec<groveshell_window_model::WindowRecord> {
+    IGNORE_RULES.with(|rules| {
+        let rules = rules.borrow();
+        if rules.is_empty() {
+            return records;
+        }
+        records
+            .into_iter()
+            .filter(|w| {
+                !rules
+                    .iter()
+                    .any(|r| r.matches(w.exe_name.as_deref(), &w.class, &w.title))
+            })
+            .collect()
+    })
 }
 
 /// Updates the re-entrancy-safe mirror of the animation-affecting config
