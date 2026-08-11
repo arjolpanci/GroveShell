@@ -25,12 +25,12 @@ use windows::Win32::Graphics::GdiPlus::{
     GpGraphics, GpImage,
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, FindWindowW, GetClassLongPtrW, GetClientRect, GetForegroundWindow,
     IsIconic, KillTimer, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
-    ShowWindow, DI_NORMAL, GCLP_HICONSM, HICON, ICON_SMALL, LWA_ALPHA,
+    ShowWindow, DI_NORMAL, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL, LWA_ALPHA,
     SPI_GETDESKWALLPAPER,
     SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SystemParametersInfoW, WM_GETICON,
 };
@@ -492,6 +492,27 @@ pub(crate) fn window_icon(hwnd: HWND) -> Option<HICON> {
         }
         None
     }
+}
+
+/// Same idea as `window_icon`, but the window's/class's *big* icon
+/// (`ICON_BIG`/`GCLP_HICON`, typically 32x32) rather than the small one
+/// (typically 16x16) — for contexts that render much larger than a
+/// thumbnail badge, like a running-but-unpinned app's dock entry. Falls
+/// back to `window_icon`'s small icon if the window has no big icon of
+/// its own, still better than nothing.
+pub(crate) fn window_icon_large(hwnd: HWND) -> Option<HICON> {
+    // SAFETY: same contract as `window_icon`.
+    unsafe {
+        let big = SendMessageW(hwnd, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0));
+        if big.0 != 0 {
+            return Some(HICON(big.0 as *mut c_void));
+        }
+        let class_icon = GetClassLongPtrW(hwnd, GCLP_HICON);
+        if class_icon != 0 {
+            return Some(HICON(class_icon as *mut c_void));
+        }
+    }
+    window_icon(hwnd)
 }
 
 /// Where a page-local rect actually appears right now: translated by
@@ -1123,7 +1144,7 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
                     from_index: index,
                     icon: ov.dock_apps.get(index).and_then(|a| a.icon),
                 });
-                return Some(ov.hwnd);
+                return Some((ov.hwnd, false));
             }
             return None;
         }
@@ -1173,7 +1194,7 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
                     at: None,
                     growing: true,
                 });
-                Some(ov.hwnd)
+                Some((ov.hwnd, true))
             }
             None => {
                 ov.carousel_drag = Some(CarouselDrag {
@@ -1181,17 +1202,32 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
                     start_offset: ov.carousel_offset,
                     max_delta: 0,
                 });
-                None
+                Some((ov.hwnd, false))
             }
         }
     });
 
-    if let Some(overview_hwnd) = overview_hwnd {
-        // SAFETY: `overview_hwnd` is a valid, process-lifetime window;
-        // keeps the pickup pop animating even if the pointer doesn't
-        // move again immediately.
+    if let Some((overview_hwnd, needs_timer)) = overview_hwnd {
+        // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
+        // Capturing the mouse here means the drag keeps receiving
+        // `WM_MOUSEMOVE`/`WM_LBUTTONUP` even if the pointer strays
+        // outside this monitor's overview window mid-drag (e.g. a fast
+        // drag toward a second monitor) — without it, the button-up
+        // lands on whatever window the cursor happens to be over
+        // instead, so `on_overview_drag_end` never runs here and
+        // `window_drag`/`carousel_drag`/`dock_drag` stay set forever,
+        // which in turn makes `on_overview_hover` a permanent no-op
+        // (its early-return guard) — hover glow looks stuck until
+        // something else (closing/reopening the overview) resets it.
         unsafe {
-            SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+            SetCapture(overview_hwnd);
+        }
+        if needs_timer {
+            // Keeps the pickup pop animating even if the pointer doesn't
+            // move again immediately.
+            unsafe {
+                SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+            }
         }
     }
 }
@@ -1480,6 +1516,12 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
 /// card moves the window to that workspace; a carousel drag snaps to
 /// whichever page ended up nearest the release point.
 pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
+    // SAFETY: releasing capture this window may or may not actually
+    // hold is a documented no-op in the latter case; matches the
+    // `SetCapture` call in `on_overview_drag_start`.
+    unsafe {
+        let _ = ReleaseCapture();
+    }
     let dock_drag = STATE.with(|s| {
         s.borrow_mut()
             .as_mut()
@@ -1560,6 +1602,33 @@ pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
         offset.round().clamp(0.0, max_index as f64) as usize
     });
     snap_carousel_to(monitor, target, None);
+}
+
+/// Drops any in-progress drag without treating it as a click or a
+/// drop, then repaints — the safety net for `WM_CAPTURECHANGED` firing
+/// mid-drag (something else, e.g. Alt+Tab or a system dialog, stole
+/// mouse capture before `WM_LBUTTONUP` reached this window). Without
+/// this, `window_drag`/`carousel_drag`/`dock_drag` would stay set
+/// forever, permanently blocking `on_overview_hover` via its early-
+/// return guard — the same "hover looks stuck" failure mode
+/// `on_overview_drag_start`'s `SetCapture` call already guards against
+/// for the ordinary cross-monitor-drag case.
+pub(crate) fn on_overview_capture_lost(monitor: &str) {
+    let overview_hwnd = STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        let ov = state_ref.as_mut()?.overviews.get_mut(monitor)?;
+        if ov.window_drag.is_none() && ov.carousel_drag.is_none() && ov.dock_drag.is_none() {
+            return None;
+        }
+        ov.window_drag = None;
+        ov.carousel_drag = None;
+        ov.dock_drag = None;
+        ov.window_pop_anim = None;
+        Some(ov.hwnd)
+    });
+    if let Some(hwnd) = overview_hwnd {
+        repaint_overview(hwnd);
+    }
 }
 
 /// A window preview was dragged and released at `(x, y)`: if that's
