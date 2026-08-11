@@ -2,7 +2,7 @@
 
 use windows::Win32::Foundation::RECT;
 
-pub(crate) const NAV_ITEMS: &[&str] = &["Home", "Dock", "Top Bar", "Overview", "Input"];
+pub(crate) const NAV_ITEMS: &[&str] = &["Home", "Dock", "Top Bar", "Overview", "Input", "Accessibility"];
 const NAV_ITEM_HEIGHT: i32 = 44;
 
 /// One rect per nav item, top-to-bottom, each `NAV_ITEM_HEIGHT` tall and
