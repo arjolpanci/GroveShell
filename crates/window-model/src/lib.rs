@@ -22,7 +22,7 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+    EnumWindows, GetClassNameW, GetWindow, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, GWL_EXSTYLE, GW_OWNER, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
@@ -51,6 +51,11 @@ pub struct WindowRecord {
     /// `docs/PROJECT_PLAN.md` §12, UIPI limits control over elevated
     /// windows; the same restriction applies to inspecting them).
     pub exe_name: Option<String>,
+    /// Win32 window class name (e.g. `"Chrome_WidgetWin_1"`). Always
+    /// present — an empty string if `GetClassNameW` failed. Used by the
+    /// compatibility ignore list to match windows by class, and useful as
+    /// a diagnostic when exe identity is unavailable (elevated windows).
+    pub class: String,
     /// On-screen bounds, used to seed the Activities overview's "zoom out
     /// from where the window actually is" animation. For a minimized
     /// window this is the last known restored position (`GetWindowRect`
@@ -110,6 +115,11 @@ pub struct MonitorRecord {
     /// The monitor's work area (bounds minus taskbar/AppBar reservations).
     pub work: Rect,
     pub is_primary: bool,
+    /// Effective DPI of this monitor (96 = 100% scale, 144 = 150%, …).
+    /// `96` if the query failed. Combine with [`scale_for_dpi`] to get the
+    /// scale factor. Meaningful only in a per-monitor-DPI-aware process
+    /// (see [`make_process_dpi_aware`]).
+    pub dpi: u32,
 }
 
 /// Enumerates connected monitors. Coordinates are physical pixels only if
@@ -136,6 +146,7 @@ pub fn monitors() -> Vec<MonitorRecord> {
                 rect: info.rcMonitor.into(),
                 work: info.rcWork.into(),
                 is_primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+                dpi: effective_dpi(hmonitor),
             });
         }
         TRUE
@@ -167,6 +178,44 @@ pub fn make_process_dpi_aware() {
     // SAFETY: plain process-wide mode switch, documented to fail (not
     // misbehave) if a DPI context was already set.
     let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+/// Effective DPI of one monitor via `GetDpiForMonitor`, or `96` (100%) if
+/// the query fails. Pulled out so [`monitors`] and any future per-monitor
+/// layout code share one definition of "this display's DPI".
+fn effective_dpi(hmonitor: HMONITOR) -> u32 {
+    use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+    let mut dpi_x: u32 = 96;
+    let mut dpi_y: u32 = 96;
+    // SAFETY: `hmonitor` is a live handle supplied by `EnumDisplayMonitors`
+    // for the duration of the enclosing synchronous enumeration; both out
+    // pointers are to locals that outlive the call. Documented to fail
+    // (leaving the locals untouched) rather than misbehave.
+    unsafe {
+        let _ = GetDpiForMonitor(hmonitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+    }
+    dpi_x
+}
+
+/// Scale factor for a DPI value: `96` DPI → `1.0`, `144` → `1.5`, etc.
+/// The one place logical↔physical conversions get their multiplier, so the
+/// convention lives in exactly one tested spot.
+pub fn scale_for_dpi(dpi: u32) -> f32 {
+    dpi as f32 / 96.0
+}
+
+/// Convert a logical (96-DPI) pixel length to physical pixels at `dpi`,
+/// rounded to the nearest integer — the direction used when placing a
+/// fixed-size shell element (bar height, dock icon) on a scaled monitor.
+pub fn logical_to_physical(logical: i32, dpi: u32) -> i32 {
+    (logical as f32 * scale_for_dpi(dpi)).round() as i32
+}
+
+/// Convert a physical pixel length at `dpi` back to logical (96-DPI)
+/// pixels — the direction used when normalizing a window rect read off a
+/// scaled monitor into resolution-independent units.
+pub fn physical_to_logical(physical: i32, dpi: u32) -> i32 {
+    (physical as f32 / scale_for_dpi(dpi)).round() as i32
 }
 
 /// Whether `hwnd` still refers to a live window at all, regardless of
@@ -239,8 +288,25 @@ fn inspect(hwnd: HWND, require_visible: bool) -> Option<WindowRecord> {
             title,
             pid,
             exe_name: exe_name_for_pid(pid),
+            class: class_name(hwnd),
             rect: window_rect(hwnd),
         })
+    }
+}
+
+/// Best-effort Win32 class name for `hwnd`; empty string on failure.
+fn class_name(hwnd: HWND) -> String {
+    // SAFETY: `hwnd` is valid for the duration of this synchronous call
+    // (same contract as every other inspection here); `buf` is a fixed
+    // 256-wide buffer and `GetClassNameW` never writes past the length it
+    // is given, returning the count actually copied.
+    unsafe {
+        let mut buf = [0u16; 256];
+        let copied = GetClassNameW(hwnd, &mut buf);
+        if copied <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buf[..copied as usize])
     }
 }
 
@@ -366,6 +432,37 @@ fn owned_windows_from_pairs(root: isize, pairs: &[(isize, isize)]) -> Vec<isize>
         }
     }
     result
+}
+
+#[cfg(test)]
+mod dpi_tests {
+    use super::{logical_to_physical, physical_to_logical, scale_for_dpi};
+
+    #[test]
+    fn scale_factor_matches_common_windows_scales() {
+        assert_eq!(scale_for_dpi(96), 1.0);
+        assert_eq!(scale_for_dpi(120), 1.25);
+        assert_eq!(scale_for_dpi(144), 1.5);
+        assert_eq!(scale_for_dpi(192), 2.0);
+    }
+
+    #[test]
+    fn logical_and_physical_convert_in_both_directions() {
+        // 32 logical px at 150% is 48 physical px, and back.
+        assert_eq!(logical_to_physical(32, 144), 48);
+        assert_eq!(physical_to_logical(48, 144), 32);
+        // Identity at 100%.
+        assert_eq!(logical_to_physical(100, 96), 100);
+        assert_eq!(physical_to_logical(100, 96), 100);
+    }
+
+    #[test]
+    fn conversion_rounds_to_nearest_pixel() {
+        // 44 logical px at 125% = 55.0 exactly.
+        assert_eq!(logical_to_physical(44, 120), 55);
+        // 45 logical px at 125% = 56.25 → 56.
+        assert_eq!(logical_to_physical(45, 120), 56);
+    }
 }
 
 #[cfg(test)]
