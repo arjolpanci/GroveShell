@@ -386,31 +386,41 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
 
             let running_dot_radius = super::dock::dock_running_dot_radius();
             let running_dot_gap = scaled(super::dock::DOCK_RUNNING_DOT_GAP, dpi);
-            for (app, slot) in ov.dock_apps.iter().zip(dock_slots.iter()) {
-                let Some(icon) = app.icon else { continue };
-                let size = (slot.right - slot.left).max(1);
-                if let Some(icon_bitmap) = icon_to_hbitmap(icon, size) {
-                    if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, icon_bitmap) {
-                        gpu::draw_rounded_bitmap(ctx, rect_to_d2d(*slot, 0, 0), 0.0, &bitmap);
-                    }
-                    // SAFETY: created locally above, owned exclusively here.
-                    unsafe {
-                        let _ = DeleteObject(icon_bitmap);
+            // Wave magnification: each icon grows with its nearness to the
+            // pointer, bottom-anchored so it rises out of the bar. The base
+            // slots are still what got hit-tested (see `on_overview_hover`);
+            // these are the drawn rects only.
+            let draw_slots = super::dock::wave_slots(&dock_slots, ov.dock_cursor_x, 1.0);
+            for (i, app) in ov.dock_apps.iter().enumerate() {
+                let (Some(slot), Some(base)) = (draw_slots.get(i), dock_slots.get(i)) else {
+                    continue;
+                };
+                if let Some(icon) = app.icon {
+                    let size = (slot.right - slot.left).max(1);
+                    if let Some(icon_bitmap) = icon_to_hbitmap(icon, size) {
+                        if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, icon_bitmap) {
+                            gpu::draw_rounded_bitmap(ctx, rect_to_d2d(*slot, 0, 0), 0.0, &bitmap);
+                        }
+                        // SAFETY: created locally above, owned exclusively here.
+                        unsafe {
+                            let _ = DeleteObject(icon_bitmap);
+                        }
                     }
                 }
                 // One small dot per open window (capped — see
-                // `running_dot_rects`), GNOME/macOS-dash-style — a
-                // circle is just a "rounded rect" whose radius is half
-                // its own size.
-                for dot in super::dock::running_dot_rects(*slot, app.windows.len(), running_dot_radius, running_dot_gap) {
+                // `running_dot_rects`), GNOME/macOS-dash-style — anchored
+                // to the *base* slot so the row of dots stays put while the
+                // icons ride the wave above it.
+                for dot in super::dock::running_dot_rects(*base, app.windows.len(), running_dot_radius, running_dot_gap) {
                     gpu::fill_rounded_rect(ctx, rect_to_d2d(dot, 0, 0), running_dot_radius as f32, super::design::color::text());
                 }
             }
             // The dock's own hover glow — whichever slot the pointer
             // currently sits on, if any, easing in the same way as the
-            // card/thumbnail glows.
+            // card/thumbnail glows. Drawn on the magnified rect so it hugs
+            // the icon as it grows.
             if let Some((index, started)) = ov.dock_hover {
-                if let Some(slot) = dock_slots.get(index) {
+                if let Some(slot) = draw_slots.get(index) {
                     let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)) as f32;
                     if intensity > 0.001 {
                         gpu::stroke_rounded_rect(
