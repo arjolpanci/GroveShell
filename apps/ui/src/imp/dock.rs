@@ -1,8 +1,10 @@
 //! The Activities overview's dock: GNOME-dash-style row of app icons
 //! along the bottom of the focused card, built fresh each time the
-//! overview opens or rebuilds. Overview-only by design (see the
-//! project's memory on this decision) — there is no always-visible
-//! desktop dock.
+//! overview opens or rebuilds. This is the *in-overview* dash; the
+//! opt-in always-visible/autohiding desktop dock (the `dock_mode`
+//! setting) lives in `desktop_dock` and reuses this module's app model
+//! (`build_dock_apps`) and pinned list so pins and running indicators
+//! stay consistent across both surfaces.
 //!
 //! Two sources feed it:
 //! - **Pinned apps**: GroveShell's own persisted list (see
