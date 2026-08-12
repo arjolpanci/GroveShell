@@ -332,13 +332,28 @@ pub(crate) struct DockWindow {
     last_offset: i32,
     /// Frame counter, driving the slow app-refresh cadence.
     ticks: u64,
+    /// Cheap signature of the last-seen running-window set + pinned list,
+    /// so the periodic refresh skips the expensive `build_dock_apps` (COM
+    /// shortcut/icon resolution) when nothing actually changed.
+    last_sig: u64,
+}
+
+/// A cheap order-independent-enough fold of the running windows and pins,
+/// used to detect whether the dock's contents changed since last refresh.
+fn contents_signature(live: &[groveshell_window_model::WindowRecord], pin_count: usize) -> u64 {
+    let mut sig = 1469598103934665603u64 ^ (live.len() as u64).wrapping_shl(1);
+    for w in live {
+        sig = (sig ^ (w.hwnd as u64)).wrapping_mul(1099511628211);
+    }
+    sig ^ (pin_count as u64).wrapping_shl(48)
 }
 
 impl DockWindow {
-    /// Creates the floating dock window on the primary monitor for the
-    /// given mode (`"always"` or `"autohide"` — any other value is treated
-    /// as always-shown). `None` if window creation fails, in which case
-    /// the shell simply runs without a persistent dock, unchanged.
+    /// Creates a floating dock window on the monitor whose `work` area is
+    /// given, for the given mode (`"always"` or `"autohide"` — any other
+    /// value is treated as always-shown). `None` if window creation fails,
+    /// in which case the shell simply runs without a persistent dock,
+    /// unchanged.
     pub(crate) fn create(
         hinstance: windows::Win32::Foundation::HINSTANCE,
         work: RECT,
@@ -346,7 +361,9 @@ impl DockWindow {
         icon_size_ref: i32,
         mode: &str,
     ) -> Option<DockWindow> {
-        let apps = build_apps();
+        let live = super::state::filter_ignored(groveshell_window_model::snapshot());
+        let sig = contents_signature(&live, super::dock::pinned_paths().len());
+        let apps = super::dock::build_dock_apps(&live);
         let geo = panel_geometry(apps.len(), icon_size_ref, dpi);
         let base_left = work.left + (work.right - work.left - geo.window_w) / 2;
         let base_top = work.bottom - super::state::scaled(MARGIN_BOTTOM, dpi) - geo.window_h;
@@ -395,6 +412,7 @@ impl DockWindow {
             wave: 0.0,
             last_offset: -1,
             ticks: 0,
+            last_sig: sig,
         };
         dock.reposition(true);
         dock.repaint();
@@ -408,19 +426,39 @@ impl DockWindow {
         Some(dock)
     }
 
-    /// Rebuilds the app model and geometry (icons pinned/running may have
-    /// changed), and recomputes the resting position. Called on the tick's
-    /// slow cadence and whenever config (icon size) changes.
-    fn refresh(&mut self, icon_size_ref: i32) {
+    /// Rebuilds the app model and geometry when the running-window set,
+    /// pins, or configured icon size actually changed since last time —
+    /// short-circuiting the expensive `build_dock_apps` (COM shortcut/icon
+    /// resolution) otherwise, so the timer stays cheap. Recreates the GPU
+    /// surface if the window resized (a different app count). Returns
+    /// whether anything changed (so the caller repaints/repositions).
+    fn refresh(&mut self, icon_size_ref: i32) -> bool {
+        let live = super::state::filter_ignored(groveshell_window_model::snapshot());
+        let sig = contents_signature(&live, super::dock::pinned_paths().len());
+        if icon_size_ref == self.icon_size_ref && sig == self.last_sig {
+            return false;
+        }
+        self.last_sig = sig;
         self.icon_size_ref = icon_size_ref;
-        self.apps = build_apps();
+        self.apps = super::dock::build_dock_apps(&live);
+
+        let old = (self.geo.window_w, self.geo.window_h);
         self.geo = panel_geometry(self.apps.len(), self.icon_size_ref, self.dpi);
         self.base_left = self.work.left + (self.work.right - self.work.left - self.geo.window_w) / 2;
         self.base_top =
             self.work.bottom - super::state::scaled(MARGIN_BOTTOM, self.dpi) - self.geo.window_h;
-        // A resized panel means the window itself must resize; force a
-        // reposition next tick.
+        // A resized window needs a surface at the new size, or the panel
+        // would be clipped/misplaced against a stale-sized surface.
+        if old != (self.geo.window_w, self.geo.window_h) {
+            // Drop the old surface/target first: a window can hold only one
+            // DirectComposition target, so creating the new one while the
+            // old still lives would fail.
+            self.gpu = None;
+            self.gpu = gpu::create_surface(self.hwnd, self.geo.window_w, self.geo.window_h);
+        }
+        // Force a reposition next tick (window moved/resized).
         self.last_offset = -1;
+        true
     }
 
     /// Moves/resizes the window for the current autohide slide offset.
@@ -465,6 +503,10 @@ impl DockWindow {
         let hovered = self.hovered;
 
         gpu::redraw(surface, |ctx: &ID2D1DeviceContext| {
+            // The window is taller than the panel (headroom for magnified
+            // icons); everything above the panel must stay transparent so
+            // the dock reads as a floating bar, not a dark box.
+            gpu::clear_transparent(ctx);
             let panel_rect = to_d2d(*panel);
             gpu::fill_rounded_rect(ctx, panel_rect, radius, super::design::color::surface_raised());
             gpu::stroke_rounded_rect(ctx, panel_rect, radius, super::design::color::stroke(), 0.6, 1.0);
@@ -586,10 +628,11 @@ impl DockWindow {
         }
 
         // Reflect a pin/unpin immediately (the slow refresh would catch it
-        // within ~0.5s anyway, but this feels instant).
+        // within ~1s anyway, but this feels instant).
         let (icon_size, _) = super::state::dock_config();
-        self.refresh(icon_size);
-        self.reposition(true);
+        if self.refresh(icon_size) {
+            self.reposition(true);
+        }
         self.repaint();
     }
 
@@ -638,14 +681,13 @@ impl DockWindow {
             self.wave -= step;
         }
 
-        // Periodically rebuild the app list so newly-opened/closed apps and
-        // pin changes show up (every ~500ms).
-        if tick_count % 32 == 0 {
-            let before = self.apps.len();
+        // Periodically pick up newly-opened/closed apps and pin changes
+        // (every ~1s). `refresh` is a cheap no-op when nothing changed.
+        if tick_count % 64 == 0 {
             let (icon_size, _) = super::state::dock_config();
-            self.refresh(icon_size);
-            if self.apps.len() != before {
+            if self.refresh(icon_size) {
                 self.reposition(true);
+                self.repaint();
             }
         }
 
@@ -710,15 +752,6 @@ impl DockWindow {
             let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
         }
     }
-}
-
-/// Builds the desktop dock's app model from a fresh, non-mutating window
-/// snapshot (running apps) merged with the persisted pins — the same
-/// `build_dock_apps` the overview dock uses, so pins and running
-/// indicators stay consistent between the two surfaces.
-fn build_apps() -> Vec<DockApp> {
-    let live = super::state::filter_ignored(groveshell_window_model::snapshot());
-    super::dock::build_dock_apps(&live)
 }
 
 /// Focuses an app's window (restoring it if minimized) or, if it has none,
