@@ -24,7 +24,149 @@
 
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::RECT;
+
 use super::design::motion::{self, BASE_MS};
+
+/// 96-DPI layout metrics for the floating desktop dock. Deliberately a
+/// touch roomier than the overview dock (`dock.rs`) so it reads as a
+/// first-class, macOS-style dock rather than a compact dash.
+pub(crate) const ICON_GAP: i32 = 12;
+pub(crate) const PAD_X: i32 = 14;
+pub(crate) const PAD_Y: i32 = 10;
+pub(crate) const CORNER_RADIUS: i32 = 22;
+/// Gap between the dock panel's bottom and the monitor's work-area bottom.
+pub(crate) const MARGIN_BOTTOM: i32 = 10;
+/// Peak magnification of the icon directly under the pointer — the crest
+/// of the wave. 1.0 would be no magnification.
+pub(crate) const MAX_SCALE: f32 = 1.65;
+/// Running-indicator dot radius (96-DPI).
+pub(crate) const RUNNING_DOT_RADIUS: i32 = 3;
+
+/// The dock's fixed (resting) panel geometry in the dock window's own
+/// local coordinates, plus each icon's baseline center-x. The window is
+/// sized taller and a little wider than the panel so magnified icons can
+/// grow upward out of the panel and outward at the ends without being
+/// clipped — the classic dock "the icon pops above the tray" look.
+///
+/// Returns `(panel_rect, icon_centers, baseline_bottom, window_w,
+/// window_h)`, all DPI-scaled. `baseline_bottom` is the local y that every
+/// icon's *bottom* edge sits on; icons grow upward from it as they
+/// magnify. Pure and total (clamps an empty dock to one slot) so it's unit
+/// testable without a live monitor.
+pub(crate) fn panel_geometry(app_count: usize, icon_size_ref: i32, dpi: u32) -> PanelGeometry {
+    let scaled = |v: i32| super::state::scaled(v, dpi);
+    let icon = super::state::scaled(icon_size_ref, dpi).max(1);
+    let gap = scaled(ICON_GAP);
+    let pad_x = scaled(PAD_X);
+    let pad_y = scaled(PAD_Y);
+
+    let count = app_count.max(1) as i32;
+    let panel_w = count * icon + (count - 1).max(0) * gap + pad_x * 2;
+    let panel_h = icon + pad_y * 2;
+
+    let max_icon = (icon as f32 * MAX_SCALE).round() as i32;
+    // Side headroom so an end icon at full magnification (scaled about its
+    // own center) doesn't clip the window edge; top headroom so a crest
+    // icon grows fully above the panel.
+    let side_pad = (max_icon - icon) / 2 + gap;
+    let top_pad = (max_icon - icon).max(0) + pad_y;
+    let window_w = panel_w + side_pad * 2;
+    let window_h = panel_h + top_pad;
+
+    let panel_left = side_pad;
+    let panel_top = window_h - panel_h;
+    let panel_rect = RECT {
+        left: panel_left,
+        top: panel_top,
+        right: panel_left + panel_w,
+        bottom: window_h,
+    };
+    let baseline_bottom = window_h - pad_y;
+
+    let mut centers = Vec::with_capacity(count as usize);
+    let first_center = panel_left + pad_x + icon / 2;
+    for i in 0..count {
+        centers.push(first_center + i * (icon + gap));
+    }
+
+    PanelGeometry { panel_rect, centers, baseline_bottom, window_w, window_h, icon }
+}
+
+/// Result of [`panel_geometry`] — see its doc comment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PanelGeometry {
+    pub(crate) panel_rect: RECT,
+    pub(crate) centers: Vec<i32>,
+    pub(crate) baseline_bottom: i32,
+    pub(crate) window_w: i32,
+    pub(crate) window_h: i32,
+    /// The resting (un-magnified) icon size, DPI-scaled.
+    pub(crate) icon: i32,
+}
+
+/// A smooth wave-magnification factor (>= 1.0) for an icon whose baseline
+/// center is `distance` px from the pointer, peaking at [`MAX_SCALE`]
+/// directly under it and easing back to 1.0 with a Gaussian falloff whose
+/// width is `sigma`. `cursor` of `None` (pointer not over the dock) yields
+/// 1.0 everywhere — a flat, resting dock. Pure and cheap.
+pub(crate) fn magnify_factor(distance: f32, sigma: f32) -> f32 {
+    let sigma = sigma.max(1.0);
+    let x = distance / sigma;
+    1.0 + (MAX_SCALE - 1.0) * (-0.5 * x * x).exp()
+}
+
+/// Each icon's on-screen rect for the current pointer position, applying
+/// the wave: every icon stays centered on its fixed baseline center and
+/// bottom-anchored to `baseline_bottom`, scaled by [`magnify_factor`] of
+/// its distance to `cursor_x` (window-local). `progress` (0..1) eases the
+/// whole effect in/out so the wave doesn't snap on when the pointer
+/// arrives — the rendered scale is lerped from 1.0 toward its target by
+/// `progress`. Fixed centers keep hit-testing stable (see
+/// [`icon_at`]). Pure.
+pub(crate) fn wave_icon_rects(
+    geo: &PanelGeometry,
+    cursor_x: Option<i32>,
+    progress: f32,
+) -> Vec<RECT> {
+    let progress = progress.clamp(0.0, 1.0);
+    let sigma = (geo.icon as f32) * 1.3;
+    geo.centers
+        .iter()
+        .map(|&cx| {
+            let target = match cursor_x {
+                Some(x) => magnify_factor((x - cx).abs() as f32, sigma),
+                None => 1.0,
+            };
+            let scale = 1.0 + (target - 1.0) * progress;
+            let size = (geo.icon as f32 * scale).round() as i32;
+            let half = size / 2;
+            RECT {
+                left: cx - half,
+                top: geo.baseline_bottom - size,
+                right: cx - half + size,
+                bottom: geo.baseline_bottom,
+            }
+        })
+        .collect()
+}
+
+/// Which icon index the pointer at window-local `x` is over, or `None` if
+/// it's past the ends. Hit-tests the *fixed* baseline centers (pitch =
+/// icon + gap), so a click lands on the same app whether the dock is
+/// resting or mid-wave — the magnified rects only move things visually.
+pub(crate) fn icon_at(geo: &PanelGeometry, x: i32, dpi: u32) -> Option<usize> {
+    if geo.centers.is_empty() {
+        return None;
+    }
+    let pitch = geo.icon + super::state::scaled(ICON_GAP, dpi);
+    let half = pitch / 2;
+    geo.centers
+        .iter()
+        .enumerate()
+        .find(|(_, &cx)| (x - cx).abs() <= half)
+        .map(|(i, _)| i)
+}
 
 /// Autohide reveal phases. `Shown`/`Hidden` are the resting states;
 /// `Revealing`/`Hiding` are the sliding transitions.
@@ -174,5 +316,84 @@ mod tests {
         a.force(RevealPhase::Revealing);
         assert_eq!(a.offset(0.0, 60), 60); // just started: fully down
         assert_eq!(a.offset(1.0, 60), 0); // complete: fully up
+    }
+
+    #[test]
+    fn panel_geometry_spaces_centers_by_one_pitch() {
+        let geo = panel_geometry(3, 48, 96);
+        assert_eq!(geo.centers.len(), 3);
+        let pitch = geo.centers[1] - geo.centers[0];
+        assert_eq!(geo.centers[2] - geo.centers[1], pitch);
+        // Pitch is one icon plus one gap at this DPI.
+        assert_eq!(pitch, 48 + ICON_GAP);
+    }
+
+    #[test]
+    fn panel_geometry_window_is_taller_and_wider_than_the_panel() {
+        let geo = panel_geometry(5, 48, 96);
+        let panel_w = geo.panel_rect.right - geo.panel_rect.left;
+        let panel_h = geo.panel_rect.bottom - geo.panel_rect.top;
+        assert!(geo.window_w > panel_w, "window needs side headroom for end-icon magnification");
+        assert!(geo.window_h > panel_h, "window needs top headroom for the wave crest");
+    }
+
+    #[test]
+    fn panel_geometry_clamps_an_empty_dock_to_one_slot() {
+        let geo = panel_geometry(0, 48, 96);
+        assert_eq!(geo.centers.len(), 1);
+        assert!(geo.window_w > 0 && geo.window_h > 0);
+    }
+
+    #[test]
+    fn magnify_factor_peaks_under_the_pointer_and_decays() {
+        let sigma = 60.0;
+        let at_zero = magnify_factor(0.0, sigma);
+        assert!((at_zero - MAX_SCALE).abs() < 1e-5);
+        assert!(magnify_factor(sigma, sigma) < at_zero);
+        assert!(magnify_factor(sigma * 4.0, sigma) < magnify_factor(sigma, sigma));
+        // Far away it's essentially resting size.
+        assert!(magnify_factor(sigma * 6.0, sigma) < 1.001);
+    }
+
+    #[test]
+    fn wave_with_no_cursor_leaves_every_icon_at_rest() {
+        let geo = panel_geometry(4, 48, 96);
+        let rects = wave_icon_rects(&geo, None, 1.0);
+        for r in &rects {
+            assert_eq!(r.right - r.left, geo.icon);
+            assert_eq!(r.bottom, geo.baseline_bottom);
+        }
+    }
+
+    #[test]
+    fn wave_magnifies_the_icon_under_the_cursor_the_most() {
+        let geo = panel_geometry(5, 48, 96);
+        let cursor = geo.centers[2];
+        let rects = wave_icon_rects(&geo, Some(cursor), 1.0);
+        let widths: Vec<i32> = rects.iter().map(|r| r.right - r.left).collect();
+        assert!(widths[2] > widths[1]);
+        assert!(widths[2] > widths[3]);
+        // Magnified icons stay bottom-anchored (grow upward).
+        for r in &rects {
+            assert_eq!(r.bottom, geo.baseline_bottom);
+        }
+    }
+
+    #[test]
+    fn wave_progress_zero_is_a_flat_dock() {
+        let geo = panel_geometry(5, 48, 96);
+        let rects = wave_icon_rects(&geo, Some(geo.centers[2]), 0.0);
+        for r in &rects {
+            assert_eq!(r.right - r.left, geo.icon);
+        }
+    }
+
+    #[test]
+    fn icon_at_hits_each_center_and_misses_past_the_ends() {
+        let geo = panel_geometry(3, 48, 96);
+        assert_eq!(icon_at(&geo, geo.centers[0], 96), Some(0));
+        assert_eq!(icon_at(&geo, geo.centers[2], 96), Some(2));
+        assert_eq!(icon_at(&geo, geo.centers[0] - 1000, 96), None);
+        assert_eq!(icon_at(&geo, geo.centers[2] + 1000, 96), None);
     }
 }
