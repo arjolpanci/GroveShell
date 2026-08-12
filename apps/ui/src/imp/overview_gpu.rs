@@ -194,7 +194,7 @@ fn rect_to_d2d(r: RECT, origin_x: i32, origin_y: i32) -> D2D_RECT_F {
 /// Renders an `HICON` to a small ARGB `HBITMAP` so it can go through
 /// the same WIC bridge as window thumbnails and the wallpaper — icons
 /// have no separate Direct2D-native path.
-fn icon_to_hbitmap(icon: HICON, size: i32) -> Option<HBITMAP> {
+pub(crate) fn icon_to_hbitmap(icon: HICON, size: i32) -> Option<HBITMAP> {
     // SAFETY: standard create-select-draw-restore GDI sequence on
     // locally created handles; `bitmap`'s ownership moves to the
     // caller on success.

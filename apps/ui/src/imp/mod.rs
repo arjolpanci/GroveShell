@@ -182,6 +182,12 @@ pub fn main() -> Result<()> {
             Some(wndproc),
             0x00303030,
         )?;
+        register_class(
+            hinstance,
+            w!("GroveShellDock"),
+            Some(wndproc),
+            0x00141418,
+        )?;
 
         // One bar per monitor (Phase 4). WS_EX_TOOLWINDOW keeps each
         // out of the taskbar/alt-tab and (as a side effect) out of its
@@ -457,8 +463,33 @@ pub fn main() -> Result<()> {
                 window_rects: std::collections::HashMap::new(),
                 hovered_bar_region: None,
                 qs_volume_dragging: false,
+                dock: None,
             });
         });
+
+        // Persistent floating desktop dock — created only when the user
+        // opted into it (`dock_mode = "always"` or `"autohide"`); the
+        // default `"overview"` leaves `AppState.dock` as `None`. Placed on
+        // the primary monitor.
+        let dock_mode = state::dock_mode();
+        if dock_mode != "overview" {
+            if let Some(primary) = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first()) {
+                let (icon_size, _) = state::dock_config();
+                if let Some(dock) = desktop_dock::DockWindow::create(
+                    hinstance,
+                    primary.work,
+                    primary.dpi,
+                    icon_size,
+                    &dock_mode,
+                ) {
+                    STATE.with(|s| {
+                        if let Some(st) = s.borrow_mut().as_mut() {
+                            st.dock = Some(dock);
+                        }
+                    });
+                }
+            }
+        }
 
         // A `MoveWindow` above may have already triggered and consumed
         // a `WM_PAINT` for a bar before `STATE` existed, in which case
@@ -531,6 +562,43 @@ fn set_blur_behind(hwnd: HWND, enabled: bool) {
     // local outliving this synchronous call.
     unsafe {
         let _ = DwmEnableBlurBehindWindow(hwnd, &bb);
+    }
+}
+
+/// Reconciles the persistent desktop dock with the current `dock_mode` /
+/// icon-size config, after a live reload. Simplest robust approach:
+/// tear down any existing dock and recreate it if a persistent mode is
+/// selected — reloads only happen when the user actually changes a
+/// setting, so the momentary flash is a non-issue.
+fn sync_desktop_dock() {
+    // Drop any existing dock first (also handles switching to "overview").
+    STATE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            if let Some(mut dock) = st.dock.take() {
+                dock.destroy();
+            }
+        }
+    });
+
+    let mode = state::dock_mode();
+    if mode == "overview" {
+        return;
+    }
+    let (icon_size, _) = state::dock_config();
+    let Ok(module) = (unsafe { GetModuleHandleW(None) }) else { return };
+    let hinstance = windows::Win32::Foundation::HINSTANCE(module.0);
+    let monitors = monitors::monitors_sorted_by_x();
+    let Some(primary) = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first()) else {
+        return;
+    };
+    if let Some(dock) =
+        desktop_dock::DockWindow::create(hinstance, primary.work, primary.dpi, icon_size, &mode)
+    {
+        STATE.with(|s| {
+            if let Some(st) = s.borrow_mut().as_mut() {
+                st.dock = Some(dock);
+            }
+        });
     }
 }
 
@@ -663,6 +731,14 @@ unsafe extern "system" fn wndproc(
                 paint_quick_settings(hwnd);
                 LRESULT(0)
             }
+            Role::Dock => {
+                // The dock's content is composited independently by
+                // DirectComposition (see `desktop_dock`) — just acknowledge.
+                let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+                let _ = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+                let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
             Role::Other => DefWindowProcW(hwnd, msg, wparam, lparam),
         },
         // The overview paints its own backdrop into a back buffer (see
@@ -717,6 +793,15 @@ unsafe extern "system" fn wndproc(
                     let x = (lparam.0 & 0xFFFF) as i32;
                     on_bar_hover(hwnd, x, is_primary, &monitor);
                 }
+                Role::Dock => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    STATE.with(|s| {
+                        if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
+                            dock.on_mouse_move(x, y);
+                        }
+                    });
+                }
                 _ => {}
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -762,6 +847,26 @@ unsafe extern "system" fn wndproc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_NCHITTEST if matches!(role, Role::Dock) => {
+            // Make the empty headroom above the dock panel (the room the
+            // window reserves for magnified icons to pop into) click-
+            // through, so it never steals clicks meant for the app window
+            // behind it. The panel itself — where the icons actually sit —
+            // stays interactive.
+            let sx = (lparam.0 & 0xFFFF) as i16 as i32;
+            let sy = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+            let mut pt = windows::Win32::Foundation::POINT { x: sx, y: sy };
+            let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
+            let panel_top = STATE.with(|s| {
+                s.borrow().as_ref().and_then(|st| st.dock.as_ref()).map(|d| d.panel_top_local())
+            });
+            match panel_top {
+                Some(top) if pt.y < top => {
+                    LRESULT(windows::Win32::UI::WindowsAndMessaging::HTTRANSPARENT as isize)
+                }
+                _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+            }
+        }
         WM_LBUTTONUP => {
             match role {
                 Role::Bar { is_primary, monitor } => {
@@ -775,6 +880,14 @@ unsafe extern "system" fn wndproc(
                 }
                 Role::QuickSettings => {
                     on_quick_settings_mouse_up();
+                }
+                Role::Dock => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    STATE.with(|s| {
+                        if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
+                            dock.on_click(x);
+                        }
+                    });
                 }
                 _ => {}
             }
@@ -922,6 +1035,10 @@ unsafe extern "system" fn wndproc(
                 for overview_hwnd in &overviews_snapshot {
                     let _ = InvalidateRect(*overview_hwnd, None, true);
                 }
+
+                // Reconcile the persistent desktop dock with the (possibly
+                // changed) dock_mode / icon size.
+                sync_desktop_dock();
             }
             LRESULT(0)
         }
@@ -963,6 +1080,13 @@ unsafe extern "system" fn wndproc(
                 SYNC_TIMER_ID => on_window_sync_timer(hwnd),
                 HOTCORNER_TIMER_ID => check_hot_corners(),
                 DRAG_TIMER_ID => on_drag_timer(),
+                desktop_dock::DOCK_TIMER_ID if matches!(role, Role::Dock) => {
+                    STATE.with(|s| {
+                        if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
+                            dock.tick();
+                        }
+                    });
+                }
                 CLOCK_TIMER_ID => {
                     let primary =
                         STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
