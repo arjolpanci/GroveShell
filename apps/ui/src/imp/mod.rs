@@ -121,6 +121,7 @@ pub fn main() -> Result<()> {
     state::set_dock_config(config.appearance.dock_icon_size as i32, &config.appearance.dock_alignment);
     state::set_bar_height_config(config.appearance.top_bar_height as i32);
     state::set_compat_a11y_config(config.appearance.high_contrast, &config.compatibility.ignore);
+    state::set_overview_appearance(config.appearance.overview_blur, &config.appearance.dock_mode);
     design::color::refresh_accent();
 
     std::thread::spawn(config_reload_listener);
@@ -167,7 +168,7 @@ pub fn main() -> Result<()> {
             hinstance,
             w!("GroveShellOverview"),
             Some(wndproc),
-            0x00404040,
+            0x00141418,
         )?;
         register_class(
             hinstance,
@@ -331,9 +332,13 @@ pub fn main() -> Result<()> {
                 monitor.device_name.clone(),
                 overview::OverviewInstance::new(overview_hwnd, width, height),
             );
-            if config.appearance.overview_blur {
-                set_blur_behind(overview_hwnd, true);
-            }
+            // The overview backdrop blur is rendered by us now (a blurred,
+            // dimmed wallpaper drawn onto the GPU root surface — see
+            // `overview_gpu::paint_backdrop`), driven by the
+            // `overview_blur` config flag. We deliberately do *not* call
+            // `DwmEnableBlurBehindWindow` here: per the note above it marks
+            // the window DWM-composed and forces the slow GDI fallback,
+            // which is the opposite of what we want.
         }
 
         // Calendar + notifications flyout, centered under the primary
@@ -855,6 +860,7 @@ unsafe extern "system" fn wndproc(
                 state::set_dock_config(new_config.appearance.dock_icon_size as i32, &new_config.appearance.dock_alignment);
                 state::set_bar_height_config(new_config.appearance.top_bar_height as i32);
                 state::set_compat_a11y_config(new_config.appearance.high_contrast, &new_config.compatibility.ignore);
+                state::set_overview_appearance(new_config.appearance.overview_blur, &new_config.appearance.dock_mode);
                 STATE.with(|s| {
                     if let Some(state) = s.borrow_mut().as_mut() {
                         state.config = new_config;
@@ -863,14 +869,13 @@ unsafe extern "system" fn wndproc(
                 // Re-run blur (idempotent: re-enabling an already-enabled
                 // blur, or "enabling" with fEnable now false via a second
                 // DwmEnableBlurBehindWindow call, both work correctly).
-                let (bars_snapshot, overviews_snapshot, blur_bar, blur_overview, new_bar_height) = STATE.with(|s| {
+                let (bars_snapshot, overviews_snapshot, blur_bar, new_bar_height) = STATE.with(|s| {
                     let state = s.borrow();
                     let st = state.as_ref();
                     (
                         st.map(|st| st.bars.iter().map(|b| (b.hwnd, b.rect)).collect::<Vec<_>>()).unwrap_or_default(),
                         st.map(|st| st.overviews.values().map(|o| o.hwnd).collect::<Vec<_>>()).unwrap_or_default(),
                         st.map(|st| st.config.appearance.top_bar_blur).unwrap_or(false),
-                        st.map(|st| st.config.appearance.overview_blur).unwrap_or(false),
                         st.map(|st| st.config.appearance.top_bar_height).unwrap_or(BAR_HEIGHT as u32),
                     )
                 });
@@ -910,8 +915,11 @@ unsafe extern "system" fn wndproc(
 
                     let _ = InvalidateRect(*bar_hwnd, None, true);
                 }
+                // The overview backdrop blur is rendered by us now (see the
+                // note at overview-window creation), driven by the
+                // `overview_blur` mirror updated above — so a live reload
+                // only needs to repaint, not toggle DWM blur-behind.
                 for overview_hwnd in &overviews_snapshot {
-                    set_blur_behind(*overview_hwnd, blur_overview);
                     let _ = InvalidateRect(*overview_hwnd, None, true);
                 }
             }

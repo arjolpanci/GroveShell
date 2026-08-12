@@ -319,7 +319,53 @@ pub(crate) fn paint_card(
 /// the dock, though it never overlaps a card today, is painted here
 /// too rather than split onto `root`, since a future layout change to
 /// either could silently reintroduce the occlusion bug this fixes.
+/// Paints the overview's full-screen backdrop onto `gpu.root` — the
+/// surface every card and the chrome composite on top of. With
+/// `overview_blur` on this is a soft, dimmed blur of the desktop
+/// wallpaper (the gorgeous GNOME-style look): a tiny, smoothly-downscaled
+/// wallpaper (see `overview::backdrop_small_wallpaper`) upscaled to fill
+/// the screen with linear interpolation — the upscale *is* the blur — then
+/// a translucent black scrim so the light cards and text stay legible over
+/// any wallpaper. With blur off it's a clean, solid dark fill. Cheap
+/// enough (one stretched small bitmap + one scrim rect) to redraw whenever
+/// `paint_root` runs; the downscaled source itself is cached.
+pub(crate) fn paint_backdrop(gpu: &OverviewGpuState) {
+    let (w, h) = (gpu.root.width().max(1), gpu.root.height().max(1));
+    let full = D2D_RECT_F { left: 0.0, top: 0.0, right: w as f32, bottom: h as f32 };
+    let blur = super::state::overview_blur();
+
+    gpu::redraw(&gpu.root, |ctx: &ID2D1DeviceContext| {
+        if blur {
+            // Downscale target: small enough for a heavy, even blur, but
+            // not so small the wallpaper loses all sense of place. ~1/22
+            // of the screen width, clamped, with height carrying the
+            // screen's aspect so the upscale doesn't distort it.
+            let small_w = (w / 22).clamp(24, 90);
+            let small_h = ((small_w as i64 * h as i64) / w as i64).max(1) as i32;
+            let mut drew_wallpaper = false;
+            if let Some(hbitmap) = super::overview::backdrop_small_wallpaper(small_w, small_h) {
+                if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, hbitmap) {
+                    gpu::draw_bitmap_stretched(ctx, full, &bitmap);
+                    drew_wallpaper = true;
+                }
+            }
+            if !drew_wallpaper {
+                gpu::fill_rect(ctx, full, 0x0014_1418);
+            }
+            // Translucent scrim to darken and unify — keeps the bright
+            // workspace cards and the "Type to search" chrome readable
+            // over any wallpaper, and gives the overview its focused,
+            // recessed feel.
+            gpu::fill_rect_alpha(ctx, full, 0x0000_0000, 0.42);
+        } else {
+            // Blur off: a clean, solid dark backdrop.
+            gpu::fill_rect(ctx, full, 0x0014_1418);
+        }
+    });
+}
+
 pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::overview::OverviewInstance) {
+    paint_backdrop(gpu);
     let dpi = reference_dpi();
     let dock_radius = scaled(super::dock::DOCK_CORNER_RADIUS, dpi) as f32;
     let thumb_radius = scaled(8, dpi) as f32;
