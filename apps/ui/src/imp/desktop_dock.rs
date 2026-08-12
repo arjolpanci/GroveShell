@@ -15,18 +15,34 @@
 //! overview dock's app model (`dock::build_dock_apps`) rather than
 //! duplicating icon logic.
 
-// The reveal state machine and slide geometry are complete and unit-tested;
-// the floating dock window that consumes them is the remaining build-out,
-// deferred because a new always-on-top surface needs live verification of
-// its placement, autohide feel, and click routing. Allowed module-wide
-// until that window lands.
-#![allow(dead_code)]
-
+use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::RECT;
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
+use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
+use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
+use windows::Win32::Graphics::Gdi::DeleteObject;
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, GetCursorPos, IsIconic, KillTimer, SetForegroundWindow, SetTimer, SetWindowPos,
+    ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+};
 
 use super::design::motion::{self, BASE_MS};
+use super::dock::DockApp;
+use super::gpu::{self, GpuSurface};
+
+/// Timer id for the desktop dock's own animation/autohide tick (distinct
+/// from the overview's `ANIM_TIMER_ID` and the others in `movesize`/
+/// `workspaces`).
+pub(crate) const DOCK_TIMER_ID: usize = 6;
+const DOCK_TIMER_INTERVAL_MS: u32 = 16;
+/// How close to the screen's bottom edge the pointer must get to reveal an
+/// autohidden dock (96-DPI band).
+const REVEAL_BAND: i32 = 3;
 
 /// 96-DPI layout metrics for the floating desktop dock. Deliberately a
 /// touch roomier than the overview dock (`dock.rs`) so it reads as a
@@ -260,7 +276,9 @@ impl AutoHide {
         off.round() as i32
     }
 
-    #[cfg(test)]
+    /// Forces the reveal phase directly — used at dock creation to set the
+    /// initial resting state (Shown for always, Hidden for autohide) and by
+    /// tests.
     pub(crate) fn force(&mut self, phase: RevealPhase) {
         self.phase = phase;
     }
@@ -272,6 +290,404 @@ fn terminal_of(transient: RevealPhase) -> RevealPhase {
         RevealPhase::Hiding => RevealPhase::Hidden,
         other => other,
     }
+}
+
+/// The live floating desktop dock: its window, GPU surface, the reveal
+/// state machine, the current app model, and the transient interaction
+/// state (pointer position, hovered icon, eased wave progress). One of
+/// these exists in `AppState.dock` whenever `dock_mode` is `"always"` or
+/// `"autohide"`; `"overview"` leaves it `None`.
+pub(crate) struct DockWindow {
+    pub(crate) hwnd: HWND,
+    gpu: Option<GpuSurface>,
+    autohide: AutoHide,
+    apps: Vec<DockApp>,
+    /// The primary monitor's work area (screen coords) and DPI the dock
+    /// is laid out against.
+    work: RECT,
+    dpi: u32,
+    /// Configured resting icon size (96-DPI reference), from
+    /// `dock_icon_size`.
+    icon_size_ref: i32,
+    /// `"always"` or `"autohide"`.
+    autohidden: bool,
+    geo: PanelGeometry,
+    /// Resting top-left of the window on screen (fully shown).
+    base_left: i32,
+    base_top: i32,
+    /// Pointer x in window-local coords while it's over the dock, else
+    /// `None` (a flat, resting dock).
+    cursor_x: Option<i32>,
+    hovered: Option<usize>,
+    /// Eased 0..1 magnification progress — the wave fades in when the
+    /// pointer arrives and out when it leaves, rather than snapping.
+    wave: f32,
+    /// Last window rect we positioned to, so `tick` only calls
+    /// `SetWindowPos` when it actually moved.
+    last_offset: i32,
+    /// Frame counter, driving the slow app-refresh cadence.
+    ticks: u64,
+}
+
+impl DockWindow {
+    /// Creates the floating dock window on the primary monitor for the
+    /// given mode (`"always"` or `"autohide"` — any other value is treated
+    /// as always-shown). `None` if window creation fails, in which case
+    /// the shell simply runs without a persistent dock, unchanged.
+    pub(crate) fn create(
+        hinstance: windows::Win32::Foundation::HINSTANCE,
+        work: RECT,
+        dpi: u32,
+        icon_size_ref: i32,
+        mode: &str,
+    ) -> Option<DockWindow> {
+        let apps = build_apps();
+        let geo = panel_geometry(apps.len(), icon_size_ref, dpi);
+        let base_left = work.left + (work.right - work.left - geo.window_w) / 2;
+        let base_top = work.bottom - super::state::scaled(MARGIN_BOTTOM, dpi) - geo.window_h;
+
+        // SAFETY: standard top-most tool-window creation; `hinstance` is the
+        // process module handle. `WS_EX_NOACTIVATE` keeps clicks from
+        // stealing focus from the app the user is working in.
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                w!("GroveShellDock"),
+                w!("GroveShell Dock"),
+                WS_POPUP,
+                base_left,
+                base_top,
+                geo.window_w,
+                geo.window_h,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+            .ok()?
+        };
+
+        let gpu = gpu::create_surface(hwnd, geo.window_w, geo.window_h);
+
+        let mut autohide = AutoHide::new();
+        let autohidden = mode == "autohide";
+        autohide.force(if autohidden { RevealPhase::Hidden } else { RevealPhase::Shown });
+
+        let mut dock = DockWindow {
+            hwnd,
+            gpu,
+            autohide,
+            apps,
+            work,
+            dpi,
+            icon_size_ref,
+            autohidden,
+            geo,
+            base_left,
+            base_top,
+            cursor_x: None,
+            hovered: None,
+            wave: 0.0,
+            last_offset: -1,
+            ticks: 0,
+        };
+        dock.reposition(true);
+        dock.repaint();
+
+        // SAFETY: `hwnd` was just created; `SW_SHOWNA` shows without
+        // activating (matching `WS_EX_NOACTIVATE`).
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+            SetTimer(hwnd, DOCK_TIMER_ID, DOCK_TIMER_INTERVAL_MS, None);
+        }
+        Some(dock)
+    }
+
+    /// Rebuilds the app model and geometry (icons pinned/running may have
+    /// changed), and recomputes the resting position. Called on the tick's
+    /// slow cadence and whenever config (icon size) changes.
+    fn refresh(&mut self, icon_size_ref: i32) {
+        self.icon_size_ref = icon_size_ref;
+        self.apps = build_apps();
+        self.geo = panel_geometry(self.apps.len(), self.icon_size_ref, self.dpi);
+        self.base_left = self.work.left + (self.work.right - self.work.left - self.geo.window_w) / 2;
+        self.base_top =
+            self.work.bottom - super::state::scaled(MARGIN_BOTTOM, self.dpi) - self.geo.window_h;
+        // A resized panel means the window itself must resize; force a
+        // reposition next tick.
+        self.last_offset = -1;
+    }
+
+    /// Moves/resizes the window for the current autohide slide offset.
+    /// `force` bypasses the "only if it moved" guard (used at creation and
+    /// after a geometry change).
+    fn reposition(&mut self, force: bool) {
+        let p = 1.0; // resting; `tick` passes eased progress via `slide_offset`
+        let offset = self.autohide.offset(p, self.geo.window_h);
+        self.apply_offset(offset, force);
+    }
+
+    fn apply_offset(&mut self, offset: i32, force: bool) {
+        if !force && offset == self.last_offset {
+            return;
+        }
+        self.last_offset = offset;
+        // SAFETY: `self.hwnd` is the live dock window; `SetWindowPos` with
+        // `HWND_TOPMOST` keeps it above ordinary windows without activating.
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                HWND_TOPMOST,
+                self.base_left,
+                self.base_top + offset,
+                self.geo.window_w,
+                self.geo.window_h,
+                SWP_NOACTIVATE,
+            );
+        }
+    }
+
+    /// Repaints the dock surface: the rounded panel, each icon at its
+    /// current wave size, running-indicator dots, and the hovered icon's
+    /// subtle highlight.
+    fn repaint(&self) {
+        let Some(surface) = self.gpu.as_ref() else { return };
+        let rects = wave_icon_rects(&self.geo, self.cursor_x, self.wave);
+        let panel = &self.geo.panel_rect;
+        let radius = super::state::scaled(CORNER_RADIUS, self.dpi) as f32;
+        let dot_radius = super::state::scaled(RUNNING_DOT_RADIUS, self.dpi);
+        let apps = &self.apps;
+        let hovered = self.hovered;
+
+        gpu::redraw(surface, |ctx: &ID2D1DeviceContext| {
+            let panel_rect = to_d2d(*panel);
+            gpu::fill_rounded_rect(ctx, panel_rect, radius, super::design::color::surface_raised());
+            gpu::stroke_rounded_rect(ctx, panel_rect, radius, super::design::color::stroke(), 0.6, 1.0);
+
+            for (i, (app, slot)) in apps.iter().zip(rects.iter()).enumerate() {
+                // Hovered-icon highlight: a soft rounded plate behind it.
+                if hovered == Some(i) {
+                    gpu::fill_rounded_rect(
+                        ctx,
+                        to_d2d(inflate(*slot, super::state::scaled(4, self.dpi))),
+                        radius * 0.5,
+                        super::design::color::surface_overlay(),
+                    );
+                }
+                if let Some(icon) = app.icon {
+                    let size = (slot.right - slot.left).max(1);
+                    if let Some(hbitmap) = super::overview_gpu::icon_to_hbitmap(icon, size) {
+                        if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, hbitmap) {
+                            gpu::draw_bitmap_stretched(ctx, to_d2d(*slot), &bitmap);
+                        }
+                        // SAFETY: created locally above, owned exclusively here.
+                        unsafe {
+                            let _ = DeleteObject(hbitmap);
+                        }
+                    }
+                }
+                // Running indicator: one dot centered under the icon, in
+                // the panel's bottom padding.
+                if !app.windows.is_empty() {
+                    let cx = (slot.left + slot.right) / 2;
+                    let cy = self.geo.baseline_bottom + (self.geo.window_h - self.geo.baseline_bottom) / 2;
+                    let dot = RECT {
+                        left: cx - dot_radius,
+                        top: cy - dot_radius,
+                        right: cx + dot_radius,
+                        bottom: cy + dot_radius,
+                    };
+                    gpu::fill_rounded_rect(ctx, to_d2d(dot), dot_radius as f32, super::design::color::accent());
+                }
+            }
+        });
+    }
+
+    /// Pointer moved to window-local `(x, y)`: track it for the wave and
+    /// update which icon is hovered.
+    pub(crate) fn on_mouse_move(&mut self, x: i32, _y: i32) {
+        self.cursor_x = Some(x);
+        self.hovered = icon_at(&self.geo, x, self.dpi);
+    }
+
+    /// A click at window-local `x`: focus (or launch) the icon under it.
+    pub(crate) fn on_click(&mut self, x: i32) {
+        if let Some(i) = icon_at(&self.geo, x, self.dpi) {
+            if let Some(app) = self.apps.get(i) {
+                focus_or_launch(app);
+            }
+        }
+    }
+
+    /// One animation frame: advance the autohide slide, ease the wave
+    /// toward its target (magnified while hovered, flat otherwise), refresh
+    /// the app model periodically, and repaint/reposition only when
+    /// something actually changed.
+    pub(crate) fn tick(&mut self) {
+        self.ticks = self.ticks.wrapping_add(1);
+        let tick_count = self.ticks;
+        let now = Instant::now();
+
+        // Autohide reveal/hide driven by the global pointer position.
+        if self.autohidden {
+            self.update_autohide();
+        } else {
+            // Always-shown mode gets no `WM_MOUSELEAVE` plumbing; poll the
+            // global pointer so the wave recedes once it leaves the window.
+            let mut pt = POINT::default();
+            // SAFETY: `GetCursorPos` writes a plain out-param.
+            if unsafe { GetCursorPos(&mut pt).is_ok() } {
+                let over = pt.x >= self.base_left
+                    && pt.x < self.base_left + self.geo.window_w
+                    && pt.y >= self.base_top
+                    && pt.y < self.base_top + self.geo.window_h;
+                if !over {
+                    self.cursor_x = None;
+                    self.hovered = None;
+                }
+            }
+        }
+        let slide_p = self.autohide.tick(now);
+        let offset = self.autohide.offset(slide_p, self.geo.window_h);
+
+        // Ease the wave toward its target. When hidden/hiding, force it flat.
+        let shown = matches!(self.autohide.phase, RevealPhase::Shown | RevealPhase::Revealing);
+        let target = if shown && self.cursor_x.is_some() { 1.0 } else { 0.0 };
+        let prev_wave = self.wave;
+        // ~120ms ease at 16ms/frame: step ~0.13 toward target.
+        let step = 0.16_f32;
+        if (self.wave - target).abs() <= step {
+            self.wave = target;
+        } else if self.wave < target {
+            self.wave += step;
+        } else {
+            self.wave -= step;
+        }
+
+        // Periodically rebuild the app list so newly-opened/closed apps and
+        // pin changes show up (every ~500ms).
+        if tick_count % 32 == 0 {
+            let before = self.apps.len();
+            let (icon_size, _) = super::state::dock_config();
+            self.refresh(icon_size);
+            if self.apps.len() != before {
+                self.reposition(true);
+            }
+        }
+
+        let moved = offset != self.last_offset;
+        if moved {
+            self.apply_offset(offset, false);
+        }
+        // Repaint if the wave progress changed, we're mid-slide, or the
+        // pointer is currently over the dock (so the crest follows it
+        // horizontally even when the overall progress is steady at 1.0).
+        let wave_changed = (self.wave - prev_wave).abs() > f32::EPSILON;
+        if wave_changed || moved || self.autohide.is_animating() || self.cursor_x.is_some() {
+            self.repaint();
+        }
+    }
+
+    /// The panel's top edge in window-local coordinates — the boundary
+    /// `wndproc` uses to make the empty headroom above the panel
+    /// click-through (see the dock's `WM_NCHITTEST` handling).
+    pub(crate) fn panel_top_local(&self) -> i32 {
+        self.geo.panel_rect.top
+    }
+
+    /// Decides reveal vs. hide for autohide mode from the live cursor
+    /// position: reveal when the pointer hits the bottom edge under the
+    /// dock's footprint; hide once it leaves that footprint.
+    fn update_autohide(&mut self) {
+        let mut pt = POINT::default();
+        // SAFETY: `GetCursorPos` writes a plain out-param; no preconditions.
+        let ok = unsafe { GetCursorPos(&mut pt).is_ok() };
+        if !ok {
+            return;
+        }
+        let in_x = pt.x >= self.base_left && pt.x < self.base_left + self.geo.window_w;
+        let over_footprint = in_x && pt.y >= self.base_top;
+        let at_edge =
+            in_x && pt.y >= self.work.bottom - super::state::scaled(REVEAL_BAND, self.dpi);
+
+        match self.autohide.phase {
+            RevealPhase::Hidden | RevealPhase::Hiding => {
+                if at_edge {
+                    self.autohide.on_hot_edge();
+                }
+            }
+            RevealPhase::Shown | RevealPhase::Revealing => {
+                if !over_footprint {
+                    self.autohide.on_leave();
+                    self.cursor_x = None;
+                    self.hovered = None;
+                }
+            }
+        }
+    }
+
+    /// Tears the window down (timer + window). Called when switching to
+    /// `"overview"` mode on a live config reload.
+    pub(crate) fn destroy(&mut self) {
+        // SAFETY: `self.hwnd` is the live dock window; killing its timer and
+        // destroying it is a standard teardown.
+        unsafe {
+            let _ = KillTimer(self.hwnd, DOCK_TIMER_ID);
+            let _ = windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd);
+        }
+    }
+}
+
+/// Builds the desktop dock's app model from a fresh, non-mutating window
+/// snapshot (running apps) merged with the persisted pins — the same
+/// `build_dock_apps` the overview dock uses, so pins and running
+/// indicators stay consistent between the two surfaces.
+fn build_apps() -> Vec<DockApp> {
+    let live = super::state::filter_ignored(groveshell_window_model::snapshot());
+    super::dock::build_dock_apps(&live)
+}
+
+/// Focuses an app's window (restoring it if minimized) or, if it has none,
+/// launches its pinned shortcut.
+fn focus_or_launch(app: &DockApp) {
+    if let Some(&hwnd) = app.windows.first() {
+        let h = HWND(hwnd as *mut c_void);
+        // SAFETY: `h` is a tracked top-level window handle; restoring and
+        // foregrounding it are standard, precondition-free calls.
+        unsafe {
+            if IsIconic(h).as_bool() {
+                let _ = ShowWindow(h, SW_RESTORE);
+            }
+            let _ = SetForegroundWindow(h);
+        }
+    } else if let Some(path) = &app.launch_path {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is nul-terminated and outlives the fire-and-forget
+        // call — same launch path the overview dock uses.
+        unsafe {
+            let _ = ShellExecuteW(
+                HWND(std::ptr::null_mut()),
+                w!("open"),
+                PCWSTR(wide.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            );
+        }
+    }
+}
+
+fn to_d2d(r: RECT) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left: r.left as f32,
+        top: r.top as f32,
+        right: r.right as f32,
+        bottom: r.bottom as f32,
+    }
+}
+
+fn inflate(r: RECT, by: i32) -> RECT {
+    RECT { left: r.left - by, top: r.top - by, right: r.right + by, bottom: r.bottom + by }
 }
 
 #[cfg(test)]

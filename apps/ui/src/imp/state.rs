@@ -87,6 +87,10 @@ pub(crate) struct AppState {
     /// actually tell something's clickable before clicking it.
     pub(crate) hovered_bar_region: Option<(HWND, super::bar::BarRegion)>,
     pub(crate) qs_volume_dragging: bool,
+    /// The persistent floating desktop dock, present only when `dock_mode`
+    /// is `"always"` or `"autohide"` (see `desktop_dock`). `None` in the
+    /// default `"overview"` mode.
+    pub(crate) dock: Option<super::desktop_dock::DockWindow>,
 }
 
 thread_local! {
@@ -335,6 +339,7 @@ pub(crate) enum Role {
     Overview { monitor: String },
     Calendar,
     QuickSettings,
+    Dock,
     Other,
 }
 
@@ -357,6 +362,8 @@ pub(crate) fn role_of(hwnd: HWND) -> Role {
             Role::Calendar
         } else if hwnd == st.quick_settings_hwnd {
             Role::QuickSettings
+        } else if st.dock.as_ref().is_some_and(|d| d.hwnd == hwnd) {
+            Role::Dock
         } else {
             Role::Other
         }
