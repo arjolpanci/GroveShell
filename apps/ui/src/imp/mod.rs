@@ -182,11 +182,15 @@ pub fn main() -> Result<()> {
             Some(wndproc),
             0x00303030,
         )?;
+        // Null background brush: the dock window is taller than its panel
+        // (headroom for the magnified icons) and paints only the panel onto
+        // a DirectComposition surface, leaving the rest transparent — an
+        // opaque class brush would fill the headroom with a dark box.
         register_class(
             hinstance,
             w!("GroveShellDock"),
             Some(wndproc),
-            0x00141418,
+            NULL_BRUSH_SENTINEL,
         )?;
 
         // One bar per monitor (Phase 4). WS_EX_TOOLWINDOW keeps each
@@ -463,32 +467,34 @@ pub fn main() -> Result<()> {
                 window_rects: std::collections::HashMap::new(),
                 hovered_bar_region: None,
                 qs_volume_dragging: false,
-                dock: None,
+                docks: Vec::new(),
             });
         });
 
-        // Persistent floating desktop dock — created only when the user
+        // Persistent floating desktop docks — created only when the user
         // opted into it (`dock_mode = "always"` or `"autohide"`); the
-        // default `"overview"` leaves `AppState.dock` as `None`. Placed on
-        // the primary monitor.
+        // default `"overview"` leaves `AppState.docks` empty. One per
+        // monitor, each on its own monitor's work area.
         let dock_mode = state::dock_mode();
         if dock_mode != "overview" {
-            if let Some(primary) = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first()) {
-                let (icon_size, _) = state::dock_config();
+            let (icon_size, _) = state::dock_config();
+            let mut docks = Vec::new();
+            for monitor in &monitors {
                 if let Some(dock) = desktop_dock::DockWindow::create(
                     hinstance,
-                    primary.work,
-                    primary.dpi,
+                    monitor.work,
+                    monitor.dpi,
                     icon_size,
                     &dock_mode,
                 ) {
-                    STATE.with(|s| {
-                        if let Some(st) = s.borrow_mut().as_mut() {
-                            st.dock = Some(dock);
-                        }
-                    });
+                    docks.push(dock);
                 }
             }
+            STATE.with(|s| {
+                if let Some(st) = s.borrow_mut().as_mut() {
+                    st.docks = docks;
+                }
+            });
         }
 
         // A `MoveWindow` above may have already triggered and consumed
@@ -522,6 +528,12 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
+/// Passed as `register_class`'s `background` to request a *null* class
+/// background brush (no auto-erase) instead of a solid color — not a valid
+/// `COLORREF` (whose high byte is always 0), so it can't collide with a
+/// real color.
+const NULL_BRUSH_SENTINEL: u32 = 0xFFFF_FFFF;
+
 /// SAFETY: `wndproc` must be a valid `WNDPROC`-compatible function
 /// pointer for the lifetime of the registered class, which holds for
 /// the whole process lifetime here (classes are never unregistered).
@@ -531,12 +543,17 @@ unsafe fn register_class(
     wndproc: WNDPROC,
     background: u32,
 ) -> Result<()> {
+    let hbr = if background == NULL_BRUSH_SENTINEL {
+        windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut())
+    } else {
+        CreateSolidBrush(COLORREF(background))
+    };
     let class = WNDCLASSW {
         lpfnWndProc: wndproc,
         hInstance: hinstance,
         lpszClassName: class_name,
         hCursor: LoadCursorW(None, IDC_ARROW).map_err(Error::Windows)?,
-        hbrBackground: CreateSolidBrush(COLORREF(background)),
+        hbrBackground: hbr,
         ..Default::default()
     };
     if RegisterClassW(&class) == 0 {
@@ -565,20 +582,49 @@ fn set_blur_behind(hwnd: HWND, enabled: bool) {
     }
 }
 
-/// Reconciles the persistent desktop dock with the current `dock_mode` /
-/// icon-size config, after a live reload. Simplest robust approach:
-/// tear down any existing dock and recreate it if a persistent mode is
-/// selected — reloads only happen when the user actually changes a
-/// setting, so the momentary flash is a non-issue.
-fn sync_desktop_dock() {
-    // Drop any existing dock first (also handles switching to "overview").
+/// Runs `f` on the dock window identified by `hwnd`, **detached from
+/// `STATE`**: the dock is moved out of `AppState.docks` before `f` runs
+/// and put back after. This is essential — `f` (a tick/click/menu) calls
+/// Win32 APIs like `SetWindowPos`, `SetForegroundWindow`, and
+/// `TrackPopupMenu` that *synchronously* re-enter `wndproc`, whose very
+/// first line (`role_of`) borrows `STATE`. Holding `STATE`'s borrow across
+/// those calls aborts the process with "already borrowed" (a non-unwinding
+/// panic). With the dock detached, the re-entrant `wndproc` sees this hwnd
+/// as `Role::Other` and routes those internal messages to `DefWindowProcW`,
+/// which is exactly right. No-op if no dock matches `hwnd`.
+fn with_dock_detached(hwnd: HWND, f: impl FnOnce(&mut desktop_dock::DockWindow)) {
+    let taken = STATE.with(|s| {
+        let mut borrow = s.borrow_mut();
+        let st = borrow.as_mut()?;
+        let idx = st.docks.iter().position(|d| d.hwnd == hwnd)?;
+        Some(st.docks.swap_remove(idx))
+    });
+    let Some(mut dock) = taken else { return };
+    f(&mut dock);
     STATE.with(|s| {
         if let Some(st) = s.borrow_mut().as_mut() {
-            if let Some(mut dock) = st.dock.take() {
-                dock.destroy();
-            }
+            st.docks.push(dock);
         }
     });
+}
+
+/// Reconciles the persistent desktop docks with the current `dock_mode` /
+/// icon-size config, after a live reload. Tears down any existing docks
+/// and recreates one per monitor if a persistent mode is selected —
+/// reloads only happen when the user actually changes a setting, so the
+/// momentary flash is a non-issue.
+fn sync_desktop_dock() {
+    // Take the docks out of STATE *before* destroying them: `DestroyWindow`
+    // synchronously re-enters `wndproc` (WM_DESTROY/WM_NCDESTROY), which
+    // borrows STATE — see `with_dock_detached` for why holding the borrow
+    // across that would abort the process.
+    let mut old = STATE.with(|s| {
+        s.borrow_mut().as_mut().map(|st| std::mem::take(&mut st.docks)).unwrap_or_default()
+    });
+    for dock in &mut old {
+        dock.destroy();
+    }
+    drop(old);
 
     let mode = state::dock_mode();
     if mode == "overview" {
@@ -588,18 +634,19 @@ fn sync_desktop_dock() {
     let Ok(module) = (unsafe { GetModuleHandleW(None) }) else { return };
     let hinstance = windows::Win32::Foundation::HINSTANCE(module.0);
     let monitors = monitors::monitors_sorted_by_x();
-    let Some(primary) = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first()) else {
-        return;
-    };
-    if let Some(dock) =
-        desktop_dock::DockWindow::create(hinstance, primary.work, primary.dpi, icon_size, &mode)
-    {
-        STATE.with(|s| {
-            if let Some(st) = s.borrow_mut().as_mut() {
-                st.dock = Some(dock);
-            }
-        });
+    let mut docks = Vec::new();
+    for monitor in &monitors {
+        if let Some(dock) =
+            desktop_dock::DockWindow::create(hinstance, monitor.work, monitor.dpi, icon_size, &mode)
+        {
+            docks.push(dock);
+        }
     }
+    STATE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            st.docks = docks;
+        }
+    });
 }
 
 /// Not a real Win32-defined message; app-private, matching the pattern
@@ -745,7 +792,12 @@ unsafe extern "system" fn wndproc(
         // `paint_overview`), so the class-brush erase pass is both
         // redundant and the source of a visible background flash
         // between erase and repaint while dragging — claim it handled.
-        WM_ERASEBKGND if matches!(role, Role::Overview { .. }) || role == Role::QuickSettings => {
+        WM_ERASEBKGND
+            if matches!(role, Role::Overview { .. } | Role::Dock) || role == Role::QuickSettings =>
+        {
+            // The dock paints its content onto a DirectComposition surface
+            // and must keep its headroom transparent — a class-brush erase
+            // would fill it with an opaque box.
             LRESULT(1)
         }
         WM_LBUTTONDOWN => {
@@ -775,12 +827,10 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_RBUTTONUP if matches!(role, Role::Dock) => {
+            // Detached: `on_right_click` runs a modal `TrackPopupMenu` loop
+            // that pumps messages and re-enters `wndproc`.
             let x = (lparam.0 & 0xFFFF) as i32;
-            STATE.with(|s| {
-                if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
-                    dock.on_right_click(x);
-                }
-            });
+            with_dock_detached(hwnd, |dock| dock.on_right_click(x));
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -803,10 +853,14 @@ unsafe extern "system" fn wndproc(
                     on_bar_hover(hwnd, x, is_primary, &monitor);
                 }
                 Role::Dock => {
+                    // Sets fields only (no window API) so it's safe to hold
+                    // STATE's borrow here — no re-entrancy.
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     STATE.with(|s| {
-                        if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
+                        if let Some(dock) =
+                            s.borrow_mut().as_mut().and_then(|st| st.docks.iter_mut().find(|d| d.hwnd == hwnd))
+                        {
                             dock.on_mouse_move(x, y);
                         }
                     });
@@ -867,7 +921,10 @@ unsafe extern "system" fn wndproc(
             let mut pt = windows::Win32::Foundation::POINT { x: sx, y: sy };
             let _ = windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut pt);
             let panel_top = STATE.with(|s| {
-                s.borrow().as_ref().and_then(|st| st.dock.as_ref()).map(|d| d.panel_top_local())
+                s.borrow()
+                    .as_ref()
+                    .and_then(|st| st.docks.iter().find(|d| d.hwnd == hwnd))
+                    .map(|d| d.panel_top_local())
             });
             match panel_top {
                 Some(top) if pt.y < top => {
@@ -891,12 +948,10 @@ unsafe extern "system" fn wndproc(
                     on_quick_settings_mouse_up();
                 }
                 Role::Dock => {
+                    // Detached: `on_click` calls `SetForegroundWindow` /
+                    // `ShellExecuteW`, which re-enter `wndproc`.
                     let x = (lparam.0 & 0xFFFF) as i32;
-                    STATE.with(|s| {
-                        if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
-                            dock.on_click(x);
-                        }
-                    });
+                    with_dock_detached(hwnd, |dock| dock.on_click(x));
                 }
                 _ => {}
             }
@@ -1090,11 +1145,9 @@ unsafe extern "system" fn wndproc(
                 HOTCORNER_TIMER_ID => check_hot_corners(),
                 DRAG_TIMER_ID => on_drag_timer(),
                 desktop_dock::DOCK_TIMER_ID if matches!(role, Role::Dock) => {
-                    STATE.with(|s| {
-                        if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
-                            dock.tick();
-                        }
-                    });
+                    // Detached: `tick` calls `SetWindowPos` (autohide slide),
+                    // which synchronously re-enters `wndproc`.
+                    with_dock_detached(hwnd, |dock| dock.tick());
                 }
                 CLOCK_TIMER_ID => {
                     let primary =

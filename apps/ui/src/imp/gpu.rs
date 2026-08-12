@@ -244,6 +244,18 @@ pub(crate) fn fill_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u3
     }
 }
 
+/// Clears the whole target to fully transparent — used by surfaces that
+/// only partially cover their window (the floating desktop dock draws a
+/// panel at the bottom and leaves the headroom above it see-through) so
+/// stale pixels from a previous, differently-sized frame never linger.
+pub(crate) fn clear_transparent(ctx: &ID2D1DeviceContext) {
+    let transparent = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
+    unsafe {
+        ctx.Clear(Some(&transparent));
+    }
+}
+
 /// Fills `rect` with `colorref` at the given `alpha` (0..1) — used for
 /// the overview backdrop's dim scrim, which needs partial transparency
 /// that `fill_rect`'s always-opaque brush can't express.
