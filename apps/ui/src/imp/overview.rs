@@ -2223,8 +2223,11 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         let buffer = overview_back_buffer(hdc, w, h);
         let previous = SelectObject(mem, buffer);
 
-        // Same backdrop color as the window class's brush.
-        let backdrop_brush = CreateSolidBrush(COLORREF(0x00404040));
+        // Dark backdrop (GDI fallback path only — the GPU path renders a
+        // blurred, dimmed wallpaper here instead, see
+        // `overview_gpu::paint_backdrop`). Darker than the old flat grey
+        // so the fallback still reads as a focused, recessed overview.
+        let backdrop_brush = CreateSolidBrush(COLORREF(0x00141418));
         FillRect(mem, &client, backdrop_brush);
         let _ = DeleteObject(backdrop_brush);
 
@@ -2749,6 +2752,71 @@ fn scaled_wallpaper(width: i32, height: i32) -> Option<isize> {
         let handle = bitmap.0 as isize;
         WALLPAPER_SCALED.with(|c| *c.borrow_mut() = Some((width, height, handle)));
         Some(handle)
+    }
+}
+
+thread_local! {
+    /// The wallpaper aggressively downscaled to a tiny canvas
+    /// (`(width, height, handle)`), the source for the overview's
+    /// gorgeous blurred backdrop. Upscaling this small bitmap back to
+    /// full-screen with linear interpolation (see
+    /// `overview_gpu::paint_backdrop`) is what turns it into a soft,
+    /// even, GNOME-style blur — far cheaper and more reliable than a
+    /// real Gaussian-blur effect, and it only re-renders when the target
+    /// size changes (once per session in practice). Separate from
+    /// `WALLPAPER_SCALED` so the two caches (card-size vs. tiny-backdrop)
+    /// never evict each other.
+    static WALLPAPER_BACKDROP: RefCell<Option<(i32, i32, isize)>> = const { RefCell::new(None) };
+}
+
+/// A tiny, smoothly-downscaled copy of the desktop wallpaper, sized
+/// `width`×`height` (both expected to be small — a few dozen px). Cached;
+/// re-rendered only when the requested size changes. `None` if the
+/// wallpaper couldn't be loaded, in which case the backdrop falls back to
+/// a solid dim fill.
+pub(crate) fn backdrop_small_wallpaper(width: i32, height: i32) -> Option<HBITMAP> {
+    let (width, height) = (width.max(1), height.max(1));
+    if let Some((w, h, handle)) = WALLPAPER_BACKDROP.with(|c| *c.borrow()) {
+        if w == width && h == height {
+            return Some(HBITMAP(handle as *mut c_void));
+        }
+        // SAFETY: `handle` is an HBITMAP created below on this same
+        // thread and owned exclusively by this cache.
+        unsafe {
+            let _ = DeleteObject(HBITMAP(handle as *mut c_void));
+        }
+        WALLPAPER_BACKDROP.with(|c| *c.borrow_mut() = None);
+    }
+
+    let source = wallpaper_bitmap()?;
+    // SAFETY: standard create-select-draw-restore GDI sequence on handles
+    // created and torn down entirely within this call (except `bitmap`,
+    // whose ownership moves into the cache); `source` was loaded once at
+    // startup and never freed/moved.
+    unsafe {
+        let screen = GetDC(None);
+        let mem = CreateCompatibleDC(screen);
+        let bitmap = CreateCompatibleBitmap(screen, width, height);
+        let previous = SelectObject(mem, bitmap);
+
+        let mut graphics: *mut GpGraphics = std::ptr::null_mut();
+        let ok = GdipCreateFromHDC(mem, &mut graphics).0 == 0 && !graphics.is_null();
+        if ok {
+            let _ = GdipDrawImageRectI(graphics, source as *mut GpImage, 0, 0, width, height);
+            let _ = GdipDeleteGraphics(graphics);
+        }
+
+        SelectObject(mem, previous);
+        let _ = DeleteDC(mem);
+        ReleaseDC(None, screen);
+
+        if !ok {
+            let _ = DeleteObject(bitmap);
+            return None;
+        }
+        let handle = bitmap.0 as isize;
+        WALLPAPER_BACKDROP.with(|c| *c.borrow_mut() = Some((width, height, handle)));
+        Some(HBITMAP(handle as *mut c_void))
     }
 }
 

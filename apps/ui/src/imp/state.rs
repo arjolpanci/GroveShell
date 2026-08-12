@@ -155,6 +155,16 @@ thread_local! {
     static DOCK_ICON_SIZE: Cell<i32> = const { Cell::new(44) };
     static DOCK_ALIGNMENT: RefCell<String> = RefCell::new(String::new());
 
+    /// Same re-entrancy-safe mirror pattern for the two appearance fields
+    /// the overview render path reads from inside a held `STATE` borrow:
+    /// whether to blur the overview backdrop (`overview::paint_backdrop`,
+    /// called via `paint_root` from deep inside animation/hover code) and
+    /// the persistent-dock visibility mode (`desktop_dock` reveal logic).
+    /// Kept in sync at the same two places as the others via
+    /// `set_overview_appearance`.
+    static OVERVIEW_BLUR: Cell<bool> = const { Cell::new(false) };
+    static DOCK_MODE: RefCell<String> = RefCell::new(String::new());
+
     /// Same idea again for `AppState.config.appearance.top_bar_height`:
     /// `overview::card_layout` (which needs the bar's real current height
     /// to know where the card grid starts) is called from the same
@@ -265,6 +275,30 @@ pub(crate) fn set_dock_config(icon_size: i32, alignment: &str) {
 pub(crate) fn dock_config() -> (i32, String) {
     let alignment = DOCK_ALIGNMENT.with(|c| c.borrow().clone());
     (DOCK_ICON_SIZE.with(|c| c.get()), if alignment.is_empty() { "center".to_string() } else { alignment })
+}
+
+/// Updates the re-entrancy-safe mirror of the overview-appearance config
+/// fields (backdrop blur, persistent-dock mode). Call this every time
+/// `AppState.config` is set or replaced.
+pub(crate) fn set_overview_appearance(overview_blur: bool, dock_mode: &str) {
+    OVERVIEW_BLUR.with(|c| c.set(overview_blur));
+    DOCK_MODE.with(|c| *c.borrow_mut() = dock_mode.to_string());
+}
+
+/// Whether the overview backdrop should render the wallpaper blurred (vs.
+/// a solid dim). Safe to call from inside an active `STATE.with` borrow —
+/// see `OVERVIEW_BLUR`'s doc comment.
+pub(crate) fn overview_blur() -> bool {
+    OVERVIEW_BLUR.with(|c| c.get())
+}
+
+/// The persistent-dock visibility mode (`"overview"`, `"always"`, or
+/// `"autohide"`). Falls back to `"overview"` before the first
+/// `set_overview_appearance`. Safe to call from inside an active
+/// `STATE.with` borrow.
+pub(crate) fn dock_mode() -> String {
+    let mode = DOCK_MODE.with(|c| c.borrow().clone());
+    if mode.is_empty() { "overview".to_string() } else { mode }
 }
 
 /// Updates the re-entrancy-safe mirror of the configured top bar height.

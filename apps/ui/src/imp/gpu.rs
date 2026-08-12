@@ -244,6 +244,32 @@ pub(crate) fn fill_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u3
     }
 }
 
+/// Fills `rect` with `colorref` at the given `alpha` (0..1) — used for
+/// the overview backdrop's dim scrim, which needs partial transparency
+/// that `fill_rect`'s always-opaque brush can't express.
+pub(crate) fn fill_rect_alpha(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u32, alpha: f32) {
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
+    unsafe {
+        let mut color = colorref_to_d2d(colorref);
+        color.a = alpha.clamp(0.0, 1.0);
+        if let Ok(brush) = ctx.CreateSolidColorBrush(&color, None) {
+            ctx.FillRectangle(&rect, &brush);
+        }
+    }
+}
+
+/// Draws `bitmap` stretched to fill `rect` with linear interpolation and
+/// no rounded-rect clip — the overview backdrop upscales a small,
+/// smoothly-downscaled wallpaper this way, and the linear upscale is
+/// exactly what turns the downscaled source into a soft, even blur.
+pub(crate) fn draw_bitmap_stretched(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, bitmap: &ID2D1Bitmap) {
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`;
+    // `bitmap` is owned by the caller for the duration of the call.
+    unsafe {
+        ctx.DrawBitmap(bitmap, Some(&rect), 1.0, D2D1_INTERPOLATION_MODE_LINEAR, None, None);
+    }
+}
+
 pub(crate) fn draw_text(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
