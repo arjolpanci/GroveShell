@@ -179,6 +179,47 @@ pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize
     (bar_rect, slots, divider_rect)
 }
 
+/// Peak magnification of the overview dash icon directly under the
+/// pointer — a touch gentler than the persistent dock's crest, since the
+/// dash sits inside the busier overview.
+const DASH_MAX_SCALE: f32 = 1.5;
+
+/// Smooth wave-magnification factor (>= 1.0) for a dash icon whose center
+/// is `distance` px from the pointer, peaking at [`DASH_MAX_SCALE`] and
+/// easing back to 1.0 with a Gaussian falloff of width `sigma`. Pure.
+pub(crate) fn dash_magnify_factor(distance: f32, sigma: f32) -> f32 {
+    let sigma = sigma.max(1.0);
+    let x = distance / sigma;
+    1.0 + (DASH_MAX_SCALE - 1.0) * (-0.5 * x * x).exp()
+}
+
+/// The overview dash's icon slots with the macOS-style wave applied: each
+/// icon stays centered on its fixed base slot and bottom-anchored to that
+/// slot's bottom edge (so it grows upward), scaled by [`dash_magnify_factor`]
+/// of its center's distance to `cursor_x`. `progress` (0..1) eases the whole
+/// effect in/out. `cursor_x` of `None` returns the slots unchanged (a flat
+/// dash). Base slots are left untouched for hit-testing — only the drawn
+/// rects move. Pure.
+pub(crate) fn wave_slots(slots: &[RECT], cursor_x: Option<i32>, progress: f32) -> Vec<RECT> {
+    let progress = progress.clamp(0.0, 1.0);
+    slots
+        .iter()
+        .map(|s| {
+            let base = (s.right - s.left).max(1);
+            let cx = (s.left + s.right) / 2;
+            let sigma = base as f32 * 1.3;
+            let target = match cursor_x {
+                Some(x) => dash_magnify_factor((x - cx).abs() as f32, sigma),
+                None => 1.0,
+            };
+            let scale = 1.0 + (target - 1.0) * progress;
+            let size = (base as f32 * scale).round() as i32;
+            let half = size / 2;
+            RECT { left: cx - half, top: s.bottom - size, right: cx - half + size, bottom: s.bottom }
+        })
+        .collect()
+}
+
 /// Whether a dock entry should show a running-indicator dot beneath it.
 pub(crate) fn dock_running_dot_radius() -> i32 {
     scaled(DOCK_RUNNING_DOT_RADIUS, super::state::reference_dpi())
@@ -917,5 +958,52 @@ mod tests {
     #[test]
     fn anchor_x_falls_back_to_center_for_an_unknown_alignment() {
         assert_eq!(anchor_x(0, 200, 40, "bogus"), 80);
+    }
+
+    fn slot(left: i32, size: i32) -> RECT {
+        RECT { left, top: 0, right: left + size, bottom: size }
+    }
+
+    #[test]
+    fn dash_magnify_factor_peaks_under_the_pointer_and_decays() {
+        let sigma = 60.0;
+        let peak = dash_magnify_factor(0.0, sigma);
+        assert!((peak - DASH_MAX_SCALE).abs() < 1e-5);
+        assert!(dash_magnify_factor(sigma, sigma) < peak);
+        assert!(dash_magnify_factor(sigma * 6.0, sigma) < 1.001);
+    }
+
+    #[test]
+    fn wave_slots_with_no_cursor_returns_slots_unchanged_in_size() {
+        let slots = vec![slot(0, 40), slot(50, 40), slot(100, 40)];
+        let waved = wave_slots(&slots, None, 1.0);
+        for (s, w) in slots.iter().zip(waved.iter()) {
+            assert_eq!(w.right - w.left, s.right - s.left);
+            assert_eq!(w.bottom, s.bottom);
+        }
+    }
+
+    #[test]
+    fn wave_slots_magnifies_the_icon_under_the_cursor_the_most() {
+        let slots = vec![slot(0, 40), slot(50, 40), slot(100, 40)];
+        let cursor = (slots[1].left + slots[1].right) / 2;
+        let waved = wave_slots(&slots, Some(cursor), 1.0);
+        let widths: Vec<i32> = waved.iter().map(|r| r.right - r.left).collect();
+        assert!(widths[1] > widths[0]);
+        assert!(widths[1] > widths[2]);
+        // Bottom-anchored: every icon keeps its slot's bottom edge.
+        for (s, w) in slots.iter().zip(waved.iter()) {
+            assert_eq!(w.bottom, s.bottom);
+        }
+    }
+
+    #[test]
+    fn wave_slots_progress_zero_is_a_flat_dash() {
+        let slots = vec![slot(0, 40), slot(50, 40)];
+        let cursor = (slots[0].left + slots[0].right) / 2;
+        let waved = wave_slots(&slots, Some(cursor), 0.0);
+        for (s, w) in slots.iter().zip(waved.iter()) {
+            assert_eq!(w.right - w.left, s.right - s.left);
+        }
     }
 }

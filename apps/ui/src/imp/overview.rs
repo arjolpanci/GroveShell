@@ -184,6 +184,12 @@ pub(crate) struct OverviewInstance {
     pub(crate) hover_thumb: Option<(isize, std::time::Instant)>,
     pub(crate) dock_apps: Vec<super::dock::DockApp>,
     pub(crate) dock_hover: Option<(usize, std::time::Instant)>,
+    /// Pointer x (overview-window coords) while it's over the dock bar,
+    /// else `None` — drives the dash's wave magnification. Kept separate
+    /// from `dock_hover` (which tracks the single hovered slot for the
+    /// glow) because the wave needs the continuous cursor position, not a
+    /// discrete slot.
+    pub(crate) dock_cursor_x: Option<i32>,
     pub(crate) search_query: String,
     /// `None` if GPU rendering isn't available for this window (see
     /// `gpu::is_enabled`) or this specific window's DirectComposition
@@ -209,6 +215,7 @@ impl OverviewInstance {
             hover_thumb: None,
             dock_apps: Vec::new(),
             dock_hover: None,
+            dock_cursor_x: None,
             search_query: String::new(),
             gpu: super::overview_gpu::create(hwnd, width, height),
         }
@@ -728,6 +735,7 @@ pub(crate) fn open_overview(monitor: &str) {
                 ov.carousel_close_after = None;
                 ov.dock_apps = dock_apps;
                 ov.dock_hover = None;
+                ov.dock_cursor_x = None;
                 ov.mode = OverviewMode::Opening {
                     started: Instant::now(),
                     thumbs,
@@ -902,6 +910,7 @@ pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
                 ov.window_pop_anim = None;
                 ov.hover_thumb = None;
                 ov.dock_hover = None;
+                ov.dock_cursor_x = None;
                 ov.search_query.clear();
                 Some(ov.hwnd)
             }
@@ -1445,7 +1454,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
 
         // Dock icons take priority: a dock slot is never also a window
         // preview, so at most one of `hovered`/`dock_hit` is ever Some.
-        let (_, dock_slots, _) = super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
+        let (dock_bar_rect, dock_slots, _) = super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
         let dock_hit = dock_slots
             .iter()
             .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom);
@@ -1468,6 +1477,18 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
         }
         if ov.dock_hover.map(|(i, _)| i) != dock_hit {
             ov.dock_hover = dock_hit.map(|i| (i, Instant::now()));
+            changed = true;
+        }
+        // Track the continuous cursor x while it's anywhere over the dock
+        // bar (not just on a slot) so the wave magnification follows it —
+        // a change here repaints the dock chrome below, and moving off the
+        // bar clears it back to a flat dash.
+        let new_dock_cursor_x = {
+            let r = dock_bar_rect;
+            (x >= r.left && x < r.right && y >= r.top && y < r.bottom).then_some(x)
+        };
+        if ov.dock_cursor_x != new_dock_cursor_x {
+            ov.dock_cursor_x = new_dock_cursor_x;
             changed = true;
         }
         if changed {
@@ -2179,14 +2200,23 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         // with the cards.
         let (dock_bar_rect, dock_slots, dock_divider) =
             super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
-        let dock_icons: Vec<(RECT, HICON, usize)> = ov
+        // Wave magnification: `draw_slots` are the magnified, bottom-
+        // anchored rects the icons render at as they ride the pointer; the
+        // base `dock_slots` are what got hit-tested and where the running
+        // dots stay pinned. Each icon carries both.
+        let dock_draw_slots = super::dock::wave_slots(&dock_slots, ov.dock_cursor_x, 1.0);
+        let dock_icons: Vec<(RECT, RECT, HICON, usize)> = ov
             .dock_apps
             .iter()
-            .zip(dock_slots.iter())
-            .filter_map(|(app, rect)| app.icon.map(|icon| (*rect, icon, app.windows.len())))
+            .enumerate()
+            .filter_map(|(i, app)| {
+                let draw = *dock_draw_slots.get(i)?;
+                let base = *dock_slots.get(i)?;
+                app.icon.map(|icon| (draw, base, icon, app.windows.len()))
+            })
             .collect();
         let dock_hover_glow = ov.dock_hover.and_then(|(i, started)| {
-            let rect = dock_slots.get(i)?;
+            let rect = dock_draw_slots.get(i)?;
             let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
             Some((*rect, intensity))
         });
@@ -2393,11 +2423,11 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                 let running_dot_brush = CreateSolidBrush(COLORREF(super::design::color::text()));
                 let running_dot_radius = super::dock::dock_running_dot_radius();
                 let running_dot_gap = scaled(super::dock::DOCK_RUNNING_DOT_GAP, dpi);
-                for (rect, icon, window_count) in &dock_icons {
-                    let size = rect.right - rect.left;
-                    let _ = DrawIconEx(mem, rect.left, rect.top, *icon, size, size, 0, None, DI_NORMAL);
+                for (draw_rect, base_rect, icon, window_count) in &dock_icons {
+                    let size = draw_rect.right - draw_rect.left;
+                    let _ = DrawIconEx(mem, draw_rect.left, draw_rect.top, *icon, size, size, 0, None, DI_NORMAL);
                     let previous = SelectObject(mem, running_dot_brush);
-                    for dot in super::dock::running_dot_rects(*rect, *window_count, running_dot_radius, running_dot_gap) {
+                    for dot in super::dock::running_dot_rects(*base_rect, *window_count, running_dot_radius, running_dot_gap) {
                         let _ = Ellipse(mem, dot.left, dot.top, dot.right, dot.bottom);
                     }
                     SelectObject(mem, previous);
