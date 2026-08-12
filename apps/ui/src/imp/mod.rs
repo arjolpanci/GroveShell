@@ -774,6 +774,15 @@ unsafe extern "system" fn wndproc(
             }
             LRESULT(0)
         }
+        WM_RBUTTONUP if matches!(role, Role::Dock) => {
+            let x = (lparam.0 & 0xFFFF) as i32;
+            STATE.with(|s| {
+                if let Some(dock) = s.borrow_mut().as_mut().and_then(|st| st.dock.as_mut()) {
+                    dock.on_right_click(x);
+                }
+            });
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             match role {
                 Role::Overview { monitor } => {

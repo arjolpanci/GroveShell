@@ -26,9 +26,10 @@ use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
 use windows::Win32::Graphics::Gdi::DeleteObject;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetCursorPos, IsIconic, KillTimer, SetForegroundWindow, SetTimer, SetWindowPos,
-    ShowWindow, HWND_TOPMOST, SWP_NOACTIVATE, SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, GetCursorPos, IsIconic, KillTimer,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, HWND_TOPMOST,
+    MF_STRING, SWP_NOACTIVATE, SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_TOPALIGN, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::design::motion::{self, BASE_MS};
@@ -43,6 +44,10 @@ const DOCK_TIMER_INTERVAL_MS: u32 = 16;
 /// How close to the screen's bottom edge the pointer must get to reveal an
 /// autohidden dock (96-DPI band).
 const REVEAL_BAND: i32 = 3;
+
+/// Right-click menu command ids.
+const MENU_PIN: u32 = 1;
+const MENU_OPEN_NEW: u32 = 2;
 
 /// 96-DPI layout metrics for the floating desktop dock. Deliberately a
 /// touch roomier than the overview dock (`dock.rs`) so it reads as a
@@ -517,6 +522,75 @@ impl DockWindow {
                 focus_or_launch(app);
             }
         }
+    }
+
+    /// A right-click at window-local `x`: pin/unpin (and "open new window")
+    /// for the icon under it, via the same persisted pinned list the
+    /// overview dash uses — so the two surfaces stay in sync. A running-
+    /// but-unpinned entry (no launch path) gets no menu, matching the
+    /// overview dock.
+    pub(crate) fn on_right_click(&mut self, x: i32) {
+        let Some(i) = icon_at(&self.geo, x, self.dpi) else { return };
+        let Some(launch_path) = self.apps.get(i).and_then(|a| a.launch_path.clone()) else {
+            return;
+        };
+
+        // SAFETY: a standard, synchronous popup-menu sequence; `menu` is
+        // destroyed on every path before returning.
+        unsafe {
+            let Ok(menu) = CreatePopupMenu() else { return };
+            let is_pinned = super::dock::pinned_paths().contains(&launch_path);
+            let pin_label = if is_pinned { w!("Unpin from dock") } else { w!("Pin to dock") };
+            let _ = AppendMenuW(menu, MF_STRING, MENU_PIN as usize, pin_label);
+            let _ = AppendMenuW(menu, MF_STRING, MENU_OPEN_NEW as usize, w!("Open new window"));
+
+            let mut point = POINT::default();
+            let _ = GetCursorPos(&mut point);
+            // A top-most `WS_EX_NOACTIVATE` window must be foregrounded for
+            // `TrackPopupMenu` to stay open — same dance the overview dock
+            // does for its menu.
+            let _ = SetForegroundWindow(self.hwnd);
+            let cmd = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN,
+                point.x,
+                point.y,
+                0,
+                self.hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+
+            match cmd.0 as u32 {
+                MENU_PIN => {
+                    if is_pinned {
+                        super::dock::unpin_app(&launch_path);
+                    } else {
+                        super::dock::pin_app(launch_path);
+                    }
+                }
+                MENU_OPEN_NEW => {
+                    let wide: Vec<u16> =
+                        launch_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+                    let _ = ShellExecuteW(
+                        HWND(std::ptr::null_mut()),
+                        w!("open"),
+                        PCWSTR(wide.as_ptr()),
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        SW_SHOWNORMAL,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Reflect a pin/unpin immediately (the slow refresh would catch it
+        // within ~0.5s anyway, but this feels instant).
+        let (icon_size, _) = super::state::dock_config();
+        self.refresh(icon_size);
+        self.reposition(true);
+        self.repaint();
     }
 
     /// One animation frame: advance the autohide slide, ease the wave
