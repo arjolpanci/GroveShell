@@ -24,7 +24,10 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
 use windows::Win32::Graphics::Gdi::DeleteObject;
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    SHAppBarMessage, ShellExecuteW, ABE_BOTTOM, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS,
+    ABN_POSCHANGED, APPBARDATA,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, GetCursorPos, IsIconic, KillTimer,
     SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, HWND_TOPMOST,
@@ -44,6 +47,12 @@ const DOCK_TIMER_INTERVAL_MS: u32 = 16;
 /// How close to the screen's bottom edge the pointer must get to reveal an
 /// autohidden dock (96-DPI band).
 const REVEAL_BAND: i32 = 3;
+
+/// Custom AppBar callback message the shell registers with `ABM_NEW` for an
+/// `"always"` dock, so Windows can notify it of edge/position recalculation
+/// (`ABN_POSCHANGED`, e.g. another AppBar appearing or a resolution change).
+/// Routed to the dock in `wndproc`.
+pub(crate) const APPBAR_CALLBACK_MSG: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x1D;
 
 /// Right-click menu command ids.
 const MENU_PIN: u32 = 1;
@@ -333,6 +342,11 @@ pub(crate) struct DockWindow {
     icon_size_ref: i32,
     /// `"always"` or `"autohide"`.
     autohidden: bool,
+    /// Whether this dock registered a reserving Windows AppBar (`ABM_NEW`)
+    /// so maximized windows stop above it. Only `"always"` docks do; it
+    /// must be released with `ABM_REMOVE` on teardown or the reserved strip
+    /// strands the desktop.
+    appbar: bool,
     geo: PanelGeometry,
     /// Resting top-left of the window on screen (fully shown).
     base_left: i32,
@@ -420,6 +434,7 @@ impl DockWindow {
             dpi,
             icon_size_ref,
             autohidden,
+            appbar: false,
             geo,
             base_left,
             base_top,
@@ -429,6 +444,13 @@ impl DockWindow {
             ticks: 0,
             last_sig: sig,
         };
+        // Only an "always" dock reserves screen space; an "autohide" dock
+        // slides away and must not (an auto-hidden reservation is dead
+        // strip). Registering the AppBar is what makes maximized windows
+        // stop above the dock like they do above the Start taskbar.
+        if !autohidden {
+            dock.register_appbar();
+        }
         dock.reposition(true);
         dock.repaint();
 
@@ -501,6 +523,94 @@ impl DockWindow {
                 self.geo.window_h,
                 SWP_NOACTIVATE,
             );
+        }
+    }
+
+    /// The height (physical px) of the work-area strip the dock reserves —
+    /// exactly its resting panel height, so maximized windows stop at the
+    /// panel's top edge while the magnified icons overflow above it.
+    fn reserved_strip_height(&self) -> i32 {
+        self.geo.panel_rect.bottom - self.geo.panel_rect.top
+    }
+
+    /// Registers the dock as a bottom Windows AppBar (`ABM_NEW`) and claims
+    /// its strip (`ABM_SETPOS`), so the system reserves that space and
+    /// maximized windows stop above it — the persistent, system-respected
+    /// reservation a bare `SPI_SETWORKAREA` can't provide (it gets reverted
+    /// on any AppBar recalculation). Idempotent-ish: only called once, at
+    /// creation, for an `"always"` dock.
+    fn register_appbar(&mut self) {
+        let mut abd = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            hWnd: self.hwnd,
+            uCallbackMessage: APPBAR_CALLBACK_MSG,
+            ..Default::default()
+        };
+        // SAFETY: `abd` is a live local for the duration of each call; `hWnd`
+        // is the just-created dock window.
+        let registered = unsafe { SHAppBarMessage(ABM_NEW, &mut abd) } != 0;
+        if !registered {
+            return;
+        }
+        self.appbar = true;
+        self.set_appbar_pos();
+    }
+
+    /// Asks the system for (and commits) the dock's reserved bottom strip
+    /// via `ABM_QUERYPOS` + `ABM_SETPOS`. Run at registration and again on
+    /// every `ABN_POSCHANGED` so the reservation survives another AppBar
+    /// appearing or a resolution change.
+    fn set_appbar_pos(&mut self) {
+        if !self.appbar {
+            return;
+        }
+        let strip = self.reserved_strip_height();
+        let mut abd = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            hWnd: self.hwnd,
+            uEdge: ABE_BOTTOM,
+            rc: RECT {
+                left: self.work.left,
+                top: self.work.bottom - strip,
+                right: self.work.right,
+                bottom: self.work.bottom,
+            },
+            ..Default::default()
+        };
+        // SAFETY: `abd` outlives both synchronous calls. `ABM_QUERYPOS`
+        // adjusts `rc` for any other edge-sharing AppBars; we then pin the
+        // strip back to our height at the (possibly moved) bottom before
+        // `ABM_SETPOS` commits the reservation.
+        unsafe {
+            SHAppBarMessage(ABM_QUERYPOS, &mut abd);
+            abd.rc.top = abd.rc.bottom - strip;
+            SHAppBarMessage(ABM_SETPOS, &mut abd);
+        }
+    }
+
+    /// Handles an `ABN_POSCHANGED` AppBar notification: re-commit our strip
+    /// so the reservation holds after whatever recalculation fired it.
+    pub(crate) fn on_appbar_notify(&mut self, notification: u32) {
+        if notification == ABN_POSCHANGED {
+            self.set_appbar_pos();
+        }
+    }
+
+    /// Releases the AppBar reservation (`ABM_REMOVE`). Must run before the
+    /// window is destroyed or the reserved strip lingers as dead space.
+    fn remove_appbar(&mut self) {
+        if !self.appbar {
+            return;
+        }
+        self.appbar = false;
+        let mut abd = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            hWnd: self.hwnd,
+            ..Default::default()
+        };
+        // SAFETY: `abd` is a live local for the duration of the call.
+        unsafe {
+            SHAppBarMessage(ABM_REMOVE, &mut abd);
         }
     }
 
@@ -749,6 +859,9 @@ impl DockWindow {
     /// Tears the window down (timer + window). Called when switching to
     /// `"overview"` mode on a live config reload.
     pub(crate) fn destroy(&mut self) {
+        // Release the reserved strip first — a lingering AppBar reservation
+        // strands the desktop even after the window is gone.
+        self.remove_appbar();
         // SAFETY: `self.hwnd` is the live dock window; killing its timer and
         // destroying it is a standard teardown.
         unsafe {
