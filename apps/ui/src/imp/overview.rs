@@ -1537,18 +1537,30 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
 /// card moves the window to that workspace; a carousel drag snaps to
 /// whichever page ended up nearest the release point.
 pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
+    // Consume any in-progress drag from state BEFORE releasing capture.
+    // `ReleaseCapture` synchronously delivers `WM_CAPTURECHANGED` to this
+    // window, and its handler (`on_overview_capture_lost`) clears exactly
+    // these three fields — the safety net for genuine mid-drag capture
+    // theft (Alt+Tab, a system dialog). If we released capture first, that
+    // re-entrant handler would wipe the very drag we're about to act on,
+    // and every drop / carousel-release would be misread as a plain click
+    // (the window "snaps back"). Taking the state out first leaves the
+    // handler a harmless no-op here, while still protecting the real
+    // capture-loss case, where these fields are still set.
+    let (dock_drag, window_drag, carousel_drag) = STATE.with(|s| {
+        s.borrow_mut()
+            .as_mut()
+            .and_then(|st| st.overviews.get_mut(monitor))
+            .map(|ov| (ov.dock_drag.take(), ov.window_drag.take(), ov.carousel_drag.take()))
+            .unwrap_or((None, None, None))
+    });
     // SAFETY: releasing capture this window may or may not actually
     // hold is a documented no-op in the latter case; matches the
     // `SetCapture` call in `on_overview_drag_start`.
     unsafe {
         let _ = ReleaseCapture();
     }
-    let dock_drag = STATE.with(|s| {
-        s.borrow_mut()
-            .as_mut()
-            .and_then(|st| st.overviews.get_mut(monitor))
-            .and_then(|ov| ov.dock_drag.take())
-    });
+
     if let Some(drag) = dock_drag {
         if drag.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
             on_overview_click(monitor, x, y);
@@ -1558,12 +1570,6 @@ pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
         return;
     }
 
-    let window_drag = STATE.with(|s| {
-        s.borrow_mut()
-            .as_mut()
-            .and_then(|st| st.overviews.get_mut(monitor))
-            .and_then(|ov| ov.window_drag.take())
-    });
     if let Some(drag) = window_drag {
         if drag.max_delta <= CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
             // Never actually became a visible drag — clear the pickup
@@ -1582,13 +1588,7 @@ pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
         return;
     }
 
-    let drag = STATE.with(|s| {
-        s.borrow_mut()
-            .as_mut()
-            .and_then(|st| st.overviews.get_mut(monitor))
-            .and_then(|ov| ov.carousel_drag.take())
-    });
-    let Some(drag) = drag else {
+    let Some(drag) = carousel_drag else {
         on_overview_click(monitor, x, y);
         return;
     };
