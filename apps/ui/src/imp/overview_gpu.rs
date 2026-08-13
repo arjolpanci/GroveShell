@@ -13,8 +13,8 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::ID2D1DeviceContext;
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
-    HBITMAP,
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, ReleaseDC,
+    SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL, HICON};
 
@@ -191,25 +191,79 @@ fn rect_to_d2d(r: RECT, origin_x: i32, origin_y: i32) -> D2D_RECT_F {
     }
 }
 
-/// Renders an `HICON` to a small ARGB `HBITMAP` so it can go through
-/// the same WIC bridge as window thumbnails and the wallpaper — icons
-/// have no separate Direct2D-native path.
+/// Renders an `HICON` to a small premultiplied-BGRA `HBITMAP` so it can
+/// go through the same WIC bridge as window thumbnails and the wallpaper
+/// — icons have no separate Direct2D-native path.
+///
+/// Uses a zeroed 32-bit top-down DIB section rather than a
+/// `CreateCompatibleBitmap`: a compatible bitmap has no alpha channel, so
+/// the icon's transparent areas came out as the DC's uninitialised gray
+/// and the WIC bridge (told the source is premultiplied) then drew every
+/// icon as an opaque gray square — the dock's "gray background behind the
+/// icons". Drawing `DI_NORMAL` onto a transparent 32-bit DIB alpha-blends
+/// a modern icon straight to premultiplied BGRA, which is exactly what
+/// `bitmap_from_hbitmap` expects, so the icon reads as true transparent
+/// art and only the icon (never a plate) rides the magnification wave.
 pub(crate) fn icon_to_hbitmap(icon: HICON, size: i32) -> Option<HBITMAP> {
-    // SAFETY: standard create-select-draw-restore GDI sequence on
-    // locally created handles; `bitmap`'s ownership moves to the
-    // caller on success.
+    let size = size.max(1);
+    // SAFETY: standard create-select-draw-restore GDI sequence on locally
+    // created handles. The DIB's pixel buffer (`bits`) stays valid for as
+    // long as `bitmap` is alive, and we only touch it while `bitmap` is
+    // selected out of `mem` and before handing ownership to the caller.
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(screen);
-        let bitmap = CreateCompatibleBitmap(screen, size, size);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size,
+                biHeight: -size, // negative => top-down (row 0 at the top)
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0 as u32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok();
+        ReleaseDC(None, screen);
+        let Some(bitmap) = bitmap else {
+            let _ = DeleteDC(mem);
+            return None;
+        };
+        if bits.is_null() {
+            let _ = DeleteObject(bitmap);
+            let _ = DeleteDC(mem);
+            return None;
+        }
+
         let previous = SelectObject(mem, bitmap);
+        // The DIB starts fully transparent (zeroed). `DI_NORMAL`
+        // alpha-blends the icon; a modern 32-bit icon writes its own
+        // premultiplied per-pixel alpha here.
         let ok = DrawIconEx(mem, 0, 0, icon, size, size, 0, None, DI_NORMAL).is_ok();
+        let _ = GdiFlush(); // flush GDI writes before reading the bits back
         SelectObject(mem, previous);
         let _ = DeleteDC(mem);
-        ReleaseDC(None, screen);
         if !ok {
             let _ = DeleteObject(bitmap);
             return None;
+        }
+
+        // Legacy icons carry a 1-bit AND mask instead of an alpha channel,
+        // so `DI_NORMAL` leaves alpha zero everywhere (the icon would be
+        // fully transparent). Detect that and treat every painted pixel as
+        // opaque so such icons still show. Modern 32-bit icons never take
+        // this branch.
+        let count = (size as usize) * (size as usize);
+        let px = std::slice::from_raw_parts_mut(bits as *mut [u8; 4], count);
+        if !px.iter().any(|p| p[3] != 0) {
+            for p in px.iter_mut() {
+                if p[0] != 0 || p[1] != 0 || p[2] != 0 {
+                    p[3] = 0xFF;
+                }
+            }
         }
         Some(bitmap)
     }
@@ -541,4 +595,61 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             }
         }
     });
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+    use windows::Win32::Graphics::Gdi::{
+        GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
+
+    /// Reads back the produced bitmap's pixels and asserts the icon fix
+    /// yields a real alpha channel: transparent corners (the system app
+    /// icon has empty corners) and opaque art. Guards against a regression
+    /// back to the alpha-less `CreateCompatibleBitmap` that drew every icon
+    /// as an opaque gray square.
+    #[test]
+    fn icon_to_hbitmap_produces_transparent_and_opaque_pixels() {
+        let size = 32i32;
+        // SAFETY: `IDI_APPLICATION` is a stock system icon always present;
+        // the read-back sequence uses locally-owned handles.
+        unsafe {
+            let icon = LoadIconW(None, IDI_APPLICATION).expect("stock app icon");
+            let hbmp = super::icon_to_hbitmap(icon, size).expect("icon_to_hbitmap");
+
+            let mut buf = vec![0u8; (size * size * 4) as usize];
+            let mut info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: core::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: size,
+                    biHeight: -size,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0 as u32,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let screen = GetDC(None);
+            let scanned = GetDIBits(
+                screen,
+                hbmp,
+                0,
+                size as u32,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                &mut info,
+                DIB_RGB_COLORS,
+            );
+            ReleaseDC(None, screen);
+            let _ = DeleteObject(hbmp);
+            assert!(scanned > 0, "GetDIBits should read scanlines");
+
+            let has_transparent = buf.chunks_exact(4).any(|p| p[3] == 0);
+            let has_opaque = buf.chunks_exact(4).any(|p| p[3] == 0xFF);
+            assert!(has_transparent, "icon must have transparent pixels (empty corners)");
+            assert!(has_opaque, "icon must have opaque pixels (the art)");
+        }
+    }
 }
