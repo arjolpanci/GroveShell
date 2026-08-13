@@ -126,6 +126,21 @@ pub(crate) struct PanelGeometry {
     pub(crate) icon: i32,
 }
 
+/// The dock window's resting top-left y within `bounds` (the monitor's
+/// physical rect). An `"always"` dock seats **flush** against the bottom
+/// edge — it reserves a work-area strip there (see
+/// [`reserved_strip_height`]) so it reads as part of the desktop like the
+/// taskbar, and its magnified icons overflow up out of the window over
+/// whatever window is behind. An `"autohide"` dock keeps a small floating
+/// gap since it reserves nothing and slides away.
+fn dock_base_top(bounds: RECT, window_h: i32, autohidden: bool, dpi: u32) -> i32 {
+    if autohidden {
+        bounds.bottom - super::state::scaled(MARGIN_BOTTOM, dpi) - window_h
+    } else {
+        bounds.bottom - window_h
+    }
+}
+
 /// A smooth wave-magnification factor (>= 1.0) for an icon whose baseline
 /// center is `distance` px from the pointer, peaking at [`MAX_SCALE`]
 /// directly under it and easing back to 1.0 with a Gaussian falloff whose
@@ -307,8 +322,10 @@ pub(crate) struct DockWindow {
     gpu: Option<GpuSurface>,
     autohide: AutoHide,
     apps: Vec<DockApp>,
-    /// The primary monitor's work area (screen coords) and DPI the dock
-    /// is laid out against.
+    /// The monitor's full physical bounds (screen coords) the dock is laid
+    /// out against — it seats flush at `bounds.bottom` and reserves a strip
+    /// there, so it positions against the real bottom edge, not the (bar-
+    /// and old-taskbar-adjusted) work area.
     work: RECT,
     dpi: u32,
     /// Configured resting icon size (96-DPI reference), from
@@ -364,8 +381,9 @@ impl DockWindow {
         let sig = contents_signature(&live, super::dock::pinned_paths().len());
         let apps = super::dock::build_dock_apps(&live);
         let geo = panel_geometry(apps.len(), icon_size_ref, dpi);
+        let autohidden = mode == "autohide";
         let base_left = work.left + (work.right - work.left - geo.window_w) / 2;
-        let base_top = work.bottom - super::state::scaled(MARGIN_BOTTOM, dpi) - geo.window_h;
+        let base_top = dock_base_top(work, geo.window_h, autohidden, dpi);
 
         // SAFETY: standard top-most tool-window creation; `hinstance` is the
         // process module handle. `WS_EX_NOACTIVATE` keeps clicks from
@@ -391,7 +409,6 @@ impl DockWindow {
         let gpu = gpu::create_surface(hwnd, geo.window_w, geo.window_h);
 
         let mut autohide = AutoHide::new();
-        let autohidden = mode == "autohide";
         autohide.force(if autohidden { RevealPhase::Hidden } else { RevealPhase::Shown });
 
         let mut dock = DockWindow {
@@ -443,8 +460,7 @@ impl DockWindow {
         let old = (self.geo.window_w, self.geo.window_h);
         self.geo = panel_geometry(self.apps.len(), self.icon_size_ref, self.dpi);
         self.base_left = self.work.left + (self.work.right - self.work.left - self.geo.window_w) / 2;
-        self.base_top =
-            self.work.bottom - super::state::scaled(MARGIN_BOTTOM, self.dpi) - self.geo.window_h;
+        self.base_top = dock_base_top(self.work, self.geo.window_h, self.autohidden, self.dpi);
         // A resized window needs a surface at the new size, or the panel
         // would be clipped/misplaced against a stale-sized surface.
         if old != (self.geo.window_w, self.geo.window_h) {
