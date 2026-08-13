@@ -323,7 +323,6 @@ pub(crate) struct DockWindow {
     /// Pointer x in window-local coords while it's over the dock, else
     /// `None` (a flat, resting dock).
     cursor_x: Option<i32>,
-    hovered: Option<usize>,
     /// Eased 0..1 magnification progress — the wave fades in when the
     /// pointer arrives and out when it leaves, rather than snapping.
     wave: f32,
@@ -408,7 +407,6 @@ impl DockWindow {
             base_left,
             base_top,
             cursor_x: None,
-            hovered: None,
             wave: 0.0,
             last_offset: -1,
             ticks: 0,
@@ -491,8 +489,7 @@ impl DockWindow {
     }
 
     /// Repaints the dock surface: the rounded panel, each icon at its
-    /// current wave size, running-indicator dots, and the hovered icon's
-    /// subtle highlight.
+    /// current wave size, and running-indicator dots.
     fn repaint(&self) {
         let Some(surface) = self.gpu.as_ref() else { return };
         let rects = wave_icon_rects(&self.geo, self.cursor_x, self.wave);
@@ -500,7 +497,6 @@ impl DockWindow {
         let radius = super::state::scaled(CORNER_RADIUS, self.dpi) as f32;
         let dot_radius = super::state::scaled(RUNNING_DOT_RADIUS, self.dpi);
         let apps = &self.apps;
-        let hovered = self.hovered;
 
         gpu::redraw(surface, |ctx: &ID2D1DeviceContext| {
             // The window is taller than the panel (headroom for magnified
@@ -511,16 +507,12 @@ impl DockWindow {
             gpu::fill_rounded_rect(ctx, panel_rect, radius, super::design::color::surface_raised());
             gpu::stroke_rounded_rect(ctx, panel_rect, radius, super::design::color::stroke(), 0.6, 1.0);
 
-            for (i, (app, slot)) in apps.iter().zip(rects.iter()).enumerate() {
-                // Hovered-icon highlight: a soft rounded plate behind it.
-                if hovered == Some(i) {
-                    gpu::fill_rounded_rect(
-                        ctx,
-                        to_d2d(inflate(*slot, super::state::scaled(4, self.dpi))),
-                        radius * 0.5,
-                        super::design::color::surface_overlay(),
-                    );
-                }
+            // No hover plate behind the icon: the magnification itself is
+            // the hover feedback (macOS-style). A plate drawn at the
+            // magnified icon's rect rose *above* the panel with the icon,
+            // reading as a gray box jumping up behind it and breaking the
+            // "only the icon moves, the platform stays put" feel.
+            for (app, slot) in apps.iter().zip(rects.iter()) {
                 if let Some(icon) = app.icon {
                     let size = (slot.right - slot.left).max(1);
                     if let Some(hbitmap) = super::overview_gpu::icon_to_hbitmap(icon, size) {
@@ -550,11 +542,9 @@ impl DockWindow {
         });
     }
 
-    /// Pointer moved to window-local `(x, y)`: track it for the wave and
-    /// update which icon is hovered.
+    /// Pointer moved to window-local `(x, y)`: track it for the wave.
     pub(crate) fn on_mouse_move(&mut self, x: i32, _y: i32) {
         self.cursor_x = Some(x);
-        self.hovered = icon_at(&self.geo, x, self.dpi);
     }
 
     /// A click at window-local `x`: focus (or launch) the icon under it.
@@ -660,7 +650,6 @@ impl DockWindow {
                     && pt.y < self.base_top + self.geo.window_h;
                 if !over {
                     self.cursor_x = None;
-                    self.hovered = None;
                 }
             }
         }
@@ -736,7 +725,6 @@ impl DockWindow {
                 if !over_footprint {
                     self.autohide.on_leave();
                     self.cursor_x = None;
-                    self.hovered = None;
                 }
             }
         }
@@ -791,10 +779,6 @@ fn to_d2d(r: RECT) -> D2D_RECT_F {
         right: r.right as f32,
         bottom: r.bottom as f32,
     }
-}
-
-fn inflate(r: RECT, by: i32) -> RECT {
-    RECT { left: r.left - by, top: r.top - by, right: r.right + by, bottom: r.bottom + by }
 }
 
 #[cfg(test)]
