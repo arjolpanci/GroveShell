@@ -1206,6 +1206,15 @@ unsafe extern "system" fn wndproc(
             }
             LRESULT(0)
         }
+        // Windows AppBar notification for a reserving "always" dock (e.g.
+        // `ABN_POSCHANGED` when another AppBar appears or the resolution
+        // changes) — re-commit the dock's reserved strip. Detached from
+        // STATE because `on_appbar_notify` calls `SHAppBarMessage`, which
+        // can re-enter `wndproc` (see `with_dock_detached`).
+        m if m == desktop_dock::APPBAR_CALLBACK_MSG && matches!(role, Role::Dock) => {
+            with_dock_detached(hwnd, |dock| dock.on_appbar_notify(wparam.0 as u32));
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
