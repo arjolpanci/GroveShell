@@ -482,7 +482,7 @@ pub fn main() -> Result<()> {
             for monitor in &monitors {
                 if let Some(dock) = desktop_dock::DockWindow::create(
                     hinstance,
-                    monitor.work,
+                    monitor.rect,
                     monitor.dpi,
                     icon_size,
                     &dock_mode,
@@ -637,7 +637,7 @@ fn sync_desktop_dock() {
     let mut docks = Vec::new();
     for monitor in &monitors {
         if let Some(dock) =
-            desktop_dock::DockWindow::create(hinstance, monitor.work, monitor.dpi, icon_size, &mode)
+            desktop_dock::DockWindow::create(hinstance, monitor.rect, monitor.dpi, icon_size, &mode)
         {
             docks.push(dock);
         }
