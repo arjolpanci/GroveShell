@@ -17,9 +17,8 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, Ellipse, EndPaint, GetStockObject,
-    InvalidateRect, RoundRect, SelectObject, SetBkMode, SetTextColor, DT_SINGLELINE, DT_VCENTER,
-    HOLLOW_BRUSH, NULL_PEN, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    BeginPaint, DeleteObject, EndPaint, InvalidateRect, SelectObject, DT_SINGLELINE, DT_VCENTER,
+    PAINTSTRUCT,
 };
 use windows::Win32::Media::Audio::Endpoints::IAudioEndpointVolume;
 use windows::Win32::Media::Audio::{eConsole, eRender, IMMDeviceEnumerator, MMDeviceEnumerator};

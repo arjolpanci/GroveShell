@@ -369,7 +369,7 @@ pub fn main() -> Result<()> {
         // `WS_EX_NOREDIRECTIONBITMAP` drops the window's opaque GDI
         // redirection surface, which is what lets DirectComposition content
         // composite to the desktop with its alpha intact and the DWM
-        // Acrylic backdrop show through (spec §9.1). Without it the
+        // Acrylic backdrop show through (spec §3). Without it the
         // redirection bitmap is painted over the material and the window
         // is opaque no matter what the backdrop attribute says.
         //
@@ -486,7 +486,7 @@ pub fn main() -> Result<()> {
             quick_settings_gpu = None;
         }
         // Acrylic plus DWM-drawn round corners and shadow on both flyouts
-        // (spec §3.1). No legacy fallback here: before this, flyouts had no
+        // (spec §3). No legacy fallback here: before this, flyouts had no
         // material at all, so an older Windows simply keeps the painted
         // card and the software corner/shadow it already had.
         design::material::apply(calendar_hwnd, design::material::Surface::Flyout);
@@ -760,7 +760,7 @@ fn invalidate_all_shell_windows() {
 }
 
 /// Re-asserts the backdrop material, corner preference, and dark-mode tint
-/// on every shell window (spec §4.3). Called when the theme changes, since
+/// on every shell window (spec §3). Called when the theme changes, since
 /// `DWMWA_USE_IMMERSIVE_DARK_MODE` is a per-window attribute that has to be
 /// set again for DWM to re-tint the material.
 ///
@@ -786,7 +786,7 @@ fn reapply_shell_materials() {
 
 /// Applies the Windows 11 material to one shell window, falling back to the
 /// legacy blur-behind path when the backdrop attribute is unsupported
-/// (spec §3.3).
+/// (spec §3.1).
 ///
 /// When the system backdrop *is* applied it supersedes
 /// `appearance.top_bar_blur`: the material already provides the
@@ -1285,7 +1285,7 @@ unsafe extern "system" fn wndproc(
         WM_DWMCOLORIZATIONCOLORCHANGED => {
             // The user changed their Windows accent — re-read it and
             // repaint every shell surface so active dots, focus rings, and
-            // toggles pick up the new color live (spec §3.1 / §6.2).
+            // toggles pick up the new color live (spec §4.1).
             design::color::refresh_accent();
             invalidate_all_shell_windows();
             LRESULT(0)

@@ -1,21 +1,18 @@
 //! One shared open/close lifecycle for the shell's pop-up surfaces (spec
-//! §5.1): Quick Settings, the calendar, the session menu, and the tray
-//! overflow all animate the same way — grow from the anchor edge with a
-//! subtle scale + fade — so they feel like one system. The heavy existing
-//! flyouts (Quick Settings, calendar) keep their own windows; new flyouts
-//! (session, tray overflow) drive their whole open/close through this.
+//! §5): Quick Settings and the calendar both drive their open and close
+//! through this, so the two flyouts animate as one system rather than
+//! each inventing its own timing.
+//!
+//! Both currently use [`Flyout::reveal_extent`] — they unroll downward
+//! from the bar's edge by animating window height, which needs no
+//! per-pixel alpha. [`Flyout::scale_opacity`] is the alternative for a
+//! surface that scales and fades instead; it is kept because that is the
+//! right motion for a surface anchored somewhere other than a screen
+//! edge, and the session menu ships as a native `TrackPopupMenu`.
 //!
 //! Motion is gated by `reduced_motion` (via `design::motion`): a zero
 //! duration collapses `Opening`/`Closing` straight to their terminal state
 //! so there is never a stuck half-open frame.
-
-// A complete, unit-tested flyout lifecycle ready to drive the visual
-// redesign of the existing flyout windows (Quick Settings, calendar) — the
-// grow-from-anchor motion that needs live verification to wire cleanly into
-// their layered/DirectComposition paint. Not yet consumed by the binary
-// (the session menu ships as a native TrackPopupMenu), so allowed
-// module-wide; the redesign that consumes it removes this.
-#![allow(dead_code)]
 
 use std::time::{Duration, Instant};
 
@@ -56,6 +53,7 @@ impl Flyout {
 
     /// Opens with no animation regardless of config (used where an instant
     /// appearance is wanted).
+    #[allow(dead_code, reason = "both flyouts animate; kept for a surface that should not")]
     pub(crate) fn open_instant(&mut self) {
         self.phase = FlyoutPhase::Open;
         self.duration = Duration::ZERO;
@@ -111,6 +109,7 @@ impl Flyout {
     /// `tick` progress `p`. Opening grows `0.96→1.0` while fading in;
     /// Closing shrinks back while fading out; `Open` is full, `Hidden` is
     /// collapsed/invisible.
+    #[allow(dead_code, reason = "both flyouts unroll; kept for surfaces not anchored to a screen edge")]
     pub(crate) fn scale_opacity(&self, p: f32) -> (f32, f32) {
         match self.phase {
             FlyoutPhase::Open => (1.0, 1.0),
@@ -121,7 +120,7 @@ impl Flyout {
     }
 
     /// The window height to show at eased progress `p` for a flyout that
-    /// unrolls downward to `full` (spec §3.4).
+    /// unrolls downward to `full` (spec §5).
     ///
     /// Opening grows `0 → full`, Closing rolls back `full → 0`, `Open` is
     /// `full` and `Hidden` is `0`. `p` is clamped, so an out-of-range
