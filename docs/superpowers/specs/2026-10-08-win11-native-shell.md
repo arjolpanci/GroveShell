@@ -235,9 +235,19 @@ translucency had failed entirely.
 
 ## 8. Known gaps
 
-- The overview's per-window DirectComposition failure (§3.1), open since
-  2026-07-30. Worth fixing before further Activities work, since animation
-  quality depends on it.
+- **Activities renders on GDI, at roughly 15 FPS.** Two separate defects
+  sit under this. The first is fixed: every `GpuSurface` created its own
+  `IDCompositionTarget`, and a window can hold only one, so the
+  overview's second surface always failed with
+  `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` and the whole renderer
+  fell back — the warning in the logs since 2026-07-30. Targets and
+  surfaces are now separate (`gpu::create_child_surface`).
+  The second is open: with that unblocked, the composition tree builds,
+  `BeginDraw` succeeds, `paint_backdrop` fills the root surface opaque
+  and the fade drives opacity to 1.0, yet the window composites fully
+  transparent — with and without `WS_EX_NOREDIRECTIONBITMAP`, on both
+  monitors. `OVERVIEW_GPU_ENABLED` in `overview_gpu.rs` holds the
+  renderer off until that is found; flipping it is the whole of the fix.
 - Live previews have square corners (§6).
 - `appearance.top_bar_blur` is superseded by the system material on
   supported builds; the settings app still presents it without saying so.
