@@ -32,7 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DestroyMenu, GetCursorPos, IsIconic, KillTimer,
     SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, TrackPopupMenu, HWND_TOPMOST,
     MF_STRING, SWP_NOACTIVATE, SW_RESTORE, SW_SHOWNA, SW_SHOWNORMAL, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_TOPALIGN, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    TPM_TOPALIGN, DestroyWindow, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use super::design::motion::{self, BASE_MS};
@@ -47,6 +48,10 @@ const DOCK_TIMER_INTERVAL_MS: u32 = 16;
 /// How close to the screen's bottom edge the pointer must get to reveal an
 /// autohidden dock (96-DPI band).
 const REVEAL_BAND: i32 = 3;
+
+/// Opacity of the dock panel's fill. Translucent enough to read as glass
+/// over the wallpaper, opaque enough to keep icon contrast.
+const DOCK_PANEL_ALPHA: f32 = 0.72;
 
 /// Custom AppBar callback message the shell registers with `ABM_NEW` for an
 /// `"always"` dock, so Windows can notify it of edge/position recalculation
@@ -175,23 +180,71 @@ pub(crate) fn wave_icon_rects(
     progress: f32,
 ) -> Vec<RECT> {
     let progress = progress.clamp(0.0, 1.0);
+    let n = geo.centers.len();
+    let (Some(cursor), false) = (cursor_x, progress == 0.0 || n == 0) else {
+        return geo
+            .centers
+            .iter()
+            .map(|&cx| RECT {
+                left: cx - geo.icon / 2,
+                top: geo.baseline_bottom - geo.icon,
+                right: cx - geo.icon / 2 + geo.icon,
+                bottom: geo.baseline_bottom,
+            })
+            .collect();
+    };
+
     let sigma = (geo.icon as f32) * 1.3;
-    geo.centers
+    let row_left = geo.centers[0] - geo.icon / 2;
+    let row_right = geo.centers[n - 1] - geo.icon / 2 + geo.icon;
+    let gap = if n > 1 { geo.centers[1] - geo.centers[0] - geo.icon } else { 0 };
+
+    // Desired scale per icon, measured from the *resting* centre so the
+    // wave's shape doesn't chase its own output frame to frame.
+    let scales: Vec<f32> = geo
+        .centers
         .iter()
         .map(|&cx| {
-            let target = match cursor_x {
-                Some(x) => magnify_factor((x - cx).abs() as f32, sigma),
-                None => 1.0,
-            };
-            let scale = 1.0 + (target - 1.0) * progress;
-            let size = (geo.icon as f32 * scale).round() as i32;
-            let half = size / 2;
-            RECT {
-                left: cx - half,
-                top: geo.baseline_bottom - size,
-                right: cx - half + size,
-                bottom: geo.baseline_bottom,
+            let target = magnify_factor((cursor - cx).abs() as f32, sigma);
+            1.0 + (target - 1.0) * progress
+        })
+        .collect();
+
+    // Redistribute a fixed total width in proportion to those scales
+    // instead of growing each icon around its own centre. Growing in
+    // place let a magnified icon reach into its neighbours, which is what
+    // made hovering one icon look like it hovered several, and let the
+    // row spill past the dock panel.
+    let total_gaps = gap * (n as i32 - 1);
+    let available = (row_right - row_left - total_gaps).max(n as i32);
+    let sum: f32 = scales.iter().sum();
+    let mut widths: Vec<i32> = scales
+        .iter()
+        .map(|scale| ((available as f32) * (scale / sum)).floor().max(1.0) as i32)
+        .collect();
+
+    // Give the floor()'d remainder to the widest icons first, so rounding
+    // is never taken out of the icon the pointer is on.
+    let mut remainder = available - widths.iter().sum::<i32>();
+    if remainder > 0 {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| scales[b].partial_cmp(&scales[a]).unwrap_or(std::cmp::Ordering::Equal));
+        for &i in order.iter().cycle() {
+            if remainder == 0 {
+                break;
             }
+            widths[i] += 1;
+            remainder -= 1;
+        }
+    }
+
+    let mut x = row_left;
+    widths
+        .iter()
+        .map(|&w| {
+            let r = RECT { left: x, top: geo.baseline_bottom - w, right: x + w, bottom: geo.baseline_bottom };
+            x += w + gap;
+            r
         })
         .collect()
 }
@@ -402,9 +455,32 @@ impl DockWindow {
         // SAFETY: standard top-most tool-window creation; `hinstance` is the
         // process module handle. `WS_EX_NOACTIVATE` keeps clicks from
         // stealing focus from the app the user is working in.
-        let hwnd = unsafe {
+        //
+        // `WS_EX_NOREDIRECTIONBITMAP` is what makes the dock's own
+        // transparency real. This window is much taller and wider than the
+        // visible panel — the extra is headroom for the magnification wave
+        // — and `paint` clears all of it with `gpu::clear_transparent`.
+        // Without this style that cleared headroom is still backed by an
+        // opaque GDI redirection bitmap, which is what showed up as a
+        // black rectangle around and behind the dock. It also lets the DWM
+        // backdrop set below show through the panel.
+        //
+        // Only safe on the GPU path: with no redirection bitmap there is
+        // nothing for GDI to paint into, so if DirectComposition is
+        // unavailable the dock would be invisible rather than merely
+        // opaque. Gated on `gpu::is_enabled`, then re-checked against the
+        // per-window surface below.
+        let translucent = gpu::is_enabled();
+        let ex_style = |translucent: bool| {
+            if translucent {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP
+            } else {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            }
+        };
+        let create = |translucent: bool| unsafe {
             CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                ex_style(translucent),
                 w!("GroveShellDock"),
                 w!("GroveShell Dock"),
                 WS_POPUP,
@@ -417,10 +493,34 @@ impl DockWindow {
                 hinstance,
                 None,
             )
-            .ok()?
+            .ok()
         };
 
-        let gpu = gpu::create_surface(hwnd, geo.window_w, geo.window_h);
+        let mut hwnd = create(translucent)?;
+        let mut gpu = gpu::create_surface(hwnd, geo.window_w, geo.window_h);
+        if translucent && gpu.is_none() {
+            // A per-window DirectComposition failure after the global
+            // check is real (the overview has hit
+            // `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` since
+            // 2026-07-30). Rebuild opaque rather than leave an invisible
+            // dock.
+            tracing::warn!(
+                "dock DirectComposition surface failed; rebuilding the window opaque"
+            );
+            // SAFETY: `hwnd` was created by this function and has no
+            // outstanding references yet.
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            hwnd = create(false)?;
+            gpu = gpu::create_surface(hwnd, geo.window_w, geo.window_h);
+        }
+
+        // No DWM backdrop here on purpose: it applies to the whole window
+        // rect, and this window is much larger than the visible panel
+        // (headroom for the wave), so the material would paint a large
+        // rectangle around the dock. The panel paints its own translucent
+        // fill instead — see `DOCK_PANEL_ALPHA`.
 
         let mut autohide = AutoHide::new();
         autohide.force(if autohidden { RevealPhase::Hidden } else { RevealPhase::Shown });
@@ -491,10 +591,36 @@ impl DockWindow {
             // old still lives would fail.
             self.gpu = None;
             self.gpu = gpu::create_surface(self.hwnd, self.geo.window_w, self.geo.window_h);
+            if self.gpu.is_none() {
+                // Don't leave it dead. Before this retry a single failed
+                // recreate was permanent: the dock painted nothing from
+                // then on, which showed as the bare window — the "black
+                // rectangle behind the dock" that appeared at random,
+                // because this path only runs when the app count changes
+                // and the window resizes. `tick` now retries.
+                tracing::warn!("dock surface recreate failed after resize; will retry on tick");
+            }
         }
         // Force a reposition next tick (window moved/resized).
         self.last_offset = -1;
         true
+    }
+
+    /// Re-acquires the DirectComposition surface if it is missing.
+    ///
+    /// A surface can go away mid-session (a resize whose recreate failed,
+    /// or device loss). Without this the dock would stay blank for the
+    /// rest of the session; with `WS_EX_NOREDIRECTIONBITMAP` it would be
+    /// invisible rather than merely unpainted, so recovering matters more,
+    /// not less.
+    fn ensure_surface(&mut self) {
+        if self.gpu.is_some() || !gpu::is_enabled() {
+            return;
+        }
+        self.gpu = gpu::create_surface(self.hwnd, self.geo.window_w, self.geo.window_h);
+        if self.gpu.is_some() {
+            tracing::info!("dock DirectComposition surface recovered");
+        }
     }
 
     /// Moves/resizes the window for the current autohide slide offset.
@@ -630,7 +756,19 @@ impl DockWindow {
             // the dock reads as a floating bar, not a dark box.
             gpu::clear_transparent(ctx);
             let panel_rect = to_d2d(*panel);
-            gpu::fill_rounded_rect(ctx, panel_rect, radius, super::design::color::surface_raised());
+            // Translucent, not opaque: the dock reads as glass over the
+            // desktop instead of a solid slab. Deliberately a D2D alpha
+            // fill rather than the DWM backdrop — the backdrop would cover
+            // this window's whole rect, and the window is much larger than
+            // the panel to leave headroom for the wave, so the material
+            // would show as a big rectangle around the dock.
+            gpu::fill_rounded_rect_alpha(
+                ctx,
+                panel_rect,
+                radius,
+                super::design::color::surface_raised(),
+                DOCK_PANEL_ALPHA,
+            );
             gpu::stroke_rounded_rect(ctx, panel_rect, radius, super::design::color::stroke(), 0.6, 1.0);
 
             // No hover plate behind the icon: the magnification itself is
@@ -758,6 +896,7 @@ impl DockWindow {
     /// something actually changed.
     pub(crate) fn tick(&mut self) {
         self.ticks = self.ticks.wrapping_add(1);
+        self.ensure_surface();
         let tick_count = self.ticks;
         let now = Instant::now();
 
@@ -989,6 +1128,36 @@ mod tests {
         assert!(magnify_factor(sigma * 4.0, sigma) < magnify_factor(sigma, sigma));
         // Far away it's essentially resting size.
         assert!(magnify_factor(sigma * 6.0, sigma) < 1.001);
+    }
+
+    #[test]
+    fn wave_icons_never_overlap_at_any_cursor_position() {
+        let geo = panel_geometry(6, 48, 96);
+        let span_left = geo.centers[0] - geo.icon / 2;
+        let span_right = geo.centers[geo.centers.len() - 1] + geo.icon / 2;
+        for cursor in (span_left - 40)..(span_right + 40) {
+            let rects = wave_icon_rects(&geo, Some(cursor), 1.0);
+            for pair in rects.windows(2) {
+                assert!(
+                    pair[0].right <= pair[1].left,
+                    "icons overlap at cursor {cursor}: {:?} then {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wave_icons_stay_within_the_resting_row() {
+        let geo = panel_geometry(6, 48, 96);
+        let span_left = geo.centers[0] - geo.icon / 2;
+        let span_right = geo.centers[geo.centers.len() - 1] + geo.icon / 2;
+        for cursor in (span_left - 40)..(span_right + 40) {
+            let rects = wave_icon_rects(&geo, Some(cursor), 1.0);
+            assert!(rects[0].left >= span_left, "row spilled left at {cursor}");
+            assert!(rects[rects.len() - 1].right <= span_right, "row spilled right at {cursor}");
+        }
     }
 
     #[test]

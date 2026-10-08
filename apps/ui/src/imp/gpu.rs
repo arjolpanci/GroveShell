@@ -432,6 +432,40 @@ pub(crate) fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, ra
 
 /// Fills a rounded rect — the flat-color fallback drawn under the
 /// wallpaper (mirrors the GDI fallback-brush fill in `paint_overview`).
+/// Like [`fill_rounded_rect`] but at `alpha` (0..1), for surfaces that
+/// want to be translucent in a rounded shape.
+///
+/// Needed where the DWM backdrop can't be used: a window whose visible
+/// panel is smaller than the window itself (the dock keeps headroom for
+/// its magnification wave) would get the system material across the whole
+/// window rect, not just the panel. Painting a translucent fill in the
+/// right shape is the alternative — it is see-through, though without
+/// DWM's blur, which only the system backdrop can provide.
+pub(crate) fn fill_rounded_rect_alpha(
+    ctx: &ID2D1DeviceContext,
+    rect: D2D_RECT_F,
+    radius: f32,
+    colorref: u32,
+    alpha: f32,
+) {
+    // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
+    unsafe {
+        let geometry = GPU.with(|g| {
+            let g = g.borrow();
+            let ctx = g.as_ref()?;
+            ctx.d2d_factory
+                .CreateRoundedRectangleGeometry(&D2D1_ROUNDED_RECT { rect, radiusX: radius, radiusY: radius })
+                .ok()
+        });
+        let Some(geometry) = geometry else { return };
+        let mut color = colorref_to_d2d(colorref);
+        color.a = alpha.clamp(0.0, 1.0);
+        if let Ok(brush) = ctx.CreateSolidColorBrush(&color, None) {
+            ctx.FillGeometry(&geometry, &brush, None);
+        }
+    }
+}
+
 pub(crate) fn fill_rounded_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, colorref: u32) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
     unsafe {

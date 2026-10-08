@@ -49,7 +49,7 @@ use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS};
 use super::state::scaled;
 
 /// 96-DPI dock layout metrics.
-const DOCK_ICON_GAP: i32 = 14;
+const DOCK_ICON_GAP: i32 = 20;
 const DOCK_PADDING_X: i32 = 14;
 const DOCK_PADDING_Y: i32 = 10;
 /// Gap between the dock bar's bottom edge and the bottom of the card
@@ -202,20 +202,66 @@ pub(crate) fn dash_magnify_factor(distance: f32, sigma: f32) -> f32 {
 /// rects move. Pure.
 pub(crate) fn wave_slots(slots: &[RECT], cursor_x: Option<i32>, progress: f32) -> Vec<RECT> {
     let progress = progress.clamp(0.0, 1.0);
-    slots
+    let (Some(cursor), false) = (cursor_x, progress == 0.0 || slots.is_empty()) else {
+        return slots.to_vec();
+    };
+
+    let n = slots.len();
+    let base = (slots[0].right - slots[0].left).max(1);
+    let row_left = slots[0].left;
+    let row_right = slots[n - 1].right;
+    let gap = if n > 1 { slots[1].left - slots[0].right } else { 0 };
+    let sigma = base as f32 * 1.3;
+
+    // Each icon's desired scale, from its *base* centre so the wave's
+    // shape doesn't chase its own output frame to frame.
+    let scales: Vec<f32> = slots
         .iter()
         .map(|s| {
-            let base = (s.right - s.left).max(1);
             let cx = (s.left + s.right) / 2;
-            let sigma = base as f32 * 1.3;
-            let target = match cursor_x {
-                Some(x) => dash_magnify_factor((x - cx).abs() as f32, sigma),
-                None => 1.0,
-            };
-            let scale = 1.0 + (target - 1.0) * progress;
-            let size = (base as f32 * scale).round() as i32;
-            let half = size / 2;
-            RECT { left: cx - half, top: s.bottom - size, right: cx - half + size, bottom: s.bottom }
+            let target = dash_magnify_factor((cursor - cx).abs() as f32, sigma);
+            1.0 + (target - 1.0) * progress
+        })
+        .collect();
+
+    // Redistribute a *fixed* total width in proportion to those scales,
+    // rather than growing each icon in place. Growing in place is what
+    // made magnified icons overlap their neighbours and made hovering one
+    // icon look like it hovered several. Holding the total constant also
+    // means the row can never spill outside the dock card.
+    let total_gaps = gap * (n as i32 - 1);
+    let available = (row_right - row_left - total_gaps).max(n as i32);
+    let sum: f32 = scales.iter().sum();
+    let mut widths: Vec<i32> = scales
+        .iter()
+        .map(|scale| ((available as f32) * (scale / sum)).floor().max(1.0) as i32)
+        .collect();
+
+    // Hand the floor()'d remainder to the widest slots first, so the
+    // rounding never comes out of the icon the pointer is actually on.
+    let mut remainder = available - widths.iter().sum::<i32>();
+    if remainder > 0 {
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_by(|&a, &b| scales[b].partial_cmp(&scales[a]).unwrap_or(std::cmp::Ordering::Equal));
+        for &i in order.iter().cycle().take(remainder.max(0) as usize) {
+            widths[i] += 1;
+            remainder -= 1;
+            if remainder == 0 {
+                break;
+            }
+        }
+    }
+
+    // Lay the row out left to right. Each icon stays bottom-anchored to
+    // its base slot so the wave grows upward out of the dock.
+    let mut x = row_left;
+    slots
+        .iter()
+        .zip(&widths)
+        .map(|(s, &w)| {
+            let r = RECT { left: x, top: s.bottom - w, right: x + w, bottom: s.bottom };
+            x += w + gap;
+            r
         })
         .collect()
 }
@@ -426,6 +472,48 @@ pub(crate) fn file_icon(path: &Path) -> Option<HICON> {
 /// (e.g. one of `default_pins`'s raw `.exe` paths), it already *is* the
 /// target — returned as-is rather than fed through `IShellLinkW`, which
 /// only understands real shortcut files.
+/// The executable name a pinned shortcut stands for, lowercased, used to
+/// match the shortcut against live windows.
+///
+/// `GetPath` is the obvious source but it is empty for some system
+/// shortcuts — File Explorer's pinned `.lnk` is the one that matters here:
+/// it is a virtual/IDList shortcut with no filesystem target, so `GetPath`
+/// yields nothing. Without a fallback the pin claims none of its windows,
+/// and every Explorer window then lands in the running-but-unpinned
+/// section as a *second* Explorer icon next to the pin.
+///
+/// The shortcut's icon location is the reliable second source: a
+/// shortcut's icon almost always lives in the executable it launches
+/// (`explorer.exe` for File Explorer), so its file stem is the exe name.
+fn shortcut_exe_name(lnk_path: &Path) -> Option<String> {
+    let from_target = resolve_shortcut_target(lnk_path)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+    if let Some(exe) = from_target.filter(|e| e.ends_with(".exe")) {
+        return Some(exe);
+    }
+    shortcut_icon_location(lnk_path)
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+        .filter(|e| e.ends_with(".exe"))
+}
+
+/// The path `IShellLinkW::GetIconLocation` reports for a shortcut, if any.
+fn shortcut_icon_location(lnk_path: &Path) -> Option<PathBuf> {
+    // SAFETY: same COM contract as `resolve_shortcut_target` — every call
+    // is synchronous and its result consumed before returning.
+    unsafe {
+        let shell_link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let persist_file: IPersistFile = shell_link.cast().ok()?;
+        let wide: Vec<u16> = lnk_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        persist_file.Load(PCWSTR(wide.as_ptr()), STGM_READ).ok()?;
+
+        let mut buf = [0u16; 260];
+        let mut index: i32 = 0;
+        shell_link.GetIconLocation(&mut buf, &mut index).ok()?;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        (len > 0).then(|| PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+    }
+}
+
 fn resolve_shortcut_target(lnk_path: &Path) -> Option<PathBuf> {
     if !lnk_path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("lnk")) {
         return Some(lnk_path.to_path_buf());
@@ -520,9 +608,7 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
             break;
         }
         let target_path = resolve_shortcut_target(&lnk);
-        let target_exe = target_path
-            .as_ref()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
+        let target_exe = shortcut_exe_name(&lnk);
         let windows: Vec<isize> = match &target_exe {
             Some(exe) => live
                 .iter()
@@ -927,6 +1013,75 @@ mod tests {
         let first_center = (dots[0].left + dots[0].right) / 2;
         let last_center = (dots[2].left + dots[2].right) / 2;
         assert_eq!(icon_center - first_center, last_center - icon_center);
+    }
+
+    /// Three 40px slots with a 10px gap, row spanning x=0..140.
+    fn row() -> Vec<RECT> {
+        vec![
+            RECT { left: 0, top: 0, right: 40, bottom: 40 },
+            RECT { left: 50, top: 0, right: 90, bottom: 40 },
+            RECT { left: 100, top: 0, right: 140, bottom: 40 },
+        ]
+    }
+
+    #[test]
+    fn wave_slots_never_overlap_at_any_cursor_position() {
+        // The old wave grew each icon around its fixed centre, so a
+        // magnified icon ate into its neighbours — the overlap that made
+        // hovering one icon look like it hovered the others.
+        let slots = row();
+        for cursor in -20..160 {
+            let waved = wave_slots(&slots, Some(cursor), 1.0);
+            for pair in waved.windows(2) {
+                assert!(
+                    pair[0].right <= pair[1].left,
+                    "slots overlap at cursor {cursor}: {:?} then {:?}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wave_slots_keep_the_row_within_its_original_bounds() {
+        // A fixed-width dock: the wave redistributes width rather than
+        // growing the row, so icons can never spill outside the card.
+        let slots = row();
+        let (left, right) = (slots[0].left, slots[slots.len() - 1].right);
+        for cursor in -20..160 {
+            let waved = wave_slots(&slots, Some(cursor), 1.0);
+            assert!(waved[0].left >= left, "row spilled left at cursor {cursor}");
+            assert!(waved[waved.len() - 1].right <= right, "row spilled right at cursor {cursor}");
+        }
+    }
+
+    #[test]
+    fn wave_slots_make_the_icon_under_the_pointer_the_largest() {
+        let slots = row();
+        let waved = wave_slots(&slots, Some(20), 1.0);
+        let width = |r: &RECT| r.right - r.left;
+        assert!(width(&waved[0]) > width(&waved[1]));
+        assert!(width(&waved[1]) > width(&waved[2]));
+    }
+
+    #[test]
+    fn wave_slots_stay_bottom_anchored_so_icons_grow_upward() {
+        let slots = row();
+        let waved = wave_slots(&slots, Some(20), 1.0);
+        for (base, w) in slots.iter().zip(&waved) {
+            assert_eq!(base.bottom, w.bottom, "every icon stays bottom-anchored");
+        }
+        // The icon under the pointer is the one that grows upward; in a
+        // fixed-width row the others give up the width it gains.
+        assert!(waved[0].top < slots[0].top);
+    }
+
+    #[test]
+    fn wave_slots_at_zero_progress_match_the_flat_row() {
+        let slots = row();
+        let waved = wave_slots(&slots, Some(20), 0.0);
+        assert_eq!(waved, slots);
     }
 
     #[test]
