@@ -132,6 +132,15 @@ pub(crate) struct ThumbAnim {
     pub(crate) rect: RECT,
     /// Icon badge rect, directly below `rect`.
     pub(crate) icon_rect: RECT,
+    /// Where this window actually sits on screen, in overview-client
+    /// coordinates — the rect it flies out of when Activities opens and
+    /// back into when it closes.
+    ///
+    /// `None` for a window that has no on-screen position to fly from: one
+    /// parked on another workspace (hidden, so its real rect is stale) or
+    /// minimized. Those just fade with the card instead, which is the
+    /// honest thing to show for a window that is not actually anywhere.
+    pub(crate) home: Option<RECT>,
 }
 
 /// One workspace's card background rect — fixed once built (`page`
@@ -608,6 +617,13 @@ pub(crate) fn build_carousel_pages(monitor: &str) -> (Vec<CardAnim>, Vec<ThumbAn
         });
 
     let (card_rect, _) = card_layout(monitor);
+    // The overview window covers its monitor exactly, so the monitor's
+    // top-left is the client origin that screen rects convert against.
+    let origin = super::monitors::monitors_sorted_by_x()
+        .iter()
+        .find(|m| m.device_name == monitor)
+        .map(|m| (m.rect.left, m.rect.top))
+        .unwrap_or((0, 0));
     let mut cards = Vec::new();
     let mut thumbs = Vec::new();
     // Every tracked window across every workspace, parked or not — the
@@ -664,12 +680,42 @@ pub(crate) fn build_carousel_pages(monitor: &str) -> (Vec<CardAnim>, Vec<ThumbAn
                 page,
                 rect: slot_rect,
                 icon_rect,
+                home: window_home_rect(source, origin),
             });
         }
     }
 
     let dock_apps = super::dock::build_dock_apps(&all_windows);
     (cards, thumbs, current_pos, dock_apps)
+}
+
+/// A window's real on-screen rect, expressed in the overview window's
+/// client coordinates, or `None` if it has no meaningful one right now.
+///
+/// Used as the start/end point of the fly-out/fly-in animation, so a
+/// preview appears to lift off the actual window and settle back onto it.
+/// A hidden window (parked on another workspace) is excluded: its last
+/// rect is stale and flying a preview to an empty patch of desktop would
+/// be a lie.
+fn window_home_rect(source: HWND, origin: (i32, i32)) -> Option<RECT> {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
+    // SAFETY: plain queries; a stale handle fails rather than misbehaves.
+    unsafe {
+        if !IsWindowVisible(source).as_bool() || IsIconic(source).as_bool() {
+            return None;
+        }
+    }
+    let mut r = RECT::default();
+    // SAFETY: as above; `r` is written only on success.
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(source, &mut r) }.is_err() {
+        return None;
+    }
+    Some(RECT {
+        left: r.left - origin.0,
+        top: r.top - origin.1,
+        right: r.right - origin.0,
+        bottom: r.bottom - origin.1,
+    })
 }
 
 /// Shows the overview and fades it in (see the module docs on why
@@ -2101,6 +2147,35 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
             zoom_rect(r, anchor_x, anchor_y, zoom)
         };
 
+        // How far through the open/close transition the window previews
+        // are, as a 0..1 "settled in the grid" value: 0 means sitting on
+        // the real window, 1 means fully laid out in the grid. Opening
+        // runs 0 -> 1 and closing 1 -> 0, so each preview lifts off its
+        // real window and lands back on it.
+        let settle = match &ov.mode {
+            OverviewMode::Opening { started, .. } => ease_out(progress(*started)),
+            OverviewMode::Closing { started, .. } => 1.0 - ease_out(progress(*started)),
+            _ => 1.0,
+        };
+        let fly = |th: &ThumbAnim| {
+            let grid = place(th.rect, th.page);
+            // A window with no real on-screen position (parked on another
+            // workspace, or minimized) has nowhere to fly from, so it
+            // just rides the card's zoom like before.
+            let Some(home) = th.home.filter(|_| settle < 0.999) else {
+                return grid;
+            };
+            let lerp = |from: i32, to: i32| {
+                (from as f64 + (to as f64 - from as f64) * settle).round() as i32
+            };
+            RECT {
+                left: lerp(home.left, grid.left),
+                top: lerp(home.top, grid.top),
+                right: lerp(home.right, grid.right),
+                bottom: lerp(home.bottom, grid.bottom),
+            }
+        };
+
         // Hover glow: the card currently under the pointer while a real
         // window drag is in progress, with its ease-in intensity —
         // computed before `cards` below is shadowed by its transformed
@@ -2145,7 +2220,7 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
             if excluded_hwnd == Some(hwnd) {
                 continue;
             }
-            let rect = place(th.rect, th.page);
+            let rect = fly(th);
             if window_snapshot(hwnd).is_some() {
                 snapshots.push((rect, th.rect.right - th.rect.left, th.rect.bottom - th.rect.top, hwnd));
             } else {
@@ -2155,7 +2230,24 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         let icons = thumbs
             .iter()
             .filter(|th| excluded_hwnd != Some(th.hwnd.0 as isize))
-            .filter_map(|th| th.icon.map(|icon| (place(th.icon_rect, th.page), icon)))
+            .filter_map(|th| {
+                // The badge rides along with its preview, keeping its
+                // offset below the slot, so it does not detach mid-flight.
+                th.icon.map(|icon| {
+                    let grid = place(th.rect, th.page);
+                    let flown = fly(th);
+                    let badge = place(th.icon_rect, th.page);
+                    (
+                        RECT {
+                            left: badge.left + (flown.left - grid.left),
+                            top: badge.top + (flown.top - grid.top),
+                            right: badge.right + (flown.right - grid.right),
+                            bottom: badge.bottom + (flown.bottom - grid.bottom),
+                        },
+                        icon,
+                    )
+                })
+            })
             .collect::<Vec<_>>();
 
         // The ghost itself: a live drag follows the cursor at full size
