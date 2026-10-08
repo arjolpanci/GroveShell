@@ -140,10 +140,13 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
         // DirectComposition refuses to target a window that has
         // `WS_EX_LAYERED` set, so this style is omitted whenever the GPU
         // path is available (it fades via compositor opacity instead).
+        // See the matching comment at the startup creation site in
+        // mod.rs: DirectComposition refuses a window that has
+        // `WS_EX_LAYERED` set, so this style is omitted whenever the GPU
+        // path is available, and the redirection bitmap is kept so the
+        // GDI painter still works.
         let overview_ex_style = if super::gpu::is_enabled() {
-            // Matches the startup site: no redirection bitmap, or the
-            // composition tree's content never reaches the screen.
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW
         } else {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED
         };

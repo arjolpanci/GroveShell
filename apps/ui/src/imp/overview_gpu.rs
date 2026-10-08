@@ -72,6 +72,17 @@ pub(crate) struct OverviewGpuState {
 /// of the fix once that defect is found; everything else is in place.
 const OVERVIEW_GPU_ENABLED: bool = false;
 
+/// Whether the overview will actually render through DirectComposition.
+///
+/// The window style has to agree with this: `WS_EX_NOREDIRECTIONBITMAP`
+/// is only safe when something is composing the window, because a window
+/// without a redirection bitmap cannot be painted by GDI *at all*. Set
+/// one without the other and the overview is invisible rather than merely
+/// slow — which is exactly what happened when this flag went in.
+pub(crate) fn enabled() -> bool {
+    OVERVIEW_GPU_ENABLED && super::gpu::is_enabled()
+}
+
 pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuState> {
     if !OVERVIEW_GPU_ENABLED {
         return None;
