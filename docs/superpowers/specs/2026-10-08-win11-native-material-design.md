@@ -383,7 +383,13 @@ locks `groveshell-ui.exe`):
 Recorded because three of them contradict assumptions made above, and a
 later reader should not re-derive them.
 
-### 9.1 The backdrop material is not visible on GDI surfaces
+### 9.1 The backdrop material is not visible on GDI surfaces — but it *is* on DirectComposition ones
+
+**Superseded in part by §9.6.** The GDI finding below stands; the
+conclusion drawn from it ("the material cannot be shown without the D2D
+port") was too broad and is corrected there.
+
+
 
 **Mica and Acrylic cannot show through a GDI-painted window.** GDI has no
 alpha channel, so every pixel it paints is opaque and DWM's material
@@ -440,3 +446,59 @@ test pins the exception so it cannot be "fixed" into a wrong glyph later.
 - Light-theme values are verified on the bar but not inspected across
   every Quick Settings page and control state.
 - The light-theme preview fixture pass described in §7.
+
+### 9.6 Transparency works today, and does not need a different language
+
+Prompted by the question "is there no way to get transparency at all?",
+this was tested rather than argued, and the answer is yes — on the
+DirectComposition path, which this codebase already has.
+
+`gpu.rs` already creates its surfaces as
+`DXGI_FORMAT_B8G8R8A8_UNORM` + `DXGI_ALPHA_MODE_PREMULTIPLIED` and
+already exposes `clear_transparent`. Two things, neither of them the
+rendering language, were blocking the result:
+
+1. **The window kept its opaque GDI redirection bitmap**, which DWM
+   composites over the material regardless of the backdrop attribute.
+   `WS_EX_NOREDIRECTIONBITMAP` removes it.
+2. **The paint code filled an opaque card** over the backdrop. Clearing
+   to alpha 0 and painting *no* card makes DWM's Acrylic — with its own
+   blur and tint — the flyout's background, which is how Windows' own
+   flyouts are built.
+
+Measured on the calendar, panel interior against three backdrops:
+
+| behind the flyout | before | after |
+|---|---|---|
+| blue wallpaper `13,29,44` | `41,41,41` | `50,67,83` |
+| grey band `46,46,46` | `41,41,41` | `48,48,49` |
+| black `11,11,11` | `41,41,41` | `61,61,61` |
+
+A constant interior means opaque; one that tracks its backdrop means
+translucent. Text behind the flyout is visible and blurred through it.
+
+**On C#/WinUI 3.** This is also the answer to whether a C# rewrite would
+unlock transparency: it would not unlock anything unavailable here.
+WinUI 3 gets Mica by rendering through DirectComposition with no
+redirection bitmap — the same two mechanisms used above. The capability
+comes from the compositor, not the language, and `apps/ui` is already
+talking to that compositor directly. ADR-004 stands.
+
+**The constraint that remains** is which surfaces are on which renderer:
+GDI surfaces (`bar.rs`, `quick_settings.rs`) still cannot be translucent,
+for the §9.1 reason. That is an argument for the Direct2D port in §1.2 —
+now with a proven payoff — not for changing language.
+
+**Caveat.** A window with no redirection bitmap cannot be painted by GDI
+at all, so the style is gated on `gpu::is_enabled()` and the per-window
+surface is re-checked; on failure the window is destroyed and rebuilt
+opaque. This is not hypothetical — see §9.7.
+
+### 9.7 Pre-existing: the overview has never been GPU-composited
+
+While reading logs for §9.6: the overview's DirectComposition surface
+fails with `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` and silently
+falls back to GDI. The oldest occurrence in the logs is **2026-07-30**,
+so this long predates this work and is unrelated to it, but it means the
+overview has been running its slow path — and that the per-window guard
+in §9.6 is necessary rather than defensive. Worth its own investigation.
