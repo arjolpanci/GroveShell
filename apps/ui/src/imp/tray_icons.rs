@@ -303,6 +303,18 @@ pub(crate) fn invoke_overflow() {
     });
 }
 
+/// Hands the captured BGRA pixels for icon `index` to `f`, for the
+/// Direct2D bar path — the GDI [`paint`] above blits the same buffer with
+/// `StretchDIBits`, but a D2D surface wants the raw pixels so it can make
+/// an `ID2D1Bitmap` out of them.
+pub(crate) fn with_pixels<R>(index: usize, f: impl FnOnce(&[u8], i32) -> R) -> Option<R> {
+    WORKER.with(|w| {
+        let w = w.borrow();
+        let icon = w.icons.get(index)?;
+        Some(f(&icon.pixels, icon.size))
+    })
+}
+
 pub(crate) unsafe fn paint(hdc: HDC, index: usize, rect: RECT) {
     WORKER.with(|w| {
         let w = w.borrow();

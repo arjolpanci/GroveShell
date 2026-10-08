@@ -49,6 +49,12 @@ pub(crate) struct BarWindow {
     pub(crate) rect: RECT,
     pub(crate) is_primary: bool,
     pub(crate) monitor: String,
+    /// The bar's DirectComposition surface, when the GPU path is
+    /// available. `None` means this bar paints through the GDI fallback
+    /// in `bar::paint_bar` and is opaque — the Mica backdrop can only
+    /// show through the Direct2D painter (`bar_gpu`), because GDI has no
+    /// alpha channel.
+    pub(crate) gpu: Option<GpuSurface>,
 }
 
 pub(crate) struct AppState {

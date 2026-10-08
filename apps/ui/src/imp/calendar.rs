@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOW,
+    SetForegroundWindow, SetTimer, ShowWindow, SW_SHOW,
 };
 
 use super::overview::close_overview;

@@ -43,7 +43,7 @@ use super::calendar::toggle_calendar;
 /// icons rather than fill the button — `draw_fluent_glyph` sizes the
 /// glyph to the rect it is handed, so it gets this inset rect, not the
 /// button.
-fn centered_square(rect: RECT, size: i32) -> RECT {
+pub(super) fn centered_square(rect: RECT, size: i32) -> RECT {
     let cx = (rect.left + rect.right) / 2;
     let cy = (rect.top + rect.bottom) / 2;
     let half = size / 2;
@@ -60,10 +60,15 @@ fn scaled(v: i32, dpi: u32) -> i32 {
 /// menu rather than a separate flyout per icon.
 const QS_PILL_HEIGHT: i32 = 20;
 const QS_PILL_PADDING_X: i32 = 8;
-const QS_ICON_SIZE: i32 = 15;
+pub(super) const QS_ICON_SIZE: i32 = 15;
 const QS_ICON_GAP: i32 = 10;
-const QS_PILL_RADIUS: i32 = 10;
+pub(super) const QS_PILL_RADIUS: i32 = 10;
 const QS_PILL_RIGHT_MARGIN: i32 = 10;
+
+/// Opacity of the bar's hover plate on the Direct2D path. The GDI painter
+/// draws it opaque because it has no choice; over the Mica backdrop a
+/// translucent plate reads as a highlight rather than a patch.
+pub(super) const BAR_HOVER_ALPHA: f32 = 0.9;
 
 /// The settings-gear glyph that opens `groveshell-settings`'s settings
 /// window — the only way to reach it once this bar has hidden the real
@@ -72,7 +77,7 @@ const QS_PILL_RIGHT_MARGIN: i32 = 10;
 /// pill, same row.
 /// Segoe Fluent Icons "Settings"; the `_FALLBACK` is the plain Unicode
 /// gear used when that font is missing (pre-Windows 11).
-const SETTINGS_GLYPH: &str = "\u{E713}";
+pub(super) const SETTINGS_GLYPH: &str = "\u{E713}";
 const SETTINGS_GLYPH_FALLBACK: &str = "\u{2699}";
 const SETTINGS_BUTTON_WIDTH: i32 = 20;
 const SETTINGS_BUTTON_GAP: i32 = 6;
@@ -80,7 +85,7 @@ const SETTINGS_BUTTON_GAP: i32 = 6;
 /// The tray-overflow chevron, sitting just left of the settings gear. Only
 /// painted/hit-tested when a real overflow window exists to host (see
 /// `tray::overflow_available`).
-const TRAY_CHEVRON_GLYPH: &str = "\u{25BE}"; // U+25BE BLACK DOWN-POINTING SMALL TRIANGLE
+pub(super) const TRAY_CHEVRON_GLYPH: &str = "\u{25BE}"; // U+25BE BLACK DOWN-POINTING SMALL TRIANGLE
 const TRAY_CHEVRON_WIDTH: i32 = 18;
 const TRAY_CHEVRON_GAP: i32 = 4;
 
@@ -88,14 +93,14 @@ const TRAY_CHEVRON_GAP: i32 = 4;
 /// session menu (lock, sleep, sign out, restart, shut down).
 /// Segoe Fluent Icons "PowerButton"; the `_FALLBACK` is the plain
 /// Unicode power symbol.
-const SESSION_GLYPH: &str = "\u{E7E8}";
+pub(super) const SESSION_GLYPH: &str = "\u{E7E8}";
 const SESSION_GLYPH_FALLBACK: &str = "\u{23FB}";
 const SESSION_BUTTON_WIDTH: i32 = 20;
 const SESSION_BUTTON_GAP: i32 = 6;
 
 /// The session button's rect, just left of the settings button — a pure
 /// function of the settings rect so paint and hit-test agree.
-fn session_button_rect(settings_rect: RECT, dpi: u32, bar_h: i32) -> RECT {
+pub(super) fn session_button_rect(settings_rect: RECT, dpi: u32, bar_h: i32) -> RECT {
     let w = scaled(SESSION_BUTTON_WIDTH, dpi);
     let gap = scaled(SESSION_BUTTON_GAP, dpi);
     RECT { left: settings_rect.left - gap - w, top: 0, right: settings_rect.left - gap, bottom: bar_h }
@@ -103,13 +108,13 @@ fn session_button_rect(settings_rect: RECT, dpi: u32, bar_h: i32) -> RECT {
 
 /// The tray chevron's rect, just left of the session button — a pure
 /// function of the session rect so paint and hit-test agree.
-fn tray_chevron_rect(session_rect: RECT, dpi: u32, bar_h: i32) -> RECT {
+pub(super) fn tray_chevron_rect(session_rect: RECT, dpi: u32, bar_h: i32) -> RECT {
     let w = scaled(TRAY_CHEVRON_WIDTH, dpi);
     let gap = scaled(TRAY_CHEVRON_GAP, dpi);
     RECT { left: session_rect.left - gap - w, top: 0, right: session_rect.left - gap, bottom: bar_h }
 }
 
-fn tray_icon_rect(chevron: RECT, dpi: u32, index: usize) -> RECT {
+pub(super) fn tray_icon_rect(chevron: RECT, dpi: u32, index: usize) -> RECT {
     let size = scaled(20, dpi);
     let right = chevron.left - scaled(6, dpi) - index as i32 * scaled(26, dpi);
     let top = (chevron.bottom - size) / 2;
@@ -128,7 +133,7 @@ pub(crate) fn on_tray_context(hwnd: HWND, x: i32) {
 /// pixels at `dpi` — a pure function of `bar_width`/`dpi` so painting
 /// and hit-testing can never disagree, same pattern as the overview's
 /// `card_layout`.
-fn qs_pill_layout(bar_width: i32, dpi: u32, bar_h: i32) -> (RECT, [RECT; 3]) {
+pub(super) fn qs_pill_layout(bar_width: i32, dpi: u32, bar_h: i32) -> (RECT, [RECT; 3]) {
     let icon = scaled(QS_ICON_SIZE, dpi);
     let gap = scaled(QS_ICON_GAP, dpi);
     let pad_x = scaled(QS_PILL_PADDING_X, dpi);
@@ -153,7 +158,7 @@ fn qs_pill_layout(bar_width: i32, dpi: u32, bar_h: i32) -> (RECT, [RECT; 3]) {
 /// The settings button's rect, just left of the status pill — a pure
 /// function of the pill's own rect so painting and hit-testing can
 /// never disagree, same pattern as `qs_pill_layout`.
-fn settings_button_rect(pill: RECT, dpi: u32, bar_h: i32) -> RECT {
+pub(super) fn settings_button_rect(pill: RECT, dpi: u32, bar_h: i32) -> RECT {
     let w = scaled(SETTINGS_BUTTON_WIDTH, dpi);
     let gap = scaled(SETTINGS_BUTTON_GAP, dpi);
     RECT {
