@@ -3,13 +3,17 @@
 //! Fully custom-painted and custom-hit-tested (no native child
 //! controls), same approach as the Activities overview.
 //!
-//! The window itself is larger than the visible card by
-//! `QS_SHADOW_MARGIN` on every side and layered with a color-key: the
-//! margin is painted in that key color (so it's fully transparent) and
-//! the drop shadow + rounded card are drawn inside it. That margin is
-//! also what makes the *window's* corners look rounded — there's no
-//! `SetWindowRgn` involved, the rectangular frame is simply invisible
-//! outside the card shape.
+//! The window is exactly the card. It is deliberately *not* layered:
+//! `WS_EX_LAYERED` blocks the Windows 11 backdrop material, so the
+//! color-key shaping and alpha fade it used to carry were replaced by
+//! DWM-drawn round corners and shadow (`design::material`) and the
+//! dropdown reveal in [`apply_reveal`] (spec §3.2/§3.4).
+//!
+//! Every rect comes from [`qs_layout`], which is a pure function of DPI
+//! and derives from the fixed `QS_HEIGHT` rather than the client rect.
+//! That is what makes the reveal cheap: the window can be any height
+//! mid-animation and the content still lands where it belongs, clipped by
+//! the window bounds.
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -30,13 +34,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use super::calendar::hide_calendar;
 use super::control_state::{self, Action};
 use super::icons::{battery_icon, draw_icon, volume_icon, Icon};
-use super::overview::{close_overview, draw_shadow};
+use super::overview::close_overview;
 use super::state::{scaled, STATE};
 use super::util::{bar_font, draw_text_in};
 use std::cell::RefCell;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    KillTimer, SetLayeredWindowAttributes, SetTimer, LWA_ALPHA, LWA_COLORKEY,
+    KillTimer, SetTimer, SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
 };
 
 pub(crate) const QS_WIDTH: i32 = 420;
@@ -68,11 +72,13 @@ thread_local! {
 /// Room around the visible card for the drop shadow (see the module
 /// docs) — comfortably more than `draw_shadow`'s 6-layer spread plus
 /// its downward bias needs.
-pub(crate) const QS_SHADOW_MARGIN: i32 = 24;
-/// The chroma-key color: fully transparent everywhere it appears,
-/// never used by anything actually drawn in the panel.
-pub(crate) const QS_COLOR_KEY: u32 = 0x00FF00FF;
-
+/// Was the breathing room the software drop-shadow was painted into,
+/// back when the window was layered and color-keyed. DWM draws the
+/// flyout's shadow and corners now (spec §3.1), so the window is exactly
+/// the card and the margin is zero. Kept as a named constant rather than
+/// deleted because the preview fixtures and `qs_layout` both still speak
+/// in terms of it, and a future surface may want its own inset.
+pub(crate) const QS_SHADOW_MARGIN: i32 = 0;
 const QS_PADDING: i32 = 16;
 const QS_CHIP_GAP: i32 = 12;
 const QS_CHIP_HEIGHT: i32 = 60;
@@ -289,12 +295,12 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     let layout = qs_layout(dpi);
     let snapshot = control_state::snapshot();
 
-    // The whole window first, in the color key — anything left
-    // this color after painting the card stays fully transparent
-    // (see the module docs), which is what makes the card's
-    // rounded corners and the shadow around it actually visible
-    // against the real desktop instead of a hard rectangle.
-    let key_brush = CreateSolidBrush(COLORREF(QS_COLOR_KEY));
+    // The whole window in the card color. This used to be the color key
+    // that made the un-painted margin transparent, back when the window
+    // was layered; DWM now rounds the window itself and draws its shadow,
+    // so the window *is* the card and a plain fill is all it needs
+    // (spec §3.2).
+    let key_brush = CreateSolidBrush(COLORREF(super::design::color::surface_raised()));
     let client = RECT {
         left: 0,
         top: 0,
@@ -305,7 +311,9 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     let _ = DeleteObject(key_brush);
 
     let card_radius = scaled(QS_CARD_RADIUS, dpi);
-    draw_shadow(hdc, layout.card, card_radius, 6);
+    // No software shadow: DWM draws the flyout's shadow outside the
+    // window now, and a painted one inside the window would read as a
+    // dark band against the real one (spec §3.1).
     fill_round_rect(
         hdc,
         layout.card,
@@ -1181,6 +1189,37 @@ unsafe fn paint_networks(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     draw_focus(hdc, dpi, Page::Wifi);
 }
 
+/// Resizes `hwnd` to the flyout's current unroll height (spec §3.4).
+///
+/// The window's top stays pinned under the bar and only its height moves,
+/// so the content — laid out against the fixed `QS_HEIGHT` by
+/// [`qs_layout`], never against the client rect — stays put while the
+/// window grows over it. The existing double buffer in [`paint`] is sized
+/// from `GetClientRect`, so during the unroll it is simply shorter and
+/// clips the overflow for free; no per-pixel alpha and no layered window
+/// are involved, which is what lets the backdrop material composite.
+fn apply_reveal(hwnd: HWND, progress: f32) {
+    let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) };
+    let full = scaled(QS_HEIGHT + QS_SHADOW_MARGIN * 2, dpi);
+    let width = scaled(QS_WIDTH + QS_SHADOW_MARGIN * 2, dpi);
+    let height =
+        INTERACTION.with(|i| i.borrow().motion.reveal_extent(progress, full));
+    // SAFETY: `hwnd` is a live, process-lifetime window. A zero height is
+    // legal for `SetWindowPos`; the window is hidden by the caller once
+    // the phase reaches `Hidden`.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height.max(0),
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
 pub(crate) fn mouse_leave(hwnd: HWND) {
     INTERACTION.with(|i| i.borrow_mut().hover = None);
     unsafe {
@@ -1190,22 +1229,16 @@ pub(crate) fn mouse_leave(hwnd: HWND) {
 
 pub(crate) fn tick(hwnd: HWND) {
     let changed = control_state::poll();
-    let opacity = INTERACTION.with(|i| {
+    let progress = INTERACTION.with(|i| {
         let mut i = i.borrow_mut();
         if !i.motion.is_animating() {
             return None;
         }
-        let p = i.motion.tick(std::time::Instant::now());
-        Some((i.motion.scale_opacity(p).1 * 255.0).round() as u8)
+        Some(i.motion.tick(std::time::Instant::now()))
     });
     unsafe {
-        if let Some(alpha) = opacity {
-            let _ = SetLayeredWindowAttributes(
-                hwnd,
-                COLORREF(QS_COLOR_KEY),
-                alpha,
-                LWA_COLORKEY | LWA_ALPHA,
-            );
+        if let Some(p) = progress {
+            apply_reveal(hwnd, p);
         }
         if INTERACTION.with(|i| !i.borrow().motion.is_visible()) {
             let _ = KillTimer(hwnd, QS_TIMER_ID);
@@ -1417,19 +1450,11 @@ pub(crate) fn toggle_quick_settings() {
         i.motion.open();
     });
     unsafe {
-        let opacity = INTERACTION.with(|i| {
-            if i.borrow().motion.is_animating() {
-                0
-            } else {
-                255
-            }
-        });
-        let _ = SetLayeredWindowAttributes(
-            hwnd,
-            COLORREF(QS_COLOR_KEY),
-            opacity,
-            LWA_COLORKEY | LWA_ALPHA,
-        );
+        // Start the unroll at its first frame so the window is never shown
+        // at full height for one frame before the animation takes over
+        // (spec §3.4). With reduced motion the flyout is already `Open`,
+        // so this is the full height immediately.
+        apply_reveal(hwnd, 0.0);
         SetTimer(hwnd, QS_TIMER_ID, 16, None);
         let _ = InvalidateRect(hwnd, None, true);
         let _ = ShowWindow(hwnd, SW_SHOW);

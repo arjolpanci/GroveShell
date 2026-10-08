@@ -71,7 +71,7 @@ use overview::{
 };
 use quick_settings::{
     hide_quick_settings, on_quick_settings_mouse_down, on_quick_settings_mouse_move,
-    on_quick_settings_mouse_up, paint_quick_settings, QS_COLOR_KEY, QS_HEIGHT, QS_SHADOW_MARGIN,
+    on_quick_settings_mouse_up, paint_quick_settings, QS_HEIGHT, QS_SHADOW_MARGIN,
     QS_WIDTH,
 };
 use state::{
@@ -126,6 +126,7 @@ pub fn main() -> Result<()> {
     state::set_compat_a11y_config(config.appearance.high_contrast, &config.compatibility.ignore);
     state::set_overview_appearance(config.appearance.overview_blur, &config.appearance.dock_mode);
     design::color::refresh_accent();
+    design::color::refresh_theme();
 
     std::thread::spawn(config_reload_listener);
 
@@ -268,7 +269,14 @@ pub fn main() -> Result<()> {
             let _ = DeleteObject(top_square);
             SetWindowRgn(bar_hwnd, region, true);
 
-            set_blur_behind(bar_hwnd, config.appearance.top_bar_blur);
+            // Mica, with the legacy blur-behind as the pre-22621 fallback
+            // (spec §3.1/§3.3). The rounded window region set just above
+            // still supplies the bar's rounded *bottom* corners, which is
+            // why the bar asks DWM not to round it — DWM would round all
+            // four and notch the screen's top corners.
+            if !design::material::apply(bar_hwnd, design::material::Surface::Bar) {
+                set_blur_behind(bar_hwnd, config.appearance.top_bar_blur);
+            }
 
             bars.push(BarWindow {
                 hwnd: bar_hwnd,
@@ -397,7 +405,12 @@ pub fn main() -> Result<()> {
         let qs_x = (qs_card_target_right + qs_margin - qs_width)
             .clamp(primary_bar_rect.left - qs_margin, (primary_bar_rect.right - qs_width).max(primary_bar_rect.left - qs_margin));
         let quick_settings_hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            // Deliberately NOT layered: `WS_EX_LAYERED` blocks the
+            // Windows 11 backdrop material (spec §3.2). The color-key
+            // shaping and alpha fade it used to carry are replaced by
+            // DWM-drawn round corners and the dropdown reveal in §3.4,
+            // neither of which needs per-pixel alpha.
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             w!("GroveShellQuickSettings"),
             w!("GroveShell Quick Settings"),
             WS_POPUP,
@@ -411,12 +424,12 @@ pub fn main() -> Result<()> {
             None,
         )
         .map_err(Error::Windows)?;
-        let _ = SetLayeredWindowAttributes(
-            quick_settings_hwnd,
-            COLORREF(QS_COLOR_KEY),
-            0,
-            LWA_COLORKEY,
-        );
+        // Acrylic plus DWM-drawn round corners and shadow on both flyouts
+        // (spec §3.1). No legacy fallback here: before this, flyouts had no
+        // material at all, so an older Windows simply keeps the painted
+        // card and the software corner/shadow it already had.
+        design::material::apply(calendar_hwnd, design::material::Surface::Flyout);
+        design::material::apply(quick_settings_hwnd, design::material::Surface::Flyout);
 
         let bar_hwnds: Vec<HWND> = bars.iter().map(|b| b.hwnd).collect();
 
@@ -682,6 +695,51 @@ fn invalidate_all_shell_windows() {
             let _ = InvalidateRect(hwnd, None, true);
         }
     }
+}
+
+/// Re-asserts the backdrop material, corner preference, and dark-mode tint
+/// on every shell window (spec §4.3). Called when the theme changes, since
+/// `DWMWA_USE_IMMERSIVE_DARK_MODE` is a per-window attribute that has to be
+/// set again for DWM to re-tint the material.
+///
+/// The bar takes Mica; the two flyouts take Acrylic. Overviews are left
+/// alone — they are full-screen surfaces that paint their own dimmed
+/// backdrop and are out of this pass's scope.
+fn reapply_shell_materials() {
+    let (bars, flyouts): (Vec<HWND>, Vec<HWND>) = STATE.with(|s| {
+        let state = s.borrow();
+        let Some(st) = state.as_ref() else { return (Vec::new(), Vec::new()) };
+        (
+            st.bars.iter().map(|b| b.hwnd).collect(),
+            vec![st.calendar_hwnd, st.quick_settings_hwnd],
+        )
+    });
+    for hwnd in bars {
+        apply_surface_material(hwnd, design::material::Surface::Bar);
+    }
+    for hwnd in flyouts {
+        apply_surface_material(hwnd, design::material::Surface::Flyout);
+    }
+}
+
+/// Applies the Windows 11 material to one shell window, falling back to the
+/// legacy blur-behind path when the backdrop attribute is unsupported
+/// (spec §3.3).
+///
+/// When the system backdrop *is* applied it supersedes
+/// `appearance.top_bar_blur`: the material already provides the
+/// translucency that setting used to ask for.
+fn apply_surface_material(hwnd: HWND, surface: design::material::Surface) {
+    if design::material::apply(hwnd, surface) {
+        return;
+    }
+    let blur = STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .map(|st| st.config.appearance.top_bar_blur)
+            .unwrap_or(false)
+    });
+    set_blur_behind(hwnd, blur);
 }
 
 /// Binds the `groveshell-ui` pipe and, on each `config.reload` message,
@@ -1130,6 +1188,43 @@ unsafe extern "system" fn wndproc(
             // toggles pick up the new color live (spec §3.1 / §6.2).
             design::color::refresh_accent();
             invalidate_all_shell_windows();
+            LRESULT(0)
+        }
+        WM_SETTINGCHANGE => {
+            // Windows broadcasts `WM_SETTINGCHANGE` with the literal
+            // "ImmersiveColorSet" when the light/dark apps preference
+            // changes — which is also exactly what `theme::
+            // set_apps_use_light_theme` sends after the Quick Settings
+            // theme chip writes the registry, so the shell restyles itself
+            // live from its own toggle with no extra wiring (spec §4.1).
+            //
+            // Other `WM_SETTINGCHANGE` reasons (metrics, policy, locale)
+            // share this message, so the string is checked before doing any
+            // work; `lparam` is null for several of them.
+            let is_color_change = if lparam.0 == 0 {
+                false
+            } else {
+                // SAFETY: a non-null `lparam` on this message is a
+                // null-terminated wide string owned by the sender and valid
+                // for the duration of the message dispatch; the length is
+                // bounded before reading so a malformed, unterminated
+                // string cannot run off the end.
+                unsafe {
+                    let ptr = lparam.0 as *const u16;
+                    let mut len = 0usize;
+                    while len < 64 && *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+                        == "ImmersiveColorSet"
+                }
+            };
+            if is_color_change {
+                design::color::refresh_theme();
+                design::color::refresh_accent();
+                reapply_shell_materials();
+                invalidate_all_shell_windows();
+            }
             LRESULT(0)
         }
         WM_HOTKEY => {

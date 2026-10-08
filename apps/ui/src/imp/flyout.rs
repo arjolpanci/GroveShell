@@ -120,6 +120,27 @@ impl Flyout {
         }
     }
 
+    /// The window height to show at eased progress `p` for a flyout that
+    /// unrolls downward to `full` (spec §3.4).
+    ///
+    /// Opening grows `0 → full`, Closing rolls back `full → 0`, `Open` is
+    /// `full` and `Hidden` is `0`. `p` is clamped, so an out-of-range
+    /// progress can never yield a negative height (which Win32 would
+    /// reject) or one past the flyout's own layout.
+    ///
+    /// This is the reveal counterpart to [`Flyout::scale_opacity`]: a
+    /// surface either unrolls (clipped by its window bounds, needing no
+    /// per-pixel alpha) or scales and fades, not both.
+    pub(crate) fn reveal_extent(&self, p: f32, full: i32) -> i32 {
+        let fraction = match self.phase {
+            FlyoutPhase::Open => 1.0,
+            FlyoutPhase::Hidden => 0.0,
+            FlyoutPhase::Opening => p.clamp(0.0, 1.0),
+            FlyoutPhase::Closing => 1.0 - p.clamp(0.0, 1.0),
+        };
+        (full as f32 * fraction).round() as i32
+    }
+
     /// Test-only: jump the current transition to completion.
     #[cfg(test)]
     pub(crate) fn force_complete(&mut self) {
@@ -172,6 +193,57 @@ mod tests {
         f.open_instant();
         assert_eq!(f.phase, FlyoutPhase::Open);
         assert_eq!(f.scale_opacity(1.0), (1.0, 1.0));
+    }
+
+    #[test]
+    fn reveal_extent_spans_zero_to_full_while_opening() {
+        let mut f = Flyout::new();
+        f.phase = FlyoutPhase::Opening;
+        assert_eq!(f.reveal_extent(0.0, 400), 0);
+        assert_eq!(f.reveal_extent(1.0, 400), 400);
+    }
+
+    #[test]
+    fn reveal_extent_is_monotonic_while_opening() {
+        let mut f = Flyout::new();
+        f.phase = FlyoutPhase::Opening;
+        let mut previous = -1;
+        for step in 0..=10 {
+            let extent = f.reveal_extent(step as f32 / 10.0, 400);
+            assert!(extent >= previous, "extent went backwards at step {step}");
+            previous = extent;
+        }
+    }
+
+    #[test]
+    fn reveal_extent_rolls_back_up_while_closing() {
+        let mut f = Flyout::new();
+        f.phase = FlyoutPhase::Closing;
+        assert_eq!(f.reveal_extent(0.0, 400), 400);
+        assert_eq!(f.reveal_extent(1.0, 400), 0);
+    }
+
+    #[test]
+    fn reveal_extent_is_full_when_open_and_zero_when_hidden() {
+        let mut f = Flyout::new();
+        f.open_instant();
+        assert_eq!(f.reveal_extent(1.0, 400), 400);
+
+        let hidden = Flyout::new();
+        assert_eq!(hidden.reveal_extent(1.0, 400), 0);
+    }
+
+    #[test]
+    fn reveal_extent_never_leaves_the_zero_to_full_range() {
+        // Progress is clamped upstream, but a stray out-of-range value
+        // must never produce a negative height (a Win32 resize error) or
+        // one past `full` (a flyout taller than its own layout).
+        let mut f = Flyout::new();
+        f.phase = FlyoutPhase::Opening;
+        for p in [-5.0f32, -0.1, 1.1, 7.0] {
+            let extent = f.reveal_extent(p, 400);
+            assert!((0..=400).contains(&extent), "extent {extent} out of range for p={p}");
+        }
     }
 
     #[test]

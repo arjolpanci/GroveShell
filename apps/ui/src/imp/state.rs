@@ -197,6 +197,28 @@ thread_local! {
     /// can read it without touching `STATE`. Defaults to the fallback accent
     /// (`#4CC2FF`) until the first read.
     static ACCENT: Cell<u32> = const { Cell::new(0x00FF_C24C) };
+
+    /// Whether Windows is currently in light-apps mode, read from
+    /// `AppsUseLightTheme` by `design::color::refresh_theme` at startup and
+    /// on every `ImmersiveColorSet` broadcast. Same re-entrancy-safe mirror
+    /// rationale as `ACCENT` above: the color tokens are read from inside
+    /// bar/flyout paint, which already holds `STATE`'s borrow, and a nested
+    /// `STATE.with(borrow)` panics. Defaults to `false` (dark), which is
+    /// also what a machine that has never touched personalization gets.
+    static LIGHT_THEME: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Stores whether Windows is in light-apps mode. Called by
+/// `design::color::refresh_theme` after reading the registry.
+pub(crate) fn set_light_theme(light: bool) {
+    LIGHT_THEME.with(|c| c.set(light));
+}
+
+/// Whether the light palette is active. Safe to call from anywhere,
+/// including from inside an active `STATE.with` borrow — see the mirror's
+/// doc comment.
+pub(crate) fn light_theme() -> bool {
+    LIGHT_THEME.with(|c| c.get())
 }
 
 /// Stores the current accent `COLORREF`. Called by
