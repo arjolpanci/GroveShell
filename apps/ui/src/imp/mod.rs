@@ -1250,6 +1250,7 @@ unsafe extern "system" fn wndproc(
         WM_TIMER => {
             match wparam.0 {
                 quick_settings::QS_TIMER_ID if role == Role::QuickSettings => quick_settings::tick(hwnd),
+                calendar::CAL_TIMER_ID if role == Role::Calendar => calendar::tick(hwnd),
                 ANIM_TIMER_ID => {
                     if let Role::Overview { monitor } = role {
                         on_animation_tick(&monitor);
