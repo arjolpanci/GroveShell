@@ -19,12 +19,18 @@ use super::state::scaled;
 /// falling back to `Segoe UI` on older releases — see
 /// `design::typography`, which probes the installed face once.
 pub(crate) fn bar_font(dpi: u32) -> HFONT {
+    ui_font(super::design::typography::BODY_PX, dpi)
+}
+
+/// The UI font at an explicit logical-pixel size. `bar_font` is this at
+/// the body size; the panels ask for caption and subtitle sizes too.
+pub(crate) fn ui_font(size_px: i32, dpi: u32) -> HFONT {
     let face = windows::core::HSTRING::from(super::design::typography::resolved_ui_face());
     // SAFETY: plain object creation; no aliasing or lifetime
     // preconditions.
     unsafe {
         CreateFontW(
-            -scaled(super::design::typography::BODY_PX, dpi),
+            -scaled(size_px, dpi),
             0,
             0,
             0,

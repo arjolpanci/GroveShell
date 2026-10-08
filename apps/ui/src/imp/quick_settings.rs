@@ -33,10 +33,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use super::calendar::hide_calendar;
 use super::control_state::{self, Action};
-use super::icons::{battery_icon, draw_icon, volume_icon, Icon};
+use super::icons::{battery_icon, volume_icon, Icon};
 use super::overview::close_overview;
 use super::state::{scaled, STATE};
-use super::util::{bar_font, draw_text_in};
+use super::canvas::Canvas;
 use std::cell::RefCell;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -79,6 +79,11 @@ thread_local! {
 /// deleted because the preview fixtures and `qs_layout` both still speak
 /// in terms of it, and a future surface may want its own inset.
 pub(crate) const QS_SHADOW_MARGIN: i32 = 0;
+/// Opacity of the Quick Settings card on the Direct2D backend. Opaque
+/// enough to keep text and chips legible over a busy wallpaper, sheer
+/// enough that the Acrylic behind it is clearly doing something.
+const QS_CARD_ALPHA: f32 = 0.78;
+
 const QS_PADDING: i32 = 16;
 const QS_CHIP_GAP: i32 = 12;
 const QS_CHIP_HEIGHT: i32 = 60;
@@ -211,46 +216,37 @@ pub(crate) fn battery_status() -> Option<(u8, bool)> {
     }
 }
 
-/// Fills `rect` with `color`, no border — the correct GDI idiom is
-/// `NULL_PEN` (no stroke) plus a solid brush (the fill); selecting
-/// `HOLLOW_BRUSH` instead, as an earlier version of this file did
-/// almost everywhere, draws *no fill at all*, just an outline in
-/// whatever pen happened to be active. That bug was why the volume
-/// track/fill/thumb and the chip backgrounds all looked flat and
-/// colorless.
-unsafe fn fill_round_rect(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    rect: RECT,
-    radius: i32,
-    color: COLORREF,
-) {
-    let brush = CreateSolidBrush(color);
-    let previous_brush = SelectObject(hdc, brush);
-    let previous_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    let _ = RoundRect(
-        hdc,
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        radius * 2,
-        radius * 2,
-    );
-    SelectObject(hdc, previous_brush);
-    SelectObject(hdc, previous_pen);
-    let _ = DeleteObject(brush);
+/// Paints the panel through the Direct2D backend, onto the window's
+/// composition surface.
+///
+/// Same `render_panel` as the GDI path — only the `Canvas` differs. The
+/// surface is cleared to alpha 0 first so the DWM Acrylic behind the
+/// window shows through wherever the card does not paint, and the card
+/// itself is drawn at `QS_CARD_ALPHA`.
+pub(crate) fn paint_quick_settings_gpu(hwnd: HWND) {
+    // SAFETY: plain query on a live window.
+    let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
+    let surface = STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.quick_settings_gpu.as_ref().map(|g| g as *const super::gpu::GpuSurface))
+    });
+    let Some(surface) = surface else { return };
+    // SAFETY: the surface lives in `AppState`, which outlives this call;
+    // the raw pointer exists only so `STATE`'s borrow ends before
+    // `redraw`, which re-enters code that borrows `STATE` again.
+    let surface = unsafe { &*surface };
+    super::gpu::redraw(surface, |ctx| {
+        super::gpu::clear_transparent(ctx);
+        render_panel(&mut super::canvas::D2DCanvas::new(ctx, dpi), dpi);
+    });
 }
 
-unsafe fn fill_ellipse(hdc: windows::Win32::Graphics::Gdi::HDC, rect: RECT, color: COLORREF) {
-    let brush = CreateSolidBrush(color);
-    let previous_brush = SelectObject(hdc, brush);
-    let previous_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
-    let _ = Ellipse(hdc, rect.left, rect.top, rect.right, rect.bottom);
-    SelectObject(hdc, previous_brush);
-    SelectObject(hdc, previous_pen);
-    let _ = DeleteObject(brush);
-}
-
+/// Paints the panel through the GDI backend.
+///
+/// Only reached when the window has no composition surface; with one,
+/// `paint_quick_settings_gpu` renders the same `render_panel` through the
+/// Direct2D backend instead, which is the translucent path.
 pub(crate) fn paint_quick_settings(hwnd: HWND) {
     // SAFETY: `hwnd` is the window currently processing `WM_PAINT`.
     unsafe {
@@ -265,10 +261,10 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
         let buffer = CreateCompatibleDC(target);
         let bitmap = CreateCompatibleBitmap(target, client.right, client.bottom);
         if buffer.0.is_null() || bitmap.0.is_null() {
-            render_panel(target, dpi);
+            render_panel(&mut super::canvas::GdiCanvas::new(target, dpi), dpi);
         } else {
             let old = SelectObject(buffer, bitmap);
-            render_panel(buffer, dpi);
+            render_panel(&mut super::canvas::GdiCanvas::new(buffer, dpi), dpi);
             let _ = BitBlt(
                 target,
                 0,
@@ -288,10 +284,9 @@ pub(crate) fn paint_quick_settings(hwnd: HWND) {
     }
 }
 
-unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
-    SetBkMode(hdc, TRANSPARENT);
-    let font = bar_font(dpi * 7 / 6);
-    let old_font = SelectObject(hdc, font);
+fn render_panel(c: &mut dyn Canvas, dpi: u32) {
+    // The panel draws one size larger than the bar's body text.
+    c.set_font_size(super::design::typography::BODY_PX * 7 / 6);
     let layout = qs_layout(dpi);
     let snapshot = control_state::snapshot();
 
@@ -300,36 +295,29 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     // was layered; DWM now rounds the window itself and draws its shadow,
     // so the window *is* the card and a plain fill is all it needs
     // (spec §3.2).
-    let key_brush = CreateSolidBrush(COLORREF(super::design::color::surface_raised()));
-    let client = RECT {
-        left: 0,
-        top: 0,
-        right: scaled(QS_WIDTH + QS_SHADOW_MARGIN * 2, dpi),
-        bottom: scaled(QS_HEIGHT + QS_SHADOW_MARGIN * 2, dpi),
-    };
-    windows::Win32::Graphics::Gdi::FillRect(hdc, &client, key_brush);
-    let _ = DeleteObject(key_brush);
-
     let card_radius = scaled(QS_CARD_RADIUS, dpi);
     // No software shadow: DWM draws the flyout's shadow outside the
     // window now, and a painted one inside the window would read as a
     // dark band against the real one (spec §3.1).
-    fill_round_rect(
-        hdc,
+    // The window *is* the card now (the shadow margin went away with the
+    // color key), so this single fill is the whole background. Translucent
+    // on the Direct2D backend so the DWM Acrylic behind the window reads
+    // through it; the GDI backend ignores the alpha and fills opaque,
+    // which is exactly the old appearance.
+    c.fill_round_rect_alpha(
         layout.card,
         card_radius,
         COLORREF(super::design::color::surface_raised()),
+        QS_CARD_ALPHA,
     );
 
     let text_color = COLORREF(super::design::color::text());
     let muted_text_color = COLORREF(super::design::color::text_muted());
     let accent = COLORREF(super::design::color::accent());
-    let hollow = GetStockObject(HOLLOW_BRUSH);
 
     let page = INTERACTION.with(|i| i.borrow().page);
-    SetTextColor(hdc, text_color);
-    draw_text_in(
-        hdc,
+    c.set_text_color( text_color);
+    c.text(
         RECT {
             left: layout.card.left + scaled(16, dpi),
             top: layout.card.top + scaled(10, dpi),
@@ -347,41 +335,25 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
         DT_SINGLELINE | DT_VCENTER,
     );
     if page != Page::Home {
-        paint_details(hdc, dpi, page);
-        SelectObject(hdc, old_font);
-        let _ = DeleteObject(font);
+        paint_details(c, dpi, page);
         return;
     }
 
-    let draw_chip = |on: bool, available: bool, rect: RECT, icon_fn: &dyn Fn(), label: &str| {
+    let draw_chip = |c: &mut dyn Canvas, on: bool, available: bool, rect: RECT, icon_fn: &dyn Fn(&mut dyn Canvas), label: &str| {
         let bg = if on {
             COLORREF(super::design::color::accent())
         } else {
             COLORREF(super::design::color::surface_overlay())
         };
         let radius = scaled(QS_CHIP_RADIUS, dpi);
-        fill_round_rect(hdc, rect, radius, bg);
+        c.fill_round_rect( rect, radius, bg);
         if on {
             // A thin accent ring around the active chip so "on"
             // reads as more than just a slightly different gray.
-            let pen = CreatePen(PS_SOLID, 2, accent);
-            let previous_pen = SelectObject(hdc, pen);
-            SelectObject(hdc, hollow);
-            let _ = RoundRect(
-                hdc,
-                rect.left,
-                rect.top,
-                rect.right,
-                rect.bottom,
-                radius * 2,
-                radius * 2,
-            );
-            SelectObject(hdc, previous_pen);
-            let _ = DeleteObject(pen);
+            c.stroke_round_rect(rect, radius, accent, 2.0);
         }
 
-        SetTextColor(
-            hdc,
+        c.set_text_color(
             if !available {
                 muted_text_color
             } else if on {
@@ -390,9 +362,8 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
                 text_color
             },
         );
-        icon_fn();
-        draw_text_in(
-            hdc,
+        icon_fn(c);
+        c.text(
             RECT {
                 left: rect.left + scaled(44, dpi),
                 top: rect.top,
@@ -419,17 +390,18 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     let wifi_on = snapshot.wifi;
     let wifi_icon_rect = icon_rect_in(layout.wifi_chip);
     draw_chip(
+        c,
         wifi_on.unwrap_or(false),
         wifi_on.is_some(),
         layout.wifi_chip,
-        &|| {
+        &|c: &mut dyn Canvas| {
             let color = chip_foreground(wifi_on.unwrap_or(false), wifi_on.is_some());
             let icon = if wifi_on.unwrap_or(false) {
                 Icon::Wifi
             } else {
                 Icon::WifiOff
             };
-            draw_icon(hdc, wifi_icon_rect, icon, color);
+            c.icon_colored( wifi_icon_rect, icon, color);
         },
         match wifi_on {
             Some(true) => "Wi-Fi",
@@ -441,17 +413,18 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     let light = snapshot.light;
     let theme_icon_rect = icon_rect_in(layout.theme_chip);
     draw_chip(
+        c,
         light == Some(false),
         light.is_some(),
         layout.theme_chip,
-        &|| {
+        &|c: &mut dyn Canvas| {
             let color = chip_foreground(light == Some(false), light.is_some());
             let icon = if light == Some(false) {
                 Icon::Moon
             } else {
                 Icon::Sun
             };
-            draw_icon(hdc, theme_icon_rect, icon, color);
+            c.icon_colored( theme_icon_rect, icon, color);
         },
         match light {
             Some(false) => "Dark Mode",
@@ -463,10 +436,11 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     let bluetooth_state = snapshot.bluetooth;
     let bluetooth_icon_rect = icon_rect_in(layout.bluetooth_chip);
     draw_chip(
+        c,
         bluetooth_state.unwrap_or(false),
         bluetooth_state.is_some(),
         layout.bluetooth_chip,
-        &|| {
+        &|c: &mut dyn Canvas| {
             let color =
                 chip_foreground(bluetooth_state.unwrap_or(false), bluetooth_state.is_some());
             let icon = if bluetooth_state.unwrap_or(false) {
@@ -474,7 +448,7 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
             } else {
                 Icon::BluetoothOff
             };
-            draw_icon(hdc, bluetooth_icon_rect, icon, color);
+            c.icon_colored( bluetooth_icon_rect, icon, color);
         },
         match bluetooth_state {
             Some(true) => "Bluetooth",
@@ -486,12 +460,13 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     let airplane_state = snapshot.airplane;
     let airplane_icon_rect = icon_rect_in(layout.airplane_chip);
     draw_chip(
+        c,
         airplane_state.unwrap_or(false),
         airplane_state.is_some(),
         layout.airplane_chip,
-        &|| {
+        &|c: &mut dyn Canvas| {
             let color = chip_foreground(airplane_state.unwrap_or(false), airplane_state.is_some());
-            draw_icon(hdc, airplane_icon_rect, Icon::Plane, color);
+            c.icon_colored( airplane_icon_rect, Icon::Plane, color);
         },
         match airplane_state {
             Some(true) => "Radios off",
@@ -505,9 +480,8 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     // percentage spelled out (nothing else in the row implies a
     // number, so leaving it out was genuinely ambiguous).
     let muted = get_mute().unwrap_or(false);
-    SetTextColor(hdc, text_color);
-    draw_icon(
-        hdc,
+    c.set_text_color( text_color);
+    c.icon_colored(
         layout.mute_button,
         volume_icon(muted, get_volume_percent().unwrap_or(0)),
         text_color,
@@ -521,8 +495,7 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
         right: layout.volume_track.right - percent_label_w,
         bottom: (layout.volume_track.top + layout.volume_track.bottom) / 2 + track_h / 2,
     };
-    fill_round_rect(
-        hdc,
+    c.fill_round_rect(
         track,
         track_h / 2,
         COLORREF(super::design::color::surface_overlay()),
@@ -538,12 +511,11 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
             right: fill_right.max(track.left + track_h),
             bottom: track.bottom,
         };
-        fill_round_rect(hdc, fill_rect, track_h / 2, accent);
+        c.fill_round_rect( fill_rect, track_h / 2, accent);
     }
     let thumb_r = scaled(7, dpi);
     let thumb_cy = (track.top + track.bottom) / 2;
-    fill_ellipse(
-        hdc,
+    c.fill_ellipse(
         RECT {
             left: fill_right - thumb_r,
             top: thumb_cy - thumb_r,
@@ -553,9 +525,8 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
         COLORREF(super::design::color::text()),
     );
 
-    SetTextColor(hdc, text_color);
-    draw_text_in(
-        hdc,
+    c.set_text_color( text_color);
+    c.text(
         RECT {
             left: track.right + scaled(8, dpi),
             top: layout.volume_track.top,
@@ -582,15 +553,13 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
         bottom: layout.battery_row.top + scaled(QS_ICON_SIZE, dpi),
     };
     let (battery_pct, battery_charging) = battery_status().unwrap_or((100, false));
-    draw_icon(
-        hdc,
+    c.icon_colored(
         battery_icon_rect,
         battery_icon(battery_pct, battery_charging),
         battery_color,
     );
-    SetTextColor(hdc, battery_color);
-    draw_text_in(
-        hdc,
+    c.set_text_color( battery_color);
+    c.text(
         RECT {
             left: battery_icon_rect.right + scaled(10, dpi),
             top: layout.battery_row.top,
@@ -609,9 +578,8 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
         (layout.airplane_chip, airplane_state == Some(true)),
     ] {
         let arrow = split_arrow(chip, dpi);
-        SetTextColor(hdc, chip_foreground(on, true));
-        draw_text_in(
-            hdc,
+        c.set_text_color( chip_foreground(on, true));
+        c.text(
             arrow,
             "›",
             DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_CENTER,
@@ -622,28 +590,22 @@ unsafe fn render_panel(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
             top: arrow.top + scaled(14, dpi),
             bottom: arrow.bottom - scaled(14, dpi),
         };
-        let brush = CreateSolidBrush(chip_foreground(on, true));
-        windows::Win32::Graphics::Gdi::FillRect(hdc, &divider, brush);
-        let _ = DeleteObject(brush);
+        c.fill_rect(divider, chip_foreground(on, true));
     }
     let targets = targets(dpi, Page::Home);
-    SetTextColor(hdc, text_color);
-    draw_text_in(
-        hdc,
+    c.set_text_color( text_color);
+    c.text(
         targets[9],
         "Sound output   ›",
         DT_SINGLELINE | DT_VCENTER,
     );
-    draw_text_in(
-        hdc,
+    c.text(
         targets[11],
         "Windows settings   ›",
         DT_SINGLELINE | DT_VCENTER,
     );
-    draw_feedback(hdc, dpi);
-    draw_focus(hdc, dpi, Page::Home);
-    SelectObject(hdc, old_font);
-    let _ = DeleteObject(font);
+    draw_feedback(c, dpi);
+    draw_focus(c, dpi, Page::Home);
 }
 
 /// Acquires the default audio endpoint's volume control fresh for each
@@ -813,9 +775,9 @@ fn hit_target(dpi: u32, page: Page, x: i32, y: i32) -> Option<usize> {
         .position(|r| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
 }
 
-unsafe fn paint_details(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32, page: Page) {
+fn paint_details(c: &mut dyn Canvas, dpi: u32, page: Page) {
     if page == Page::Wifi {
-        paint_networks(hdc, dpi);
+        paint_networks(c, dpi);
         return;
     }
     let l = qs_layout(dpi);
@@ -827,9 +789,8 @@ unsafe fn paint_details(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32, page:
         Page::Sound => "Select speakers or headphones and set the volume for individual apps.",
         Page::Home => "",
     };
-    SetTextColor(hdc, COLORREF(super::design::color::text_muted()));
-    draw_text_in(
-        hdc,
+    c.set_text_color( COLORREF(super::design::color::text_muted()));
+    c.text(
         RECT {
             left: l.card.left + scaled(16, dpi),
             top: l.card.top + scaled(52, dpi),
@@ -844,15 +805,13 @@ unsafe fn paint_details(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32, page:
         .skip(1)
         .zip(detail_links(page))
     {
-        fill_round_rect(
-            hdc,
+        c.fill_round_rect(
             rect,
             scaled(6, dpi),
             COLORREF(super::design::color::surface_overlay()),
         );
-        SetTextColor(hdc, COLORREF(super::design::color::text()));
-        draw_text_in(
-            hdc,
+        c.set_text_color( COLORREF(super::design::color::text()));
+        c.text(
             RECT {
                 left: rect.left + scaled(12, dpi),
                 right: rect.right - scaled(12, dpi),
@@ -862,14 +821,13 @@ unsafe fn paint_details(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32, page:
             DT_SINGLELINE | DT_VCENTER,
         );
     }
-    draw_focus(hdc, dpi, page);
+    draw_focus(c, dpi, page);
 }
 
-unsafe fn draw_feedback(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
+fn draw_feedback(c: &mut dyn Canvas, dpi: u32) {
     let l = qs_layout(dpi);
-    SetTextColor(hdc, COLORREF(super::design::color::text_muted()));
-    draw_text_in(
-        hdc,
+    c.set_text_color( COLORREF(super::design::color::text_muted()));
+    c.text(
         RECT {
             left: l.card.left + scaled(16, dpi),
             top: l.card.bottom - scaled(72, dpi),
@@ -881,7 +839,7 @@ unsafe fn draw_feedback(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
     );
 }
 
-unsafe fn draw_focus(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32, page: Page) {
+fn draw_focus(c: &mut dyn Canvas, dpi: u32, page: Page) {
     let (hover, focus) = INTERACTION.with(|i| {
         let i = i.borrow();
         (i.hover, i.focus)
@@ -892,21 +850,12 @@ unsafe fn draw_focus(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32, page: Pa
         (focus, super::design::color::accent()),
     ] {
         if let Some(r) = index.and_then(|n| rows.get(n)) {
-            let pen = CreatePen(PS_SOLID, scaled(1, dpi).max(1), COLORREF(color));
-            let old = SelectObject(hdc, pen);
-            let brush = SelectObject(hdc, GetStockObject(HOLLOW_BRUSH));
-            let _ = RoundRect(
-                hdc,
-                r.left + 1,
-                r.top + 1,
-                r.right - 1,
-                r.bottom - 1,
-                scaled(8, dpi),
-                scaled(8, dpi),
+            c.stroke_round_rect(
+                RECT { left: r.left + 1, top: r.top + 1, right: r.right - 1, bottom: r.bottom - 1 },
+                scaled(8, dpi) / 2,
+                COLORREF(color),
+                scaled(1, dpi).max(1) as f32,
             );
-            SelectObject(hdc, brush);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(pen);
         }
     }
 }
@@ -1091,7 +1040,7 @@ pub(crate) fn scroll_networks(hwnd: HWND, delta: i32) {
     }
 }
 
-unsafe fn paint_networks(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
+fn paint_networks(c: &mut dyn Canvas, dpi: u32) {
     let snapshot = control_state::snapshot();
     let l = qs_layout(dpi);
     let networks = visible_networks();
@@ -1112,9 +1061,8 @@ unsafe fn paint_networks(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
             snapshot.networks.len()
         )
     };
-    SetTextColor(hdc, COLORREF(super::design::color::text_muted()));
-    draw_text_in(
-        hdc,
+    c.set_text_color( COLORREF(super::design::color::text_muted()));
+    c.text(
         RECT {
             left: l.card.left + scaled(16, dpi),
             top: l.card.top + scaled(52, dpi),
@@ -1125,20 +1073,18 @@ unsafe fn paint_networks(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
         windows::Win32::Graphics::Gdi::DT_WORDBREAK,
     );
     for (network, rect) in networks.iter().zip(rows.iter().skip(1)) {
-        fill_round_rect(
-            hdc,
+        c.fill_round_rect(
             *rect,
             scaled(6, dpi),
             COLORREF(super::design::color::surface_overlay()),
         );
-        SetTextColor(hdc, COLORREF(super::design::color::text()));
+        c.set_text_color( COLORREF(super::design::color::text()));
         let name = if network.name.is_empty() {
             "Hidden network"
         } else {
             &network.name
         };
-        draw_text_in(
-            hdc,
+        c.text(
             RECT {
                 left: rect.left + scaled(10, dpi),
                 right: rect.right - scaled(160, dpi),
@@ -1159,16 +1105,14 @@ unsafe fn paint_networks(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
         } else {
             "Set up ↗"
         };
-        SetTextColor(
-            hdc,
+        c.set_text_color(
             COLORREF(if network.connected {
                 super::design::color::accent()
             } else {
                 super::design::color::text_muted()
             }),
         );
-        draw_text_in(
-            hdc,
+        c.text(
             RECT {
                 left: rect.right - scaled(160, dpi),
                 right: rect.right - scaled(8, dpi),
@@ -1178,15 +1122,15 @@ unsafe fn paint_networks(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) {
             DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_RIGHT,
         );
     }
-    SetTextColor(hdc, COLORREF(super::design::color::text()));
+    c.set_text_color( COLORREF(super::design::color::text()));
     for (rect, label) in rows.iter().skip(networks.len() + 1).zip([
         "Refresh",
         "Windows networks & passwords ↗",
         "Manage saved networks ↗",
     ]) {
-        draw_text_in(hdc, *rect, label, DT_SINGLELINE | DT_VCENTER);
+        c.text( *rect, label, DT_SINGLELINE | DT_VCENTER);
     }
-    draw_focus(hdc, dpi, Page::Wifi);
+    draw_focus(c, dpi, Page::Wifi);
 }
 
 /// Resizes `hwnd` to the flyout's current unroll height (spec §3.4).
@@ -1618,7 +1562,7 @@ mod tests {
                     let bitmap =
                         CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
                     let old = SelectObject(dc, bitmap);
-                    render_panel(dc, dpi);
+                    render_panel(&mut crate::imp::canvas::GdiCanvas::new(dc, dpi), dpi);
                     let _ = GdiFlush();
                     let size = (width * height * 4) as usize;
                     let mut bytes = Vec::new();
