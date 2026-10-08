@@ -2343,6 +2343,23 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                 let _ = DeleteDC(src);
             }
 
+            // Live previews on top of the stills just drawn. DWM
+            // composites thumbnails above this window's own content, so
+            // the snapshot underneath is the base layer: it is what shows
+            // for a window that is hidden (parked on another workspace,
+            // so it has no live contents) or that DWM refuses to
+            // register. Rects are the same animated ones the snapshots
+            // were drawn into, so a preview tracks the explode/implode
+            // zoom frame for frame.
+            super::thumbnails::sync(
+                hwnd,
+                &snapshots
+                    .iter()
+                    .map(|(rect, _, _, h)| (HWND(*h as *mut c_void), *rect))
+                    .filter(|(h, _)| super::thumbnails::can_preview(*h))
+                    .collect::<Vec<_>>(),
+            );
+
             // Placeholder chips: fallback for windows with no snapshot
             // (capture failed, window died, or it was minimized when
             // parked) — just their last-known title.
@@ -3273,6 +3290,10 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         match completion {
             Completion::Opened => {}
             Completion::Closed { focus_after } => {
+                // Drop the live previews before hiding: a registration
+                // left alive keeps DWM compositing a thumbnail over a
+                // window that is no longer showing one.
+                super::thumbnails::clear(overview_hwnd);
                 // SAFETY: `overview_hwnd` is a valid, process-lifetime
                 // window.
                 unsafe {
