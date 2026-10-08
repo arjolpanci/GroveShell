@@ -311,13 +311,17 @@ pub fn main() -> Result<()> {
             // (`SetLayeredWindowAttributes`); the GPU path fades via
             // `SetOpacity2` on the compositor visual instead, so it must
             // omit the style entirely to let `overview_gpu::create` succeed.
+            // DirectComposition's `CreateTargetForHwnd` unconditionally
+            // refuses a window that has `WS_EX_LAYERED` set, so the style
+            // is omitted whenever the GPU path is available at all. Note
+            // this is `gpu::is_enabled()`, the process-wide check — not
+            // whether the overview's own renderer is on. The window must
+            // be left composable either way, and it keeps its redirection
+            // bitmap so the GDI painter still works: a window without one
+            // cannot be GDI-painted at all, which is what made Activities
+            // open to nothing when this briefly said otherwise.
             let overview_ex_style = if gpu::is_enabled() {
-                // `WS_EX_NOREDIRECTIONBITMAP` for the same reason every
-                // other composition surface in the shell has it: without
-                // it the window keeps an empty GDI redirection surface
-                // that is composited alongside the visual tree, and the
-                // tree's content never reaches the screen.
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW
             } else {
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED
             };
