@@ -1,7 +1,6 @@
 //! Small painting/animation helpers shared across bar, calendar, quick
 //! settings, and overview rendering.
 
-use windows::core::w;
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, DrawTextW, DRAW_TEXT_FORMAT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     DEFAULT_CHARSET, DEFAULT_PITCH, HDC, HFONT, OUT_DEFAULT_PRECIS,
@@ -13,14 +12,19 @@ use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThre
 
 use super::state::scaled;
 
-/// A Segoe UI font sized for the bar at `dpi` (caller owns the handle
-/// and must `DeleteObject` it after deselecting).
+/// The UI font sized for the bar at `dpi` (caller owns the handle and
+/// must `DeleteObject` it after deselecting).
+///
+/// Uses Windows 11's `Segoe UI Variable Text` at the WinUI body size,
+/// falling back to `Segoe UI` on older releases — see
+/// `design::typography`, which probes the installed face once.
 pub(crate) fn bar_font(dpi: u32) -> HFONT {
+    let face = windows::core::HSTRING::from(super::design::typography::resolved_ui_face());
     // SAFETY: plain object creation; no aliasing or lifetime
     // preconditions.
     unsafe {
         CreateFontW(
-            -scaled(12, dpi),
+            -scaled(super::design::typography::BODY_PX, dpi),
             0,
             0,
             0,
@@ -33,7 +37,7 @@ pub(crate) fn bar_font(dpi: u32) -> HFONT {
             CLIP_DEFAULT_PRECIS.0.into(),
             CLEARTYPE_QUALITY.0.into(),
             DEFAULT_PITCH.0.into(),
-            w!("Segoe UI"),
+            windows::core::PCWSTR(face.as_ptr()),
         )
     }
 }

@@ -35,6 +35,20 @@ use super::calendar::toggle_calendar;
 /// every constant by `bar_content_scale()` first (the ratio between the
 /// configured height and the tuned baseline) before the usual DPI scale
 /// makes the bar's contents actually grow with it.
+/// A `size`-square centered inside `rect`.
+///
+/// The settings and session *buttons* are bar-height tall so they have a
+/// comfortable hit target, but their glyphs must match the status pill's
+/// icons rather than fill the button — `draw_fluent_glyph` sizes the
+/// glyph to the rect it is handed, so it gets this inset rect, not the
+/// button.
+fn centered_square(rect: RECT, size: i32) -> RECT {
+    let cx = (rect.left + rect.right) / 2;
+    let cy = (rect.top + rect.bottom) / 2;
+    let half = size / 2;
+    RECT { left: cx - half, top: cy - half, right: cx - half + size, bottom: cy - half + size }
+}
+
 fn scaled(v: i32, dpi: u32) -> i32 {
     super::state::scaled((v as f64 * super::state::bar_content_scale()).round() as i32, dpi)
 }
@@ -55,7 +69,10 @@ const QS_PILL_RIGHT_MARGIN: i32 = 10;
 /// Windows taskbar (and, with it, the system tray `groveshell-settings`
 /// would otherwise show its own icon in). Sits just left of the status
 /// pill, same row.
-const SETTINGS_GLYPH: &str = "\u{2699}"; // U+2699 GEAR
+/// Segoe Fluent Icons "Settings"; the `_FALLBACK` is the plain Unicode
+/// gear used when that font is missing (pre-Windows 11).
+const SETTINGS_GLYPH: &str = "\u{E713}";
+const SETTINGS_GLYPH_FALLBACK: &str = "\u{2699}";
 const SETTINGS_BUTTON_WIDTH: i32 = 20;
 const SETTINGS_BUTTON_GAP: i32 = 6;
 
@@ -68,7 +85,10 @@ const TRAY_CHEVRON_GAP: i32 = 4;
 
 /// The session/power button, just left of the settings gear. Opens the
 /// session menu (lock, sleep, sign out, restart, shut down).
-const SESSION_GLYPH: &str = "\u{23FB}"; // U+23FB POWER SYMBOL
+/// Segoe Fluent Icons "PowerButton"; the `_FALLBACK` is the plain
+/// Unicode power symbol.
+const SESSION_GLYPH: &str = "\u{E7E8}";
+const SESSION_GLYPH_FALLBACK: &str = "\u{23FB}";
 const SESSION_BUTTON_WIDTH: i32 = 20;
 const SESSION_BUTTON_GAP: i32 = 6;
 
@@ -411,13 +431,27 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
             if hovered_region == Some(BarRegion::SettingsGear) {
                 draw_hover_highlight(hdc, settings_rect, scaled(6, dpi));
             }
-            draw_text_in(hdc, settings_rect, SETTINGS_GLYPH, format);
+            if !super::icons::draw_fluent_glyph(
+                hdc,
+                centered_square(settings_rect, scaled(QS_ICON_SIZE, dpi)),
+                SETTINGS_GLYPH,
+                COLORREF(super::design::color::text()),
+            ) {
+                draw_text_in(hdc, settings_rect, SETTINGS_GLYPH_FALLBACK, format);
+            }
 
             let session_rect = session_button_rect(settings_rect, dpi, bar_h);
             if hovered_region == Some(BarRegion::SessionButton) {
                 draw_hover_highlight(hdc, session_rect, scaled(6, dpi));
             }
-            draw_text_in(hdc, session_rect, SESSION_GLYPH, format);
+            if !super::icons::draw_fluent_glyph(
+                hdc,
+                centered_square(session_rect, scaled(QS_ICON_SIZE, dpi)),
+                SESSION_GLYPH,
+                COLORREF(super::design::color::text()),
+            ) {
+                draw_text_in(hdc, session_rect, SESSION_GLYPH_FALLBACK, format);
+            }
 
             {
                 let chevron = tray_chevron_rect(session_rect, dpi, bar_h);
