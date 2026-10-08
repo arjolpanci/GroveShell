@@ -752,7 +752,7 @@ pub(crate) fn open_overview(monitor: &str) {
         if let Some(state) = s.borrow_mut().as_mut() {
             if let Some(ov) = state.overviews.get_mut(monitor) {
                 if let Some(gpu) = ov.gpu.as_mut() {
-                    super::overview_gpu::rebuild_cards(gpu, ov.hwnd, &cards);
+                    super::overview_gpu::rebuild_cards(gpu, &cards);
                     for card_visual in &gpu.cards {
                         let card = cards.iter().find(|c| c.page == card_visual.page);
                         if let Some(card) = card {
@@ -843,7 +843,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         let ov = state.as_mut()?.overviews.get_mut(monitor)?;
         let carousel_offset = ov.carousel_offset;
         let gpu = ov.gpu.as_mut()?;
-        super::overview_gpu::rebuild_cards(gpu, ov.hwnd, &cards);
+        super::overview_gpu::rebuild_cards(gpu, &cards);
         for card_visual in &gpu.cards {
             let card = cards.iter().find(|c| c.page == card_visual.page);
             if let Some(card) = card {

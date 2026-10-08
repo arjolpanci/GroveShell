@@ -53,9 +53,36 @@ pub(crate) struct OverviewGpuState {
 /// process-wide GPU setup isn't available, or if this specific
 /// window's target/surface setup fails — either way the caller keeps
 /// using GDI for this monitor's overview, unchanged.
+/// Whether the overview's Direct2D renderer is used.
+///
+/// **Currently false, deliberately.** Until 2026-10-08 this renderer had
+/// never executed: `create` asked for a second `IDCompositionTarget` on a
+/// window that already had one, which always failed with
+/// `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`, so every overview
+/// silently fell back to GDI. That bug is fixed (the extra surfaces are
+/// children now, see `gpu::create_child_surface`), but enabling the
+/// renderer revealed a second defect underneath it: the composition tree
+/// builds, `BeginDraw` succeeds, `paint_backdrop` fills the root surface
+/// opaque and the fade drives opacity to 1.0 — and the window still
+/// composites as fully transparent, with or without
+/// `WS_EX_NOREDIRECTIONBITMAP`.
+///
+/// Rather than ship a blank Activities view, the renderer stays off and
+/// the overview keeps its working GDI path. Turning this on is the whole
+/// of the fix once that defect is found; everything else is in place.
+const OVERVIEW_GPU_ENABLED: bool = false;
+
 pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuState> {
+    if !OVERVIEW_GPU_ENABLED {
+        return None;
+    }
     let root = gpu::create_surface(hwnd, width, height)?;
-    let chrome = gpu::create_surface(hwnd, width, height)?;
+    // A *child* surface: `root` already owns this window's one and only
+    // composition target, and asking for a second would fail with
+    // `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` — which is exactly
+    // what used to happen here, silently dropping every overview onto
+    // the GDI fallback.
+    let chrome = gpu::create_child_surface(width, height)?;
     // SAFETY: `root`/`chrome` were both just created above by this
     // module's own `gpu::create_surface` and are alive for as long as
     // the `OverviewGpuState` returned below is. `AddVisual` on a fresh,
@@ -73,7 +100,7 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
 /// layout). Cards are recreated in `cards`' order, matching how
 /// `on_animation_tick`'s per-tick transform pass below will iterate
 /// them.
-pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[CardAnim]) {
+pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     let mut old_cards = std::mem::take(&mut state.cards);
     let mut rebuilt = Vec::with_capacity(cards.len());
     for card in cards {
@@ -85,7 +112,7 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, hwnd: HWND, cards: &[C
             .filter(|cv| cv.surface.width() == w && cv.surface.height() == h);
         let card_visual = match reused {
             Some(cv) => cv,
-            None => match gpu::create_surface(hwnd, w.max(1), h.max(1)) {
+            None => match gpu::create_child_surface(w.max(1), h.max(1)) {
                 Some(surface) => CardVisual { page: card.page, surface },
                 None => continue,
             },

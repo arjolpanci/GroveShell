@@ -88,8 +88,14 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI
 /// into. Fields are private — every window holding a `GpuSurface` only
 /// ever passes it back into this module's own functions.
 pub(crate) struct GpuSurface {
+    /// The window's composition target. `Some` only for the *first*
+    /// surface created for a window — a window can hold exactly one
+    /// target, and asking for a second fails with
+    /// `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`. Child surfaces
+    /// ([`create_child_surface`]) carry `None` and reach the screen by
+    /// being attached under that first surface's visual.
     #[allow(dead_code)] // kept alive for as long as the surface must render; never read directly
-    target: IDCompositionTarget,
+    target: Option<IDCompositionTarget>,
     visual: IDCompositionVisual2,
     surface: IDCompositionSurface,
     width: i32,
@@ -134,18 +140,56 @@ fn try_create_surface(ctx: &GpuContext, hwnd: HWND, width: i32, height: i32) -> 
     // calls below have no other preconditions.
     unsafe {
         let target = ctx.dcomp_device.CreateTargetForHwnd(hwnd, true)?;
-        let visual = ctx.dcomp_device.CreateVisual()?;
-        let surface = ctx.dcomp_device.CreateSurface(
-            width as u32,
-            height as u32,
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-            DXGI_ALPHA_MODE_PREMULTIPLIED,
-        )?;
-        visual.SetContent(&surface)?;
+        let (visual, surface) = try_create_visual(ctx, width, height)?;
         target.SetRoot(&visual)?;
         ctx.dcomp_device.Commit()?;
-        Ok(GpuSurface { target, visual, surface, width, height })
+        Ok(GpuSurface { target: Some(target), visual, surface, width, height })
     }
+}
+
+/// SAFETY: the caller must be inside an `unsafe` block for the device
+/// calls; `ctx` is the process-wide device, alive for the process.
+unsafe fn try_create_visual(
+    ctx: &GpuContext,
+    width: i32,
+    height: i32,
+) -> windows::core::Result<(IDCompositionVisual2, IDCompositionSurface)> {
+    let visual = ctx.dcomp_device.CreateVisual()?;
+    let surface = ctx.dcomp_device.CreateSurface(
+        width as u32,
+        height as u32,
+        DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_ALPHA_MODE_PREMULTIPLIED,
+    )?;
+    visual.SetContent(&surface)?;
+    Ok((visual, surface))
+}
+
+/// Creates an additional surface for a window that already has one.
+///
+/// A window can hold exactly **one** `IDCompositionTarget`; a second
+/// `CreateTargetForHwnd` fails with
+/// `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`. A surface that is going
+/// to be attached under another surface's visual therefore must not ask
+/// for a target of its own — it reaches the screen through its parent.
+///
+/// The caller is responsible for attaching the returned surface's visual
+/// with `AddVisual`; until it does, the surface renders nowhere.
+pub(crate) fn create_child_surface(width: i32, height: i32) -> Option<GpuSurface> {
+    GPU.with(|g| {
+        let g = g.borrow();
+        let ctx = g.as_ref()?;
+        // SAFETY: `ctx` is the process-wide device, alive for the process.
+        match unsafe { try_create_visual(ctx, width, height) } {
+            Ok((visual, surface)) => {
+                Some(GpuSurface { target: None, visual, surface, width, height })
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, width, height, "child composition surface setup failed");
+                None
+            }
+        }
+    })
 }
 
 /// Sets `surface`'s root visual opacity (0.0–1.0) and commits. No-op if
