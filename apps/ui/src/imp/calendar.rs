@@ -319,7 +319,7 @@ pub(crate) const CAL_TIMER_ID: usize = 72;
 thread_local! {
     /// The calendar's open/close lifecycle. Shares `flyout::Flyout` with
     /// Quick Settings so both flyouts unroll with one motion system
-    /// (spec §3.4/§6).
+    /// (spec §5).
     static MOTION: std::cell::RefCell<super::flyout::Flyout> =
         std::cell::RefCell::new(super::flyout::Flyout::new());
 }
