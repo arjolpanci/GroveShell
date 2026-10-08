@@ -20,7 +20,7 @@ pub(crate) const BAR_CORNER_RADIUS: i32 = 10;
 
 pub(crate) const ANIM_DURATION: std::time::Duration = std::time::Duration::from_millis(250);
 pub(crate) const ANIM_TIMER_ID: usize = 1;
-pub(crate) const ANIM_TIMER_INTERVAL_MS: u32 = 16;
+pub(crate) const ANIM_TIMER_INTERVAL_MS: u32 = super::design::motion::FRAME_INTERVAL_MS;
 pub(crate) const CLOCK_TIMER_ID: usize = 2;
 
 pub(crate) fn scaled(v: i32, dpi: u32) -> i32 {

@@ -402,7 +402,7 @@ pub(crate) fn hide_calendar(restore_focus: bool) {
         // the phase settles on `Hidden`. Under reduced motion the close is
         // instant and the window is hidden on the next tick immediately.
         MOTION.with(|m| m.borrow_mut().close());
-        SetTimer(hwnd, CAL_TIMER_ID, 16, None);
+        SetTimer(hwnd, CAL_TIMER_ID, super::design::motion::FRAME_INTERVAL_MS, None);
         if restore_focus && !previous.0.is_null() {
             let _ = SetForegroundWindow(previous);
         }
@@ -452,7 +452,7 @@ pub(crate) fn toggle_calendar() {
         }
         MOTION.with(|m| m.borrow_mut().open());
         apply_reveal(hwnd, 0.0);
-        SetTimer(hwnd, CAL_TIMER_ID, 16, None);
+        SetTimer(hwnd, CAL_TIMER_ID, super::design::motion::FRAME_INTERVAL_MS, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);

@@ -44,7 +44,7 @@ use super::gpu::{self, GpuSurface};
 /// from the overview's `ANIM_TIMER_ID` and the others in `movesize`/
 /// `workspaces`).
 pub(crate) const DOCK_TIMER_ID: usize = 6;
-const DOCK_TIMER_INTERVAL_MS: u32 = 16;
+const DOCK_TIMER_INTERVAL_MS: u32 = motion::FRAME_INTERVAL_MS;
 /// How close to the screen's bottom edge the pointer must get to reveal an
 /// autohidden dock (96-DPI band).
 const REVEAL_BAND: i32 = 3;

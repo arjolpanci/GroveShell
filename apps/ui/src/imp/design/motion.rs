@@ -5,6 +5,20 @@
 
 use super::super::state;
 
+/// The interval every animation timer in the shell runs at.
+///
+/// **15, deliberately, not 16.** `SetTimer` cannot fire faster than the
+/// system timer granularity, which is ~15.6ms by default. A 16ms request
+/// is *above* that, so it rounds up to two ticks — 31.2ms, about 32 FPS —
+/// while a 15ms request lands on one. Measured on the Activities
+/// animation: the gap between ticks was 30.6ms median with 16, while the
+/// paint itself took only 9.35ms, so the shell was idle roughly two
+/// thirds of every frame.
+///
+/// Going below 15 buys nothing without `timeBeginPeriod`, which raises
+/// the granularity process-wide and costs power.
+pub(crate) const FRAME_INTERVAL_MS: u32 = 15;
+
 /// Duration for small, snappy transitions (hover highlights, presses).
 pub(crate) const FAST_MS: u32 = 180;
 
