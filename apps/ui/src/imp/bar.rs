@@ -22,7 +22,6 @@ use super::quick_settings::{battery_status, get_mute, get_volume_percent, toggle
 use super::overview::OverviewMode;
 use super::state::STATE;
 use super::util::{bar_font, draw_text_in, blend_toward_white};
-use super::wifi::wifi_radio_on;
 use super::calendar::clock_text;
 use super::calendar::toggle_calendar;
 
@@ -87,6 +86,21 @@ fn tray_chevron_rect(session_rect: RECT, dpi: u32, bar_h: i32) -> RECT {
     let w = scaled(TRAY_CHEVRON_WIDTH, dpi);
     let gap = scaled(TRAY_CHEVRON_GAP, dpi);
     RECT { left: session_rect.left - gap - w, top: 0, right: session_rect.left - gap, bottom: bar_h }
+}
+
+fn tray_icon_rect(chevron: RECT, dpi: u32, index: usize) -> RECT {
+    let size = scaled(20, dpi);
+    let right = chevron.left - scaled(6, dpi) - index as i32 * scaled(26, dpi);
+    let top = (chevron.bottom - size) / 2;
+    RECT { left: right - size, top, right, bottom: top + size }
+}
+
+pub(crate) fn on_tray_context(hwnd: HWND, x: i32) {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let mut client = RECT::default();
+    unsafe { let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client); }
+    let h = scaled(super::state::BAR_HEIGHT, dpi);
+    if let Some(BarRegion::TrayIcon(index)) = region_at(x, dpi, client.right, h, true, 0) { super::tray_icons::invoke(index, true); }
 }
 
 /// The status pill's own rect and its three icon slots, in physical
@@ -156,6 +170,7 @@ pub(crate) enum BarRegion {
     SettingsGear,
     SessionButton,
     TrayChevron,
+    TrayIcon(usize),
 }
 
 /// Which clickable region (if any) `x` falls under, given this bar's
@@ -192,10 +207,14 @@ fn region_at(x: i32, dpi: u32, bar_width: i32, bar_h: i32, is_primary: bool, wor
     if (session_rect.left..session_rect.right).contains(&x) {
         return Some(BarRegion::SessionButton);
     }
-    if super::tray::overflow_available() {
+    {
         let chevron = tray_chevron_rect(session_rect, dpi, bar_h);
         if (chevron.left..chevron.right).contains(&x) {
             return Some(BarRegion::TrayChevron);
+        }
+        for index in 0..super::tray_icons::count() {
+            let rect = tray_icon_rect(chevron, dpi, index);
+            if (rect.left..rect.right).contains(&x) { return Some(BarRegion::TrayIcon(index)); }
         }
     }
     None
@@ -362,12 +381,15 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
             }
 
             let glyph_color = COLORREF(super::design::color::text());
-            let wifi_icon = if wifi_radio_on().unwrap_or(false) { Icon::Wifi } else { Icon::WifiOff };
+            let wifi_icon = if super::control_state::snapshot().wifi.unwrap_or(false) { Icon::Wifi } else { Icon::WifiOff };
             draw_icon(hdc, slots[0], wifi_icon, glyph_color);
             let vol_icon = volume_icon(get_mute().unwrap_or(false), get_volume_percent().unwrap_or(0));
             draw_icon(hdc, slots[1], vol_icon, glyph_color);
-            let (pct, charging) = battery_status().unwrap_or((100, false));
-            draw_icon(hdc, slots[2], battery_icon(pct, charging), glyph_color);
+            if let Some((pct, charging)) = battery_status() {
+                draw_icon(hdc, slots[2], battery_icon(pct, charging), glyph_color);
+            } else {
+                draw_text_in(hdc, slots[2], "AC", format);
+            }
 
             let settings_rect = settings_button_rect(pill, dpi, bar_h);
             if hovered_region == Some(BarRegion::SettingsGear) {
@@ -381,12 +403,17 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
             }
             draw_text_in(hdc, session_rect, SESSION_GLYPH, format);
 
-            if super::tray::overflow_available() {
+            {
                 let chevron = tray_chevron_rect(session_rect, dpi, bar_h);
                 if hovered_region == Some(BarRegion::TrayChevron) {
                     draw_hover_highlight(hdc, chevron, scaled(6, dpi));
                 }
                 draw_text_in(hdc, chevron, TRAY_CHEVRON_GLYPH, format);
+                for index in 0..super::tray_icons::count() {
+                    let rect = tray_icon_rect(chevron, dpi, index);
+                    if hovered_region == Some(BarRegion::TrayIcon(index)) { draw_hover_highlight(hdc, rect, scaled(4, dpi)); }
+                    super::tray_icons::paint(hdc, index, rect);
+                }
             }
         }
 
@@ -438,6 +465,7 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
         Some(BarRegion::QsPill) => toggle_quick_settings(),
         Some(BarRegion::SettingsGear) => open_settings_app(),
         Some(BarRegion::SessionButton) => super::session_menu::show(hwnd),
+        Some(BarRegion::TrayIcon(index)) => super::tray_icons::invoke(index, false),
         Some(BarRegion::TrayChevron) => {
             // Host the real Windows overflow window under the chevron. Needs
             // the chevron's screen rect and this bar's monitor span, which
@@ -457,7 +485,8 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
                     right: bar_left + chevron.right,
                     bottom: bar_bottom,
                 };
-                super::tray::toggle_overflow(screen, bar_left, bar_right);
+                if super::tray::overflow_available() { super::tray::toggle_overflow(screen, bar_left, bar_right); }
+                else { super::tray_icons::invoke_overflow(); }
             }
         }
         None => {}
@@ -516,6 +545,19 @@ pub(crate) fn on_bar_hover(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
         .with(|s| s.borrow().as_ref().and_then(|st| st.workspaces.get(monitor)).map(|t| t.workspace_ids().len()))
         .unwrap_or(0);
     let region = region_at(x, dpi, bar_width, bar_h, is_primary, workspace_count);
+
+    let tip = match region {
+        Some(BarRegion::Activities) => "Activities (Windows key)".into(),
+        Some(BarRegion::Dots) => "Workspaces (Ctrl + Alt + Left / Right)".into(),
+        Some(BarRegion::Clock) => "Open calendar".into(),
+        Some(BarRegion::QsPill) => format!("Control center\nVolume: {}%{}", get_volume_percent().unwrap_or(0), if get_mute() == Some(true) { " (muted)" } else { "" }),
+        Some(BarRegion::SettingsGear) => "GroveShell settings".into(),
+        Some(BarRegion::SessionButton) => "Power and session".into(),
+        Some(BarRegion::TrayChevron) => "Show hidden notification icons".into(),
+        Some(BarRegion::TrayIcon(index)) => super::tray_icons::name(index),
+        None => String::new(),
+    };
+    super::tooltips::update(hwnd, &tip);
 
     let changed = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();

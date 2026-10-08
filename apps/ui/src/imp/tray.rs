@@ -20,11 +20,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// Windows builds, newest-interesting first. `NotifyIconOverflowWindow` is
 /// the long-standing classic-tray class; the XAML-island classes appear on
 /// newer Windows 11 shells.
-fn overflow_class_candidates() -> [PCWSTR; 3] {
+fn overflow_class_candidates() -> [PCWSTR; 2] {
     [
         windows::core::w!("NotifyIconOverflowWindow"),
         windows::core::w!("TopLevelWindowForOverflowXamlIsland"),
-        windows::core::w!("XamlExplorerHostIslandWindow"),
     ]
 }
 

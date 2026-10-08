@@ -19,12 +19,15 @@ mod overview;
 mod overview_gpu;
 mod pending_launch;
 mod quick_settings;
+mod control_state;
 mod radios;
 mod session_menu;
 mod state;
 mod taskbar;
 mod theme;
 mod tray;
+mod tray_icons;
+mod tooltips;
 mod util;
 mod wifi;
 mod workspaces;
@@ -279,6 +282,7 @@ pub fn main() -> Result<()> {
         // it (and give apps its reserved strip back), remembering the
         // pre-existing work areas to restore at clean shutdown.
         ORIGINAL_WORK_AREAS.with(|w| *w.borrow_mut() = monitors.iter().map(|m| m.work).collect());
+        tray_icons::prepare();
         set_windows_taskbar_visible(false);
         claim_work_areas(&monitors);
 
@@ -818,6 +822,10 @@ unsafe extern "system" fn wndproc(
             }
         }
         WM_RBUTTONDOWN => {
+            if let Role::Bar { is_primary: true, .. } = &role {
+                bar::on_tray_context(hwnd, lparam.0 as u16 as i16 as i32);
+                return LRESULT(0);
+            }
             tracing::info!(role = ?role, "wndproc: WM_RBUTTONDOWN");
             if let Role::Overview { monitor } = role {
                 let x = (lparam.0 & 0xFFFF) as i32;
@@ -845,8 +853,9 @@ unsafe extern "system" fn wndproc(
                     }
                 }
                 Role::QuickSettings => {
-                    let x = (lparam.0 & 0xFFFF) as i32;
-                    on_quick_settings_mouse_move(hwnd, x);
+                    let x = (lparam.0 as u16 as i16) as i32;
+                    let y = ((lparam.0 >> 16) as u16 as i16) as i32;
+                    on_quick_settings_mouse_move(hwnd, x, y);
                 }
                 Role::Bar { is_primary, monitor } => {
                     let x = (lparam.0 & 0xFFFF) as i32;
@@ -870,12 +879,18 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_MOUSELEAVE => {
+            if role == Role::QuickSettings { quick_settings::mouse_leave(hwnd); }
             if let Role::Bar { .. } = role {
                 on_bar_mouse_leave(hwnd);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_MOUSEWHEEL if role == Role::QuickSettings => {
+            quick_settings::scroll_networks(hwnd, if (wparam.0 >> 16) as u16 as i16 > 0 { -1 } else { 1 });
+            LRESULT(0)
+        }
         WM_CAPTURECHANGED => {
+            if role == Role::QuickSettings { on_quick_settings_mouse_up(); }
             // Mouse capture moved to some other window (or none) without
             // this one seeing the matching `WM_LBUTTONUP` first — see
             // `on_overview_capture_lost`'s doc comment for why an
@@ -964,6 +979,9 @@ unsafe extern "system" fn wndproc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
+            if role == Role::QuickSettings && quick_settings::on_key(hwnd, wparam.0 as u32) {
+                return LRESULT(0);
+            }
             if wparam.0 == VK_ESCAPE.0 as usize {
                 match role {
                     Role::Overview { monitor } => {
@@ -1136,6 +1154,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_TIMER => {
             match wparam.0 {
+                quick_settings::QS_TIMER_ID if role == Role::QuickSettings => quick_settings::tick(hwnd),
                 ANIM_TIMER_ID => {
                     if let Role::Overview { monitor } = role {
                         on_animation_tick(&monitor);
@@ -1150,6 +1169,9 @@ unsafe extern "system" fn wndproc(
                     with_dock_detached(hwnd, |dock| dock.tick());
                 }
                 CLOCK_TIMER_ID => {
+                    tray_icons::refresh();
+                    control_state::poll();
+                    control_state::request(control_state::Action::Refresh);
                     let primary =
                         STATE.with(|s| s.borrow().as_ref().map(|st| st.primary_bar_hwnd));
                     if let Some(primary) = primary {
@@ -1176,6 +1198,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_DESTROY => {
             if let Role::Bar { is_primary, .. } = role {
+                tooltips::destroy(hwnd);
                 unregister_appbar(hwnd);
                 if is_primary {
                     uninstall_win_event_hooks();

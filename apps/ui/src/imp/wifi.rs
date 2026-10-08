@@ -6,13 +6,100 @@
 use windows::core::GUID;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::NetworkManagement::WiFi::{
-    WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory, WlanOpenHandle, WlanQueryInterface,
-    WlanSetInterface, WLAN_INTERFACE_INFO_LIST, wlan_intf_opcode_radio_state, WLAN_OPCODE_VALUE_TYPE,
-    WLAN_PHY_RADIO_STATE, WLAN_RADIO_STATE,
+    wlan_intf_opcode_radio_state, WlanCloseHandle, WlanEnumInterfaces, WlanFreeMemory,
+    WlanOpenHandle, WlanQueryInterface, WlanSetInterface, WLAN_INTERFACE_INFO_LIST,
+    WLAN_OPCODE_VALUE_TYPE, WLAN_PHY_RADIO_STATE, WLAN_RADIO_STATE,
 };
 
 const DOT11_RADIO_STATE_ON: u32 = 1;
 const DOT11_RADIO_STATE_OFF: u32 = 2;
+
+#[derive(Clone, Debug)]
+pub(crate) struct Network {
+    pub name: String,
+    pub profile: String,
+    pub signal: u32,
+    pub secured: bool,
+    pub connected: bool,
+    pub connectable: bool,
+}
+
+/// Copy the variable-length WLAN allocation while its handle is live.
+pub(crate) fn available_networks() -> Result<Vec<Network>, u32> {
+    with_first_interface(|handle, guid| unsafe {
+        use windows::Win32::NetworkManagement::WiFi::*;
+        let mut list = std::ptr::null_mut();
+        let status = WlanGetAvailableNetworkList(handle, guid, 0, None, &mut list);
+        if status != 0 || list.is_null() {
+            return Some(Err(if status == 0 { 1 } else { status }));
+        }
+        // SAFETY: WLAN owns a contiguous array with dwNumberOfItems entries;
+        // all strings/flags are copied before WlanFreeMemory below.
+        let entries =
+            std::slice::from_raw_parts((*list).Network.as_ptr(), (*list).dwNumberOfItems as usize);
+        let mut networks: Vec<Network> = entries
+            .iter()
+            .map(|n| Network {
+                name: String::from_utf8_lossy(
+                    &n.dot11Ssid.ucSSID[..(n.dot11Ssid.uSSIDLength as usize).min(32)],
+                )
+                .into_owned(),
+                profile: String::from_utf16_lossy(
+                    &n.strProfileName
+                        [..n.strProfileName.iter().position(|c| *c == 0).unwrap_or(256)],
+                ),
+                signal: n.wlanSignalQuality.min(100),
+                secured: n.bSecurityEnabled.as_bool(),
+                connected: n.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED != 0,
+                connectable: n.bNetworkConnectable.as_bool(),
+            })
+            .collect();
+        WlanFreeMemory(list as *const _);
+        networks.sort_by(|a, b| {
+            b.connected
+                .cmp(&a.connected)
+                .then(a.name.cmp(&b.name))
+                .then(b.profile.cmp(&a.profile))
+        });
+        networks.dedup_by(|a, b| a.name == b.name && a.secured == b.secured);
+        Some(Ok(networks))
+    })
+    .unwrap_or(Err(1062))
+}
+
+pub(crate) fn scan() {
+    with_first_interface(|handle, guid| {
+        // SAFETY: live interface and client handle; optional parameters are null.
+        unsafe {
+            windows::Win32::NetworkManagement::WiFi::WlanScan(handle, guid, None, None, None);
+        }
+        Some(())
+    });
+}
+
+pub(crate) fn connect_saved(profile: &str) -> u32 {
+    with_first_interface(|handle, guid| {
+        use windows::Win32::NetworkManagement::WiFi::*;
+        let profile = windows::core::HSTRING::from(profile);
+        let params = WLAN_CONNECTION_PARAMETERS {
+            wlanConnectionMode: wlan_connection_mode_profile,
+            strProfile: windows::core::PCWSTR(profile.as_ptr()),
+            dot11BssType: dot11_BSS_type_infrastructure,
+            ..Default::default()
+        };
+        // SAFETY: profile, parameters and handle remain live for the call.
+        Some(unsafe { WlanConnect(handle, guid, &params, None) })
+    })
+    .unwrap_or(1062)
+}
+
+pub(crate) fn disconnect() -> u32 {
+    with_first_interface(|handle, guid| {
+        // SAFETY: the helper owns the live WLAN handle and interface GUID.
+        Some(unsafe { windows::Win32::NetworkManagement::WiFi::WlanDisconnect(handle, guid, None) })
+    })
+    .unwrap_or(1062)
+}
 
 /// Opens a fresh WLAN handle and hands the first available interface's
 /// GUID to `f`, same "reacquire every call" tradeoff as the volume
@@ -103,7 +190,11 @@ pub(crate) fn set_wifi_radio_on(on: bool) {
     with_first_interface(|handle, guid| {
         let mut state = WLAN_PHY_RADIO_STATE {
             dot11SoftwareRadioState: windows::Win32::NetworkManagement::WiFi::DOT11_RADIO_STATE(
-                if on { DOT11_RADIO_STATE_ON } else { DOT11_RADIO_STATE_OFF } as i32,
+                if on {
+                    DOT11_RADIO_STATE_ON
+                } else {
+                    DOT11_RADIO_STATE_OFF
+                } as i32,
             ),
             ..Default::default()
         };

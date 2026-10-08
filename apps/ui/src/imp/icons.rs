@@ -100,26 +100,39 @@ pub(crate) fn battery_icon(percent: u8, charging: bool) -> Icon {
     }
 }
 
+struct CachedBitmap {
+    bitmap: isize,
+    _stream: IStream,
+}
+
+impl Drop for CachedBitmap {
+    fn drop(&mut self) {
+        // SAFETY: the bitmap belongs to this cache entry; its backing
+        // stream remains alive until after this Drop implementation.
+        unsafe { let _ = windows::Win32::Graphics::GdiPlus::GdipDisposeImage(self.bitmap as *mut GpImage); }
+    }
+}
+
 thread_local! {
     /// Decoded once per icon, kept for the process lifetime — same
     /// tradeoff as `WALLPAPER_BITMAP`/the dock's pinned-icon cache
     /// elsewhere in this codebase (a handful of small bitmaps, never
     /// worth tearing down).
-    static CACHE: RefCell<HashMap<Icon, isize>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<Icon, CachedBitmap>> = RefCell::new(HashMap::new());
 }
 
 /// Decodes `icon`'s embedded PNG bytes into a `GpBitmap` via an
 /// in-memory `IStream` (there's no `GdipCreateBitmapFromFile` for bytes
 /// that were never a real file). Cached after the first call.
 fn bitmap_for(icon: Icon) -> Option<*mut GpBitmap> {
-    if let Some(existing) = CACHE.with(|c| c.borrow().get(&icon).copied()) {
+    if let Some(existing) = CACHE.with(|c| c.borrow().get(&icon).map(|entry| entry.bitmap)) {
         return Some(existing as *mut GpBitmap);
     }
     let bytes = icon.bytes();
     // SAFETY: `SHCreateMemStream` copies `bytes` into its own
     // heap-owned buffer, so the stream is valid independent of this
-    // function's stack frame; `GdipCreateBitmapFromStream` reads the
-    // whole stream synchronously before returning.
+    // function's stack frame. GDI+ can decode lazily, so the stream must
+    // remain alive for the lifetime of the cached bitmap.
     unsafe {
         let stream: IStream = SHCreateMemStream(Some(bytes))?;
         let mut bitmap: *mut GpBitmap = std::ptr::null_mut();
@@ -127,7 +140,7 @@ fn bitmap_for(icon: Icon) -> Option<*mut GpBitmap> {
         if status.0 != 0 || bitmap.is_null() {
             return None;
         }
-        CACHE.with(|c| c.borrow_mut().insert(icon, bitmap as isize));
+        CACHE.with(|c| c.borrow_mut().insert(icon, CachedBitmap { bitmap: bitmap as isize, _stream: stream }));
         Some(bitmap)
     }
 }
