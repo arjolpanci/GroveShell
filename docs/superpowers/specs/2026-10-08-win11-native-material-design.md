@@ -1,7 +1,8 @@
 # Windows 11 Native Material — Mica, System Theme, Fluent Typography
 
 **Date:** 2026-10-08
-**Status:** Approved design — not an implementation guarantee.
+**Status:** Implemented. Revised against what the implementation proved —
+see §9 for the findings that contradicted this spec's own assumptions.
 **Supersedes:** the deferred items of
 `docs/superpowers/specs/2026-08-11-phase-4-shell-ui-design-language.md` §3
 ("subtle Mica-like translucency on bar + flyouts") and its plan's Task 3
@@ -39,9 +40,11 @@ fixable in place:
   branches only on `high_contrast`. `theme.rs` reads
   `AppsUseLightTheme` but only to *write* the system theme from the
   Quick Settings chip; it never feeds our own palette.
-- No system icon font or type ramp. `icons.rs` hand-draws geometry and
-  `bar.rs:57` uses a bare `U+2699` for the settings gear;
-  `util::bar_font` requests plain `Segoe UI`.
+- No system icon font or type ramp. `icons.rs` embeds bundled PNG assets
+  in a non-Windows (Lucide) drawing style — *not* hand-drawn geometry, as
+  an earlier draft of this spec claimed — and `bar.rs:57` uses a bare
+  `U+2699` for the settings gear; `util::bar_font` requests plain
+  `Segoe UI`.
 
 ADR-003 and ADR-004 are therefore unchanged. No new runtime dependency.
 
@@ -373,3 +376,67 @@ locks `groveshell-ui.exe`):
   leaves dark.
 - `DWMSBT_TABBEDWINDOW` (Mica Alt) as a bar option, once there is a real
   preference to express.
+
+
+## 9. Findings from the implementation
+
+Recorded because three of them contradict assumptions made above, and a
+later reader should not re-derive them.
+
+### 9.1 The backdrop material is not visible on GDI surfaces
+
+**Mica and Acrylic cannot show through a GDI-painted window.** GDI has no
+alpha channel, so every pixel it paints is opaque and DWM's material
+never reaches the screen.
+
+Tested directly rather than assumed: the bar's window class was
+re-registered with a null background brush so nothing would paint over
+the backdrop. The background stayed opaque and the text picked up black
+boxes from the uninitialized redirection surface. There is no arrangement
+of class brush and `WM_ERASEBKGND` that yields transparency here, because
+the double-buffered `BitBlt` path (Quick Settings) and the direct
+`BeginPaint` path (bar) both write opaque pixels.
+
+The `DWMWA_SYSTEMBACKDROP_TYPE` calls are kept: they cost nothing, they
+are correct, and they will start showing the moment a surface moves to
+Direct2D. But the visible wins from this pass are the DWM corners and
+shadow, the system theme, and the Fluent type and icons — not
+translucency. §1.2's follow-up port is what unlocks the material, which
+raises its value relative to how §8 first framed it.
+
+### 9.2 Round corners and the reveal both work as designed
+
+`DWMWCP_ROUND` applies cleanly to the un-layered flyouts, drawing an
+antialiased curve plus DWM's own hairline border and drop shadow —
+visibly better than the color-key corners it replaced. Verified by
+zooming into the rendered corner, not inferred from the call succeeding.
+
+The dropdown reveal works for both flyouts with no surface resizing, as
+§3.4 predicted: the window's height animates while content stays laid out
+against the fixed constants, and the window bounds clip the overflow.
+
+### 9.3 The bar could never have followed a theme
+
+Independent of this spec's goals, the bar's background came from its
+window class brush — a solid color fixed at `RegisterClass` time. No
+theme change could ever have restyled it. The light palette would have
+landed on every surface except the most visible one. The bar now paints
+its own background from `surface_base()`, which also replaces the
+class-brush erase as the thing that clears the previous hover highlight.
+
+### 9.4 Icon mapping is verified, not recalled
+
+Every codepoint was checked with `GetGlyphIndicesW` and then rendered and
+inspected. That second step caught real errors: `E75E` exists and sounds
+like "bluetooth off" but draws a device pill, and the battery run is
+`E850` (empty) through `E859` (full) with charging variants living
+separately at `E83E`/`E83F`. Segoe Fluent Icons has **no**
+bluetooth-disabled glyph, so that one `Icon` variant keeps its PNG and a
+test pins the exception so it cannot be "fixed" into a wrong glyph later.
+
+### 9.5 Not done
+
+- The `top_bar_blur` settings-app copy change described in §3.3.
+- Light-theme values are verified on the bar but not inspected across
+  every Quick Settings page and control state.
+- The light-theme preview fixture pass described in §7.
