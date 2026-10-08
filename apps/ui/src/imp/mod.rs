@@ -5,6 +5,7 @@
 mod bar;
 mod bar_gpu;
 mod calendar;
+mod canvas;
 mod design;
 mod desktop_dock;
 mod dock;
@@ -438,26 +439,51 @@ pub fn main() -> Result<()> {
         let qs_card_target_right = primary_bar_rect.right - scaled(QS_LABEL_MARGIN, primary_dpi);
         let qs_x = (qs_card_target_right + qs_margin - qs_width)
             .clamp(primary_bar_rect.left - qs_margin, (primary_bar_rect.right - qs_width).max(primary_bar_rect.left - qs_margin));
-        let quick_settings_hwnd = CreateWindowExW(
-            // Deliberately NOT layered: `WS_EX_LAYERED` blocks the
-            // Windows 11 backdrop material (spec §3.2). The color-key
-            // shaping and alpha fade it used to carry are replaced by
-            // DWM-drawn round corners and the dropdown reveal in §3.4,
-            // neither of which needs per-pixel alpha.
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            w!("GroveShellQuickSettings"),
-            w!("GroveShell Quick Settings"),
-            WS_POPUP,
-            qs_x,
-            primary_bar_rect.bottom,
-            qs_width,
-            qs_height,
-            None,
-            None,
-            hinstance,
-            None,
-        )
-        .map_err(Error::Windows)?;
+        // Deliberately NOT layered: `WS_EX_LAYERED` blocks the Windows 11
+        // backdrop material. The color-key shaping and alpha fade it used
+        // to carry are replaced by DWM-drawn round corners and the
+        // dropdown reveal, neither of which needs per-pixel alpha.
+        //
+        // `WS_EX_NOREDIRECTIONBITMAP` additionally drops the opaque GDI
+        // redirection bitmap so the Acrylic can reach the screen, and is
+        // gated on the GPU path then re-checked: without that bitmap GDI
+        // cannot paint the window at all, so a panel that failed to get a
+        // surface is rebuilt opaque rather than left invisible.
+        let qs_translucent = bar_gpu::available();
+        let make_qs = |translucent: bool| {
+            let ex = if translucent {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
+            } else {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+            };
+            CreateWindowExW(
+                ex,
+                w!("GroveShellQuickSettings"),
+                w!("GroveShell Quick Settings"),
+                WS_POPUP,
+                qs_x,
+                primary_bar_rect.bottom,
+                qs_width,
+                qs_height,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)
+        };
+        let mut quick_settings_hwnd = make_qs(qs_translucent)?;
+        let mut quick_settings_gpu = if qs_translucent {
+            gpu::create_surface(quick_settings_hwnd, qs_width, qs_height)
+        } else {
+            None
+        };
+        if qs_translucent && quick_settings_gpu.is_none() {
+            tracing::warn!("quick settings surface failed; rebuilding the window opaque");
+            let _ = DestroyWindow(quick_settings_hwnd);
+            quick_settings_hwnd = make_qs(false)?;
+            quick_settings_gpu = None;
+        }
         // Acrylic plus DWM-drawn round corners and shadow on both flyouts
         // (spec §3.1). No legacy fallback here: before this, flyouts had no
         // material at all, so an older Windows simply keeps the painted
@@ -509,6 +535,7 @@ pub fn main() -> Result<()> {
                 calendar_hwnd,
                 calendar_gpu,
                 quick_settings_hwnd,
+            quick_settings_gpu,
                 calendar_open: false,
                 quick_settings_open: false,
                 previous_foreground: HWND(std::ptr::null_mut()),
@@ -893,7 +920,23 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             Role::QuickSettings => {
-                paint_quick_settings(hwnd);
+                // Same `render_panel` either way; the surface decides
+                // whether it lands on the translucent Direct2D backend or
+                // the opaque GDI one.
+                let has_surface =
+                    STATE.with(|s| s.borrow().as_ref().is_some_and(|st| st.quick_settings_gpu.is_some()));
+                if has_surface {
+                    let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+                    // SAFETY: `hwnd` is the window handling WM_PAINT; the
+                    // paint must still be validated or Windows resends it.
+                    unsafe {
+                        let _ = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+                        let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+                    }
+                    quick_settings::paint_quick_settings_gpu(hwnd);
+                } else {
+                    paint_quick_settings(hwnd);
+                }
                 LRESULT(0)
             }
             Role::Dock => {

@@ -71,6 +71,10 @@ pub(crate) struct AppState {
     /// case, unchanged from before this feature existed.
     pub(crate) calendar_gpu: Option<GpuSurface>,
     pub(crate) quick_settings_hwnd: HWND,
+    /// Quick Settings' composition surface, when the GPU path is
+    /// available. `None` means the panel paints through the opaque GDI
+    /// backend — same `render_panel`, different `Canvas`.
+    pub(crate) quick_settings_gpu: Option<GpuSurface>,
     pub(crate) calendar_open: bool,
     pub(crate) quick_settings_open: bool,
     pub(crate) previous_foreground: HWND,
