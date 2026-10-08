@@ -43,7 +43,8 @@ anchoring, or reimplementing them. ADR-004 covers this.
 | Session menu | native `TrackPopupMenu` | system | Already native; untouched |
 
 Plus system light/dark theme following, Segoe Fluent Icons and the Segoe
-UI Variable type ramp, and the dropdown reveal on both flyouts.
+UI Variable type ramp, the dropdown reveal on both flyouts, live window
+previews in Activities, and the fly-out/fly-in animation.
 
 ## 3. Material
 
@@ -163,24 +164,32 @@ corners grow with it — the material never appears as an empty box waiting
 to be filled, which a translate-based slide would produce.
 `reduced_motion` collapses the reveal to an instant full-height show.
 
-## 6. Activities: tried and reverted
+## 6. Activities: live previews and the fly animation
 
-Live previews (`DwmRegisterThumbnail`) and a fly-out/fly-in animation
-between each window's real rect and its grid slot were built and then
-**reverted** (commit reverting `eee9d08` and `4646ef1`). Recorded because
-the reasons are properties of the APIs, not bugs:
+Previews were `PrintWindow` captures: a still taken when Activities
+opened, frozen while the real window carried on. `DwmRegisterThumbnail`
+composites the live contents of a source window into a rect of the
+overview instead (`thumbnails.rs`).
 
-- **DWM thumbnails cannot be clipped and always composite above the
-  destination window's own content.** They therefore covered the card
-  chrome the overview paints — rounded preview corners, shadow, border.
-  Live previews are only worth having if the chrome is drawn *into* the
-  same composition tree, above them.
-- **Interpolating a preview between its real window rect and its grid
-  slot stretches between two different aspect ratios**, which reads as a
-  window being resized oddly rather than moving. A fly animation needs to
-  letterbox or crop rather than stretch.
+Two constraints shape it:
 
-Neither was asked for; the actual ask was frame rate (§8).
+- **DWM draws thumbnails above the destination window's own content**,
+  with no z-ordering against what the overview paints and no way to clip
+  one to a rounded rect. The painted snapshot stays underneath as the base
+  layer, so nothing flashes empty if a thumbnail cannot be registered.
+  Previews therefore have square corners where the card chrome would
+  otherwise round them.
+- **A hidden source renders nothing.** Windows parked on another workspace
+  are hidden, so they keep their park-time capture; only on-screen windows
+  get a live preview, which is the set the user is looking at anyway.
+
+Opening Activities lifts each preview off the window's real on-screen rect
+and carries it into its grid slot; closing reverses it. Each `ThumbAnim`
+carries a `home` rect in overview-client coordinates, and paint
+interpolates between `home` and the grid slot on one eased "settled"
+value — 0 at the real window, 1 in the grid. A window with no real
+position (parked, minimized) does not fly. The same rects feed the
+thumbnails, so a real window lifts off itself and lands back on itself.
 
 ## 7. What the implementation disproved
 
