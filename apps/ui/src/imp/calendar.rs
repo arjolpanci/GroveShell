@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    SetForegroundWindow, ShowWindow, SW_HIDE, SW_SHOW,
+    SetForegroundWindow, SetTimer, ShowWindow, SW_HIDE, SW_SHOW,
 };
 
 use super::overview::close_overview;
@@ -300,6 +300,74 @@ pub(crate) fn paint_calendar(hwnd: HWND) {
 /// which is already becoming foreground on its own — forcing our
 /// stashed `previous_foreground` back at that moment would fight the
 /// click that just happened).
+/// Timer driving the dropdown reveal, at the same 16ms cadence Quick
+/// Settings uses.
+pub(crate) const CAL_TIMER_ID: usize = 72;
+
+thread_local! {
+    /// The calendar's open/close lifecycle. Shares `flyout::Flyout` with
+    /// Quick Settings so both flyouts unroll with one motion system
+    /// (spec §3.4/§6).
+    static MOTION: std::cell::RefCell<super::flyout::Flyout> =
+        std::cell::RefCell::new(super::flyout::Flyout::new());
+}
+
+/// Resizes the calendar to its current unroll height.
+///
+/// Like Quick Settings, the window's top stays pinned under the bar and
+/// only its height moves. The Direct2D surface is deliberately *not*
+/// resized — it is created once at `CAL_WIDTH x CAL_HEIGHT` and the
+/// window bounds clip the composition, so the content stays laid out
+/// against the fixed `CAL_HEIGHT` while the window grows over it.
+fn apply_reveal(hwnd: HWND, progress: f32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
+    };
+    // Deliberately unscaled: unlike Quick Settings, the calendar window is
+    // created at the raw `CAL_WIDTH`/`CAL_HEIGHT` and its Direct2D surface
+    // is sized to match, so scaling here would resize the window away from
+    // its own content.
+    let full = CAL_HEIGHT;
+    let width = CAL_WIDTH;
+    let height = MOTION.with(|m| m.borrow().reveal_extent(progress, full));
+    // SAFETY: `hwnd` is a live, process-lifetime window; a zero height is
+    // legal and the window is hidden once the phase reaches `Hidden`.
+    unsafe {
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            width,
+            height.max(0),
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// Advances the reveal one frame. Returns once the flyout has settled, so
+/// the caller can drop the timer and hide the window.
+pub(crate) fn tick(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, ShowWindow, SW_HIDE};
+    let progress = MOTION.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.is_animating() {
+            return None;
+        }
+        Some(m.tick(std::time::Instant::now()))
+    });
+    if let Some(p) = progress {
+        apply_reveal(hwnd, p);
+    }
+    if MOTION.with(|m| !m.borrow().is_visible()) {
+        // SAFETY: `hwnd` is a live, process-lifetime window.
+        unsafe {
+            let _ = KillTimer(hwnd, CAL_TIMER_ID);
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+}
+
 pub(crate) fn hide_calendar(restore_focus: bool) {
     let result = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
@@ -318,7 +386,11 @@ pub(crate) fn hide_calendar(restore_focus: bool) {
     // `GetForegroundWindow` and may have since closed, in which case
     // `SetForegroundWindow` documented-fails rather than misbehaving.
     unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
+        // Roll back up rather than vanishing; `tick` hides the window once
+        // the phase settles on `Hidden`. Under reduced motion the close is
+        // instant and the window is hidden on the next tick immediately.
+        MOTION.with(|m| m.borrow_mut().close());
+        SetTimer(hwnd, CAL_TIMER_ID, 16, None);
         if restore_focus && !previous.0.is_null() {
             let _ = SetForegroundWindow(previous);
         }
@@ -366,6 +438,9 @@ pub(crate) fn toggle_calendar() {
         if !super::gpu::is_enabled() {
             let _ = InvalidateRect(hwnd, None, true);
         }
+        MOTION.with(|m| m.borrow_mut().open());
+        apply_reveal(hwnd, 0.0);
+        SetTimer(hwnd, CAL_TIMER_ID, 16, None);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetFocus(hwnd);
