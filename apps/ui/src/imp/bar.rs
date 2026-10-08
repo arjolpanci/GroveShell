@@ -4,7 +4,8 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, Ellipse, FillRect, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC, DeleteObject,
+    Ellipse, FillRect, RoundRect, SelectObject, SetBkMode, SetTextColor, SRCCOPY,
     BeginPaint, EndPaint, PAINTSTRUCT, TRANSPARENT, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
     GetStockObject, NULL_PEN,
 };
@@ -303,7 +304,22 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
     // local that outlives the paired `BeginPaint`/`EndPaint` call.
     unsafe {
         let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
+        let window_dc = BeginPaint(hwnd, &mut ps);
+
+        // Paint into a back buffer, never straight to the window. The
+        // clock timer invalidates this bar once a second, and the first
+        // thing the paint does is fill the whole background; drawing that
+        // directly to the window makes the fill visible as a flash before
+        // the icons land on top of it — a flicker once a second, worst on
+        // the status-pill icons, which is exactly what the `bErase: false`
+        // at the clock-timer call site in `mod.rs` exists to avoid. Quick
+        // Settings already buffers this way for the same reason.
+        let mut client = RECT::default();
+        let _ = windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut client);
+        let buffer = CreateCompatibleDC(window_dc);
+        let buffer_bitmap = CreateCompatibleBitmap(window_dc, client.right, client.bottom);
+        let previous_bitmap = SelectObject(buffer, buffer_bitmap);
+        let hdc = buffer;
 
         let dpi = GetDpiForWindow(hwnd).max(96);
         let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
@@ -469,6 +485,23 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
 
         SelectObject(hdc, previous_font);
         let _ = DeleteObject(font);
+        // One blit of the finished frame; nothing partially drawn is ever
+        // on screen.
+        let _ = BitBlt(
+            window_dc,
+            0,
+            0,
+            client.right,
+            client.bottom,
+            buffer,
+            0,
+            0,
+            SRCCOPY,
+        );
+        SelectObject(buffer, previous_bitmap);
+        let _ = DeleteObject(buffer_bitmap);
+        let _ = DeleteDC(buffer);
+
         let _ = EndPaint(hwnd, &ps);
     }
 }
