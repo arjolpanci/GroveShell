@@ -47,6 +47,38 @@ pub(crate) enum Icon {
     Moon,
 }
 
+/// The Segoe Fluent Icons codepoint for an icon, or `None` when the font
+/// has no suitable glyph and the bundled PNG should be used instead.
+///
+/// Every codepoint here was verified against the installed font rather
+/// than taken from a table: each candidate was selected into a DC and
+/// checked with `GetGlyphIndicesW` for existence, then *rendered and
+/// looked at* to confirm it means what its name suggests. That second
+/// step matters — `E75E` exists and sounds plausible for "bluetooth off"
+/// but draws a device pill, and the battery run turned out to be `E850`
+/// (empty) through `E859` (full) with the charging variants living
+/// separately at `E83E`/`E83F`.
+pub(crate) fn fluent_glyph(icon: Icon) -> Option<&'static str> {
+    Some(match icon {
+        Icon::Wifi => "\u{E701}",
+        Icon::WifiOff => "\u{EB5E}",
+        Icon::Volume2 => "\u{E767}",
+        Icon::Volume1 => "\u{E993}",
+        Icon::VolumeX => "\u{E74F}",
+        Icon::Bluetooth => "\u{E702}",
+        // Segoe Fluent has no "bluetooth disabled" glyph; keep the PNG.
+        Icon::BluetoothOff => return None,
+        Icon::Plane => "\u{E709}",
+        Icon::BatteryFull => "\u{E83F}",
+        Icon::BatteryMedium => "\u{E855}",
+        Icon::BatteryLow => "\u{E852}",
+        Icon::BatteryWarning => "\u{E996}",
+        Icon::BatteryCharging => "\u{E83E}",
+        Icon::Sun => "\u{E706}",
+        Icon::Moon => "\u{E708}",
+    })
+}
+
 impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
@@ -153,6 +185,17 @@ fn bitmap_for(icon: Icon) -> Option<*mut GpBitmap> {
 /// SAFETY: `hdc` must be a valid device context currently being painted
 /// into.
 pub(crate) unsafe fn draw_icon(hdc: HDC, rect: RECT, icon: Icon, color: COLORREF) {
+    // Prefer the system icon font: it is what every other Windows 11
+    // surface draws, and it scales as an outline instead of stretching a
+    // fixed-size bitmap. The bundled PNGs stay as the fallback for
+    // pre-Windows-11 machines and for the one state Fluent has no glyph
+    // for (see `fluent_glyph`).
+    if super::design::typography::icon_font_available() {
+        if let Some(glyph) = fluent_glyph(icon) {
+            draw_glyph(hdc, rect, glyph, color);
+            return;
+        }
+    }
     let Some(bitmap) = bitmap_for(icon) else {
         return;
     };
@@ -206,4 +249,116 @@ pub(crate) unsafe fn draw_icon(hdc: HDC, rect: RECT, icon: Icon, color: COLORREF
         let _ = GdipDeleteGraphics(graphics);
     }
     let _ = GdipDisposeImageAttributes(attributes);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [Icon; 15] = [
+        Icon::Wifi, Icon::WifiOff, Icon::Volume2, Icon::Volume1, Icon::VolumeX,
+        Icon::Bluetooth, Icon::BluetoothOff, Icon::Plane, Icon::BatteryFull,
+        Icon::BatteryMedium, Icon::BatteryLow, Icon::BatteryWarning,
+        Icon::BatteryCharging, Icon::Sun, Icon::Moon,
+    ];
+
+    #[test]
+    fn every_icon_but_bluetooth_off_has_a_fluent_glyph() {
+        // Segoe Fluent Icons has no "bluetooth disabled" glyph — verified
+        // by rendering the candidates (E703/E704/E75B turned out to be a
+        // device pair, a broadcast tower, and a card). That one variant
+        // keeps its PNG.
+        for icon in ALL {
+            let glyph = fluent_glyph(icon);
+            if icon == Icon::BluetoothOff {
+                assert!(glyph.is_none(), "BluetoothOff should fall back to its PNG");
+            } else {
+                assert!(glyph.is_some(), "missing Fluent glyph for an icon");
+            }
+        }
+    }
+
+    #[test]
+    fn fluent_glyphs_are_single_chars_in_the_private_use_area() {
+        // A multi-char or out-of-range entry would render as tofu or as
+        // literal text in the bar, so pin both properties.
+        for icon in ALL {
+            let Some(glyph) = fluent_glyph(icon) else { continue };
+            let mut chars = glyph.chars();
+            let c = chars.next().expect("glyph must not be empty");
+            assert!(chars.next().is_none(), "glyph must be exactly one char");
+            assert!(
+                ('\u{E700}'..='\u{F8FF}').contains(&c),
+                "glyph outside the Segoe Fluent private use area"
+            );
+        }
+    }
+
+    #[test]
+    fn battery_glyphs_rise_with_charge_level() {
+        // The battery run is contiguous (E850 empty -> E859 full), so a
+        // transposed mapping would silently show a full battery at 5%.
+        let level = |icon| fluent_glyph(icon).unwrap().chars().next().unwrap() as u32;
+        assert!(level(Icon::BatteryLow) < level(Icon::BatteryMedium));
+    }
+}
+
+/// Draws one Segoe Fluent Icons glyph centered in `rect`, sized to the
+/// rect's height so it matches whatever the PNG path would have drawn.
+///
+/// SAFETY: `hdc` must be a valid device context the caller is painting
+/// into; the font and text state are restored before returning.
+unsafe fn draw_glyph(hdc: HDC, rect: RECT, glyph: &str, color: COLORREF) {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Graphics::Gdi::{
+        CreateFontW, DeleteObject, SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
+        CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DrawTextW, OUT_DEFAULT_PRECIS,
+        DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
+    };
+
+    let face = HSTRING::from(super::design::typography::ICON_FACE);
+    let size = (rect.bottom - rect.top).max(1);
+    let font = CreateFontW(
+        -size,
+        0,
+        0,
+        0,
+        400,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET.0.into(),
+        OUT_DEFAULT_PRECIS.0.into(),
+        CLIP_DEFAULT_PRECIS.0.into(),
+        CLEARTYPE_QUALITY.0.into(),
+        DEFAULT_PITCH.0.into(),
+        PCWSTR(face.as_ptr()),
+    );
+    let previous_font = SelectObject(hdc, font);
+    let previous_mode = SetBkMode(hdc, TRANSPARENT);
+    let previous_color = SetTextColor(hdc, color);
+
+    let mut wide: Vec<u16> = glyph.encode_utf16().collect();
+    let mut r = rect;
+    DrawTextW(hdc, &mut wide, &mut r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+    SetTextColor(hdc, previous_color);
+    SetBkMode(hdc, windows::Win32::Graphics::Gdi::BACKGROUND_MODE(previous_mode as u32));
+    SelectObject(hdc, previous_font);
+    let _ = DeleteObject(font);
+}
+
+/// Draws a bare Segoe Fluent Icons codepoint into `rect`, for the bar's
+/// chrome glyphs (settings, session) that have no `Icon` variant or PNG
+/// behind them. Returns `false` when the icon font is unavailable, so the
+/// caller can draw its pre-Windows-11 text fallback instead.
+///
+/// SAFETY: `hdc` must be a valid device context the caller is painting
+/// into; see [`draw_glyph`].
+pub(crate) unsafe fn draw_fluent_glyph(hdc: HDC, rect: RECT, glyph: &str, color: COLORREF) -> bool {
+    if !super::design::typography::icon_font_available() {
+        return false;
+    }
+    draw_glyph(hdc, rect, glyph, color);
+    true
 }
