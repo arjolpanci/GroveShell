@@ -41,9 +41,12 @@ pub(crate) fn bar_font(dpi: u32) -> HFONT {
 /// SAFETY: `hdc` must be a valid device context obtained from
 /// `BeginPaint` on the window currently handling `WM_PAINT`.
 pub(crate) unsafe fn draw_text_in(hdc: HDC, rect: RECT, text: &str, format: DRAW_TEXT_FORMAT) {
+    // An empty Vec has a dangling non-null pointer. Some DrawText paths
+    // inspect the first character even with a zero character count.
+    if text.is_empty() { return; }
     let mut wide: Vec<u16> = text.encode_utf16().collect();
     let mut r = rect;
-    DrawTextW(hdc, &mut wide, &mut r, format);
+    DrawTextW(hdc, &mut wide, &mut r, format | windows::Win32::Graphics::Gdi::DT_NOPREFIX);
 }
 
 pub(crate) fn ease_out(t: f64) -> f64 {

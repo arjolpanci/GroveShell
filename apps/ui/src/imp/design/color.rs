@@ -76,7 +76,18 @@ pub(crate) fn accent() -> u32 {
 
 /// Text drawn on top of an [`accent`] fill.
 pub(crate) fn accent_text() -> u32 {
-    if hc() { rgb(0x0000_0000) } else { rgb(0x00FF_FFFF) }
+    contrasting_text(accent())
+}
+
+fn contrasting_text(background: u32) -> u32 {
+    let linear = |channel: u32| {
+        let c = channel as f64 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let luminance = 0.2126 * linear(background & 255)
+        + 0.7152 * linear((background >> 8) & 255)
+        + 0.0722 * linear((background >> 16) & 255);
+    if luminance > 0.179 { rgb(0x0000_0000) } else { rgb(0x00FF_FFFF) }
 }
 
 /// Re-reads the Windows accent color from the DWM registry key and updates
@@ -121,6 +132,13 @@ fn read_dwm_dword(value_name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accent_foreground_stays_legible_on_light_and_dark_accents() {
+        assert_eq!(contrasting_text(accent_fallback()), rgb(0));
+        assert_eq!(contrasting_text(rgb(0xFFFFFF)), rgb(0));
+        assert_eq!(contrasting_text(rgb(0x102060)), rgb(0xFFFFFF));
+    }
 
     #[test]
     fn rgb_swaps_red_and_blue_to_colorref() {

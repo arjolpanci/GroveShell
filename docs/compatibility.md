@@ -80,6 +80,24 @@ hardware. The mechanism (eligibility + ignore rules) is the stable part.
 running them in a real multi-monitor / assistive-technology session and
 recording the outcomes here.
 
+## Control center and notification area (Phase 4 polish, 2026-09-08)
+
+- Split-button layout and hit testing verified at 100%, 125%, 150%, 200%,
+  and 250% DPI. Home and options pages rendered and inspected at multiple scales.
+- Wi-Fi lists visible networks from the first WLAN interface. Saved profiles
+  connect in-panel; new credentials and enterprise setup open Windows. Access
+  denied (including location restrictions) keeps Windows network controls reachable.
+- Explorer's Windows 11 XAML tray was inspected on a real desktop. Visible
+  taskbar capture works (including the Rust capture smoke test); hidden taskbar capture is black. Inline tray icons
+  therefore use startup snapshots and retained automation elements. Live
+  badge changes/new icons while hidden are not yet supported.
+- Native app invocation/context menus, Bluetooth pairing, password entry,
+  mixed-monitor hotplug and Narrator remain interactive acceptance checks.
+- Run `cargo test -p groveshell-ui render_control_center_previews -- --ignored`
+  to export GDI preview fixtures under `target/`. See
+  [ADR-009](adr/0009-control-center-and-tray-integration.md) for the integration
+  decision and tray diagnostic commands.
+
 ## Privacy
 
 - `privacy.redact_window_titles` (default **on**) replaces window titles with
