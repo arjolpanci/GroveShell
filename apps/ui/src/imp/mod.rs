@@ -26,7 +26,6 @@ mod radios;
 mod session_menu;
 mod state;
 mod taskbar;
-mod thumbnails;
 mod theme;
 mod tray;
 mod tray_icons;
