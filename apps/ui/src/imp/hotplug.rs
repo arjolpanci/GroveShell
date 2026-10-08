@@ -10,8 +10,8 @@ use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, InvalidateRect, SetWindowRgn, RGN_OR,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, MoveWindow, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DestroyWindow, MoveWindow, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use groveshell_common::{Error, Result};
@@ -141,7 +141,9 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
         // `WS_EX_LAYERED` set, so this style is omitted whenever the GPU
         // path is available (it fades via compositor opacity instead).
         let overview_ex_style = if super::gpu::is_enabled() {
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+            // Matches the startup site: no redirection bitmap, or the
+            // composition tree's content never reaches the screen.
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
         } else {
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED
         };
