@@ -68,11 +68,23 @@ fn paint_calendar_content(ctx: &windows::Win32::Graphics::Direct2D::ID2D1DeviceC
     // painted automatically before GDI's `paint_calendar` ran. Once this
     // surface owns the window's visual content, nothing else provides
     // that background any more, so it has to be drawn explicitly here.
-    super::gpu::fill_rect(
-        ctx,
-        D2D_RECT_F { left: 0.0, top: 0.0, right: CAL_WIDTH as f32, bottom: CAL_HEIGHT as f32 },
-        super::design::color::surface_raised(),
-    );
+    // EXPERIMENT: clear to alpha 0, then tint at 70% to see whether the
+    // DComp premultiplied-alpha surface actually composites translucently.
+    // On the translucent path the card is *not* painted at all: clearing
+    // to alpha 0 is what lets the DWM Acrylic backdrop — with its own blur
+    // and tint — be the flyout's background, which is how Windows' own
+    // flyouts are built. Painting a card here would cover the material.
+    //
+    // On the GDI-fallback path there is no material to reveal, so the card
+    // is filled as before; clearing alone would render a black rectangle.
+    super::gpu::clear_transparent(ctx);
+    if !super::state::calendar_translucent() {
+        super::gpu::fill_rect(
+            ctx,
+            D2D_RECT_F { left: 0.0, top: 0.0, right: CAL_WIDTH as f32, bottom: CAL_HEIGHT as f32 },
+            super::design::color::surface_raised(),
+        );
+    }
 
     // SAFETY: plain query, no preconditions.
     let now = unsafe { GetLocalTime() };
