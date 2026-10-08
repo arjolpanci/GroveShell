@@ -1340,7 +1340,7 @@ pub(crate) fn hide_quick_settings(restore_focus: bool) {
             i.motion.is_animating()
         });
         if animating {
-            SetTimer(hwnd, QS_TIMER_ID, 16, None);
+            SetTimer(hwnd, QS_TIMER_ID, super::design::motion::FRAME_INTERVAL_MS, None);
         } else {
             let _ = KillTimer(hwnd, QS_TIMER_ID);
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -1398,7 +1398,7 @@ pub(crate) fn toggle_quick_settings() {
         // (spec §3.4). With reduced motion the flyout is already `Open`,
         // so this is the full height immediately.
         apply_reveal(hwnd, 0.0);
-        SetTimer(hwnd, QS_TIMER_ID, 16, None);
+        SetTimer(hwnd, QS_TIMER_ID, super::design::motion::FRAME_INTERVAL_MS, None);
         let _ = InvalidateRect(hwnd, None, true);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);

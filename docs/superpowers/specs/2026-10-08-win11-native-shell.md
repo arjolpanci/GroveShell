@@ -235,8 +235,19 @@ translucency had failed entirely.
 
 ## 8. Known gaps
 
-- **Activities renders on GDI, at roughly 15 FPS.** Two separate defects
-  sit under this. The first is fixed: every `GpuSurface` created its own
+- **Activities frame rate: doubled, and the cause was not the renderer.**
+  Measured rather than assumed: painting the overview costs **9.0ms**, but
+  the gap between animation ticks was **30.6ms**. Every animation timer in
+  the shell asked for 16ms, and `SetTimer` cannot beat the ~15.6ms system
+  granularity, so a 16ms request rounded up to two ticks — 31.2ms, ~32 FPS,
+  with the painter idle two thirds of every frame. One shared
+  `motion::FRAME_INTERVAL_MS = 15` lands on a single tick: 15.59ms
+  measured, 64 FPS, nothing about the drawing changed. This applies to the
+  dock wave and the flyout reveals too, which ran at the same 32 FPS.
+  The Direct2D renderer would not have fixed this.
+- **The overview still renders through GDI.** Two further defects sit
+  under that, and it is now a rendering-quality question rather than a
+  frame-rate one. The first is fixed: every `GpuSurface` created its own
   `IDCompositionTarget`, and a window can hold only one, so the
   overview's second surface always failed with
   `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` and the whole renderer
