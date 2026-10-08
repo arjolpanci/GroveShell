@@ -3,6 +3,7 @@
 //! comment in `main.rs` for the overall shell design.
 
 mod bar;
+mod bar_gpu;
 mod calendar;
 mod design;
 mod desktop_dock;
@@ -224,21 +225,15 @@ pub fn main() -> Result<()> {
         for monitor in &monitors {
             let width = monitor.rect.right - monitor.rect.left;
             let bar_height = scaled(config.appearance.top_bar_height as i32, monitor.dpi);
-            let bar_hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                w!("GroveShellBar"),
-                w!("GroveShell Top Bar"),
-                WS_POPUP | WS_VISIBLE,
+            let (bar_hwnd, bar_gpu) = bar_gpu::create_bar_window(
+                hinstance,
                 monitor.rect.left,
                 monitor.rect.top,
                 width,
                 bar_height,
-                None,
-                None,
-                hinstance,
-                None,
             )
             .map_err(Error::Windows)?;
+            let bar_gpu_is_none = bar_gpu.is_none();
 
             // Register this bar as a top-edge AppBar (the same
             // mechanism the Windows taskbar uses) so it reserves its
@@ -269,17 +264,17 @@ pub fn main() -> Result<()> {
             let _ = DeleteObject(top_square);
             SetWindowRgn(bar_hwnd, region, true);
 
-            // Mica, with the legacy blur-behind as the pre-22621 fallback
-            // (spec §3.1/§3.3). The rounded window region set just above
-            // still supplies the bar's rounded *bottom* corners, which is
-            // why the bar asks DWM not to round it — DWM would round all
-            // four and notch the screen's top corners.
-            if !design::material::apply(bar_hwnd, design::material::Surface::Bar) {
+            // The backdrop is applied by `create_bar_window`. The legacy
+            // blur-behind stays only as the pre-22621 fallback, and only
+            // for a bar that never got a composition surface — with one,
+            // the Direct2D painter plus Mica supersede it entirely.
+            if bar_gpu_is_none {
                 set_blur_behind(bar_hwnd, config.appearance.top_bar_blur);
             }
 
             bars.push(BarWindow {
                 hwnd: bar_hwnd,
+                gpu: bar_gpu,
                 rect: bar_rect,
                 is_primary: monitor.is_primary,
                 monitor: monitor.device_name.clone(),
@@ -389,7 +384,7 @@ pub fn main() -> Result<()> {
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW
             }
         };
-        let mut make_calendar = |translucent: bool| unsafe {
+        let make_calendar = |translucent: bool| {
             CreateWindowExW(
                 calendar_ex_style(translucent),
                 w!("GroveShellCalendar"),
@@ -864,7 +859,29 @@ unsafe extern "system" fn wndproc(
     match msg {
         WM_PAINT => match role {
             Role::Bar { is_primary, monitor } => {
-                paint_bar(hwnd, is_primary, &monitor);
+                // A bar with a composition surface paints through
+                // `bar_gpu`, which can be translucent over Mica; one
+                // without falls back to the opaque GDI painter. The paint
+                // still has to be validated either way, or Windows would
+                // keep resending WM_PAINT forever.
+                let has_surface = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|st| st.bars.iter().find(|b| b.hwnd == hwnd))
+                        .is_some_and(|b| b.gpu.is_some())
+                });
+                if has_surface {
+                    let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+                    // SAFETY: `hwnd` is the window currently handling
+                    // WM_PAINT; `ps` outlives the paired calls.
+                    unsafe {
+                        let _ = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+                        let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+                    }
+                    bar_gpu::paint(hwnd, is_primary, &monitor);
+                } else {
+                    paint_bar(hwnd, is_primary, &monitor);
+                }
                 LRESULT(0)
             }
             Role::Overview { monitor } => {

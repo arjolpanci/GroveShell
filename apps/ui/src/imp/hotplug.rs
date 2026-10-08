@@ -10,8 +10,8 @@ use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, CreateRoundRectRgn, DeleteObject, InvalidateRect, SetWindowRgn, RGN_OR,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, MoveWindow, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, MoveWindow, WS_EX_LAYERED, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_POPUP,
 };
 
 use groveshell_common::{Error, Result};
@@ -110,19 +110,15 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
         // monitor's bar the wrong height whenever the user had changed the
         // Top Bar settings page's height slider from its default.
         let bar_height = scaled(super::state::bar_height_config(), monitor.dpi);
-        let bar_hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            w!("GroveShellBar"),
-            w!("GroveShell Top Bar"),
-            WS_POPUP | WS_VISIBLE,
+        // Same creation path as startup, so a hotplugged monitor's bar
+        // gets the composition surface and backdrop too rather than
+        // silently falling back to the opaque GDI painter.
+        let (bar_hwnd, bar_gpu) = super::bar_gpu::create_bar_window(
+            hinstance,
             monitor.rect.left,
             monitor.rect.top,
             width,
             bar_height,
-            None,
-            None,
-            hinstance,
-            None,
         )
         .map_err(Error::Windows)?;
 
@@ -180,6 +176,7 @@ fn add_monitor(hinstance: HINSTANCE, monitor: &super::monitors::MonitorInfo) -> 
             if let Some(state) = s.borrow_mut().as_mut() {
                 state.bars.push(BarWindow {
                     hwnd: bar_hwnd,
+                    gpu: bar_gpu,
                     rect: bar_rect,
                     is_primary: monitor.is_primary,
                     monitor: monitor.device_name.clone(),
