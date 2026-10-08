@@ -290,14 +290,29 @@ pub(crate) fn draw_text(
     size: f32,
     center_horizontally: bool,
 ) {
+    draw_text_in_font(ctx, rect, text, colorref, size, center_horizontally, "Segoe UI");
+}
+
+/// [`draw_text`] with an explicit font family — the bar needs the Windows
+/// 11 UI face and the Segoe Fluent Icons face, not just the default.
+pub(crate) fn draw_text_in_font(
+    ctx: &ID2D1DeviceContext,
+    rect: D2D_RECT_F,
+    text: &str,
+    colorref: u32,
+    size: f32,
+    center_horizontally: bool,
+    family: &str,
+) {
     GPU.with(|g| {
         let g = g.borrow();
         let Some(gpu_ctx) = g.as_ref() else { return };
         // SAFETY: same as `fill_rect`; `gpu_ctx.dwrite_factory` is the
         // process-wide factory from `init`, alive for the process's life.
         unsafe {
+            let family_wide = windows::core::HSTRING::from(family);
             let Ok(format) = gpu_ctx.dwrite_factory.CreateTextFormat(
-                windows::core::w!("Segoe UI"),
+                windows::core::PCWSTR(family_wide.as_ptr()),
                 None,
                 DWRITE_FONT_WEIGHT_NORMAL,
                 DWRITE_FONT_STYLE_NORMAL,
@@ -441,6 +456,48 @@ pub(crate) fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, ra
 /// window rect, not just the panel. Painting a translucent fill in the
 /// right shape is the alternative — it is see-through, though without
 /// DWM's blur, which only the system backdrop can provide.
+/// An `ID2D1Bitmap` from a tightly packed 32-bit BGRA buffer — the shape
+/// the captured tray-icon pixels are already in, so the bar's D2D path can
+/// draw them without a detour through an `HBITMAP`.
+pub(crate) fn bitmap_from_bgra(
+    ctx: &ID2D1DeviceContext,
+    pixels: &[u8],
+    size: i32,
+) -> Option<ID2D1Bitmap> {
+    let size = size.max(1);
+    let stride = (size as u32).checked_mul(4)?;
+    if pixels.len() < (stride as usize) * (size as usize) {
+        return None;
+    }
+    use windows::Win32::Graphics::Direct2D::Common::{
+        D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_PIXEL_FORMAT, D2D_SIZE_U,
+    };
+    use windows::Win32::Graphics::Direct2D::D2D1_BITMAP_PROPERTIES1;
+
+    let props = D2D1_BITMAP_PROPERTIES1 {
+        pixelFormat: D2D1_PIXEL_FORMAT {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+        },
+        dpiX: 96.0,
+        dpiY: 96.0,
+        ..Default::default()
+    };
+    // SAFETY: `pixels` is at least `stride * size` bytes, which is what
+    // `CreateBitmap` reads for the given size and stride; the data is
+    // copied into the bitmap, so the borrow ends with this call.
+    unsafe {
+        ctx.CreateBitmap(
+            D2D_SIZE_U { width: size as u32, height: size as u32 },
+            Some(pixels.as_ptr() as *const std::ffi::c_void),
+            stride,
+            &props,
+        )
+        .ok()
+        .and_then(|b| b.cast::<ID2D1Bitmap>().ok())
+    }
+}
+
 pub(crate) fn fill_rounded_rect_alpha(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
