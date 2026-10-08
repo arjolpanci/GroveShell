@@ -79,6 +79,7 @@ const OVERVIEW_GPU_ENABLED: bool = false;
 /// without a redirection bitmap cannot be painted by GDI *at all*. Set
 /// one without the other and the overview is invisible rather than merely
 /// slow — which is exactly what happened when this flag went in.
+#[allow(dead_code, reason = "the window style deliberately keys off gpu::is_enabled instead; kept as the single place that answers this question")]
 pub(crate) fn enabled() -> bool {
     OVERVIEW_GPU_ENABLED && super::gpu::is_enabled()
 }
