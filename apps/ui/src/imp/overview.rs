@@ -554,6 +554,22 @@ pub(crate) fn displayed_rect(base: RECT, page: usize, offset: f64, pitch: i32, c
     }
 }
 
+/// How far below its resting place the overview dock sits at `settle`.
+///
+/// `settle` is 1.0 once the dock has arrived and 0.0 when it is parked at
+/// the monitor's bottom edge, where the desktop dock lives — so the dock
+/// slides up into the overview and back down on close rather than
+/// appearing and vanishing on the spot.
+///
+/// Pure, so the travel is testable without a monitor: `bar_top` is the
+/// dock bar's resting top in overview-client coordinates, `monitor_bottom`
+/// the overview's height.
+pub(crate) fn dock_slide_offset(settle: f64, bar_top: i32, monitor_bottom: i32) -> i32 {
+    let settle = settle.clamp(0.0, 1.0);
+    let travel = (monitor_bottom - bar_top).max(0);
+    ((travel as f64) * (1.0 - settle)).round() as i32
+}
+
 /// Scales `r` about `(anchor_x, anchor_y)` by `s` — the open/close
 /// zoom transform, applied on top of `displayed_rect` at paint time
 /// only (input never round-trips, so no drift).
@@ -2297,6 +2313,38 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
         // base `dock_slots` are what got hit-tested and where the running
         // dots stay pinned. Each icon carries both.
         let dock_draw_slots = super::dock::wave_slots(&dock_slots, ov.dock_cursor_x, 1.0);
+
+        // The dock flies in and out with the windows: it slides up from
+        // the monitor's bottom edge — where the desktop dock sits — into
+        // its overview position, and back down on close, instead of
+        // appearing and vanishing on the spot.
+        //
+        // Deliberately measured against the screen edge rather than the
+        // desktop dock's own window: that keeps the two dock
+        // implementations uncoupled, works the same when `dock_mode` is
+        // `"overview"` and there is no desktop dock at all, and lands in
+        // the same place either way because a desktop dock seats flush at
+        // that edge.
+        //
+        // Only the *drawn* rects move. The base slots keep hit-testing
+        // where the dock comes to rest, exactly as they already do for the
+        // magnification wave.
+        let dock_settle = match &ov.mode {
+            OverviewMode::Opening { started, .. } => ease_out(progress(*started)),
+            OverviewMode::Closing { started, .. } => 1.0 - ease_out(progress(*started)),
+            _ => 1.0,
+        };
+        let monitor_bottom = super::monitors::monitors_sorted_by_x()
+            .iter()
+            .find(|m| m.device_name == monitor)
+            .map(|m| m.rect.bottom - m.rect.top)
+            .unwrap_or(dock_bar_rect.bottom);
+        let dock_dy = dock_slide_offset(dock_settle, dock_bar_rect.top, monitor_bottom);
+        let slide = |r: RECT| RECT { top: r.top + dock_dy, bottom: r.bottom + dock_dy, ..r };
+        let dock_bar_rect = slide(dock_bar_rect);
+        let dock_divider = dock_divider.map(slide);
+        let dock_slots: Vec<RECT> = dock_slots.into_iter().map(slide).collect();
+        let dock_draw_slots: Vec<RECT> = dock_draw_slots.into_iter().map(slide).collect();
         let dock_icons: Vec<(RECT, RECT, HICON, usize)> = ov
             .dock_apps
             .iter()
@@ -3459,5 +3507,41 @@ pub(crate) fn on_animation_tick(monitor: &str) {
     // thumbnail does directly.
     if let Some(hwnd) = carousel_close_after {
         close_overview(monitor, Some(hwnd));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_slide_parks_at_the_screen_edge_and_arrives_at_rest() {
+        // Resting bar top 1200 on a 1440-tall monitor: fully settled it
+        // sits where it belongs; fully unsettled it is pushed the whole
+        // way down to the bottom edge, where the desktop dock is.
+        assert_eq!(dock_slide_offset(1.0, 1200, 1440), 0);
+        assert_eq!(dock_slide_offset(0.0, 1200, 1440), 240);
+    }
+
+    #[test]
+    fn dock_slide_is_monotonic() {
+        let mut previous = i32::MAX;
+        for step in 0..=10 {
+            let offset = dock_slide_offset(step as f64 / 10.0, 1200, 1440);
+            assert!(offset <= previous, "dock slid backwards at step {step}");
+            previous = offset;
+        }
+    }
+
+    #[test]
+    fn dock_slide_clamps_out_of_range_progress() {
+        assert_eq!(dock_slide_offset(-1.0, 1200, 1440), 240);
+        assert_eq!(dock_slide_offset(2.0, 1200, 1440), 0);
+    }
+
+    #[test]
+    fn dock_slide_never_lifts_a_dock_that_already_sits_below_the_edge() {
+        // Degenerate geometry must not push the dock *up* off the screen.
+        assert_eq!(dock_slide_offset(0.0, 1500, 1440), 0);
     }
 }
