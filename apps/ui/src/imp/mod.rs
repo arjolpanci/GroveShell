@@ -167,7 +167,7 @@ pub fn main() -> Result<()> {
         let hinstance = GetModuleHandleW(None).map_err(Error::Windows)?;
         let hinstance = windows::Win32::Foundation::HINSTANCE(hinstance.0);
 
-        register_class(hinstance, w!("GroveShellBar"), Some(wndproc), 0x00202020)?;
+        register_class(hinstance, w!("GroveShellBar"), Some(wndproc), NULL_BRUSH_SENTINEL)?;
         register_class(
             hinstance,
             w!("GroveShellOverview"),

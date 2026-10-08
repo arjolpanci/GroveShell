@@ -4,7 +4,7 @@
 
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, Ellipse, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    CreateSolidBrush, DeleteObject, Ellipse, FillRect, RoundRect, SelectObject, SetBkMode, SetTextColor,
     BeginPaint, EndPaint, PAINTSTRUCT, TRANSPARENT, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
     GetStockObject, NULL_PEN,
 };
@@ -294,6 +294,22 @@ pub(crate) fn paint_bar(hwnd: HWND, is_primary: bool, monitor: &str) {
                 })
             })
             .unwrap_or(0);
+
+        // The bar paints its own background rather than leaning on the
+        // window class's brush, which was a solid color fixed at
+        // registration time and so could never follow a live theme
+        // change. Filling here also replaces the class-brush erase as the
+        // thing that clears the previous frame's hover highlight, which is
+        // why the class is now registered with a null brush.
+        //
+        // This fill is also why the Mica backdrop set in
+        // `design::material` is not visible on the bar: GDI has no alpha
+        // channel, so every painted pixel is opaque and DWM's material
+        // never shows through. Verified live. Making the material visible
+        // needs the Direct2D port tracked as a follow-up in the spec.
+        let background = CreateSolidBrush(COLORREF(super::design::color::surface_base()));
+        FillRect(hdc, &RECT { left: 0, top: 0, right: bar_width, bottom: bar_h }, background);
+        let _ = DeleteObject(background);
 
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, COLORREF(super::design::color::text()));
