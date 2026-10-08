@@ -99,17 +99,46 @@ Both uses are removed:
 
 - Corner shaping → `DWMWCP_ROUND` (§3.1). Strictly better: DWM
   antialiases, GDI's color key does not.
-- The fade → **dropped.** Quick Settings appears and dismisses
-  instantly, exactly as it already does when `reduced_motion` is on.
+- The fade → **replaced by a dropdown reveal** (§3.4). No opacity
+  animation is needed, so nothing is lost.
 
 `WS_EX_LAYERED` comes off the creation flags, all three
 `SetLayeredWindowAttributes` call sites go, and `QS_COLOR_KEY` and the
 magenta-key painting it drove are deleted.
 
-This is an accepted, deliberate regression of one animation in exchange
-for the system material, real corners, and the system shadow. The
-restoration path is the D2D port in §8, where opacity comes from D2D
-and Mica composites underneath.
+### 3.4 Dropdown reveal
+
+Both flyouts open by unrolling downward from the bar's bottom edge: the
+window's **top stays pinned** and its **height animates** `0 → full`
+over `motion::BASE_MS`, eased by the existing `ease_out_cubic`. Closing
+runs it in reverse. One `SetWindowPos` per frame on the existing 16ms
+timer; no per-pixel alpha, so `WS_EX_LAYERED` is not needed and the
+backdrop composites normally.
+
+The key property that makes this nearly free: **content is laid out
+against fixed height constants, not the client rect.** Quick Settings
+derives positions from `QS_HEIGHT` (`quick_settings.rs:115`,
+`card_bottom = margin + scaled(QS_HEIGHT, dpi)`); the calendar from
+`CAL_HEIGHT` (`calendar.rs:22`, `:73`). So content stays put while the
+window grows over it, and the overflow is clipped:
+
+- **Quick Settings (GDI):** already double-buffers through a compatible
+  DC sized from `GetClientRect` (`quick_settings.rs:255`–`266`). During
+  the reveal that back buffer is simply shorter, so painting content at
+  full-height coordinates clips for free. The paint code is unchanged.
+- **Calendar (Direct2D/DirectComposition):** its `GpuSurface` is created
+  once at `CAL_WIDTH, CAL_HEIGHT` (`mod.rs:379`) and **is not resized** —
+  `gpu.rs` has no resize entry point and does not need one. The window
+  bounds clip the composition. The surface staying larger than the
+  window is fine and intentional.
+
+Because the window grows with the content, the backdrop and the
+DWM-drawn round corners grow with it too — the material never appears as
+an empty box waiting to be filled, which is what a translate-based slide
+or a full-size-then-clip approach would produce.
+
+`reduced_motion` collapses the reveal to an instant full-height show, via
+the same `effective_ms` → 0 path every other transition already uses.
 
 ### 3.3 Fallback
 
@@ -208,7 +237,7 @@ Note this **changes the bar's text size**: `bar_font` is 12px today, and
 `BODY_PX` is 14px, which is what Windows itself uses for body text. That
 is the intended correction, but `bar.rs`'s own header comment warns every
 96-DPI constant in that file was tuned against the original bar height, so
-larger text can overflow tuned layouts. Smoke step 6 covers it; if a
+larger text can overflow tuned layouts. Smoke step 7 covers it; if a
 layout breaks, the bar keeps `CAPTION_PX` and only the flyouts move to
 `BODY_PX`, rather than retuning the whole bar in this pass.
 
@@ -254,13 +283,20 @@ Calendar and Quick Settings replace their ad-hoc show/hide with
 visibility and dismissal; `is_animating()` drives the existing 16ms
 timer.
 
-After §3.2 neither window has layered alpha, so `scale_opacity`'s
-**opacity term is unused on these two surfaces**. The scale term stays
-available for the D2D surfaces in §8. `scale_opacity` itself is not
-changed or narrowed — it remains correct for its eventual consumers —
-but the `#![allow(dead_code)]` comes off the module, and if any
-individual item is still genuinely unconsumed it gets a targeted
-`#[allow]` with a reason rather than a module-wide blanket.
+The reveal in §3.4 is driven by `tick()`'s eased progress directly, so
+`flyout.rs` gains one small method:
+
+```rust
+/// The window height to show at eased progress `p` for a flyout that
+/// unrolls to `full`. Hidden is 0; Open is `full`.
+pub(crate) fn reveal_extent(&self, p: f32, full: i32) -> i32
+```
+
+`scale_opacity` is **not** changed or narrowed — it stays correct for the
+scale-and-fade surfaces that come later — but neither of its terms is
+used by these two flyouts now. The `#![allow(dead_code)]` comes off the
+module; anything still genuinely unconsumed gets a targeted `#[allow]`
+with a stated reason rather than a module-wide blanket.
 
 The shared lifecycle also replaces Quick Settings' own
 `INTERACTION.motion` bookkeeping, so there is one flyout state machine
@@ -280,6 +316,9 @@ rather than two.
   resolves to the hand-drawn path for every `Icon` variant — so no icon
   can silently render as a missing-glyph box.
 - Backdrop failure maps to the `set_blur_behind` fallback.
+- `reveal_extent`: 0 at `p=0`, `full` at `p=1`, monotonic between, and
+  never exceeding `full` or going negative for out-of-range `p` (matching
+  how the easing functions already clamp).
 - Existing `flyout.rs` phase tests continue to pass unchanged; they are
   the regression net for §6.
 
@@ -295,12 +334,17 @@ locks `groveshell-ui.exe`):
 
 1. Bar shows Mica over a busy wallpaper; text stays legible.
 2. Flyouts show Acrylic with DWM-drawn round corners and shadow.
-3. Quick Settings opens/dismisses instantly with no magenta fringe —
+3. Both flyouts unroll downward from the bar edge and roll back up on
+   dismiss, with the backdrop and round corners growing with the window
+   rather than popping in at full size. No tearing or flicker from the
+   per-frame resize, and no stuck half-open frame if dismissed mid-open.
+   `reduced_motion` shows them instantly at full height.
+4. Quick Settings opens/dismisses with no magenta fringe —
    the color-key regression to watch for.
-4. Flipping Windows' Dark mode toggle restyles bar and flyouts live,
+5. Flipping Windows' Dark mode toggle restyles bar and flyouts live,
    without restart, including via the Quick Settings theme chip.
-5. `high_contrast: true` still overrides both themes.
-6. 100% / 150% / 200% DPI: glyphs and type scale with the bar-height
+6. `high_contrast: true` still overrides both themes.
+7. 100% / 150% / 200% DPI: glyphs and type scale with the bar-height
    slider, per `bar.rs`'s `bar_content_scale` note. Specifically confirm
    the 14px body (§5.1) still fits the default 32px bar without clipping
    the status pill or the clock.
@@ -310,8 +354,9 @@ locks `groveshell-ui.exe`):
 | Risk | Mitigation |
 |---|---|
 | Mica hurts contrast over busy wallpaper | Solid backing plate behind text, per Phase 4 §8. Verified in smoke step 1. |
-| Un-layering QS leaves magenta color-key artifacts | Delete the key and its paint together, not separately. Smoke step 3 targets exactly this. |
-| Losing the QS fade feels abrupt | Accepted trade (§3.2). DWM's own flyout shadow softens the appearance. Restored by the §8 D2D port. |
+| Un-layering QS leaves magenta color-key artifacts | Delete the key and its paint together, not separately. Smoke step 4 targets exactly this. |
+| Per-frame `SetWindowPos` during the reveal tears or flickers | 16ms on the existing timer, the same cadence the fade already ran at; content is double-buffered (QS) or DComp-composed (calendar), so neither repaints unbuffered. Smoke step 3 is the gate. If the calendar tears, it falls back to `IDCompositionVisual::SetClip` via the existing `gpu::visual()` accessor, with the window kept at full size. |
+| Backdrop may not composite under a DComp-rendered window (calendar) | **Unverified by code reading** — Mica shows through where window content is transparent, and `gpu::clear_transparent` exists, but the DWM/DComp interaction needs a live check. First thing to confirm in smoke step 2. If it does not composite, the calendar keeps a solid `surface_raised` card and only the bar and QS take the material; §4.2's token values make that degradation coherent rather than broken. |
 | Backdrop unsupported on older Win11/Win10 | `HRESULT` failure drives the `set_blur_behind` fallback; no version gate. |
 | Fluent Icons / Segoe UI Variable absent | One-time probe, hand-drawn and `Segoe UI` fallbacks retained and unit-tested. |
 | Wrong glyph codepoints | Verified against the installed font before use, never from memory (§5.2). |
@@ -320,8 +365,10 @@ locks `groveshell-ui.exe`):
 **Follow-ups, explicitly not in this spec:**
 
 - Port `bar.rs` / `quick_settings.rs` / `session_menu.rs` to Direct2D on
-  the existing `GpuSurface`. Restores the QS fade and gives antialiased
-  geometry at fractional DPI. The natural successor to this pass.
+  the existing `GpuSurface`, for antialiased geometry at fractional DPI.
+  No longer needed to recover any animation — §3.4's reveal supersedes
+  the fade — so this is now a pure rendering-quality follow-up, and
+  correspondingly lower priority than when it was a regression fix.
 - A light-theme pass over the overview and desktop dock, which this spec
   leaves dark.
 - `DWMSBT_TABBEDWINDOW` (Mica Alt) as a bar option, once there is a real
