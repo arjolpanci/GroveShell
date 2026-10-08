@@ -369,22 +369,61 @@ pub fn main() -> Result<()> {
         let primary_bar_width = primary_bar_rect.right - primary_bar_rect.left;
         let calendar_x = (primary_bar_rect.left + primary_bar_width / 2 - CAL_WIDTH / 2)
             .clamp(primary_bar_rect.left, (primary_bar_rect.right - CAL_WIDTH).max(primary_bar_rect.left));
-        let calendar_hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-            w!("GroveShellCalendar"),
-            w!("GroveShell Calendar"),
-            WS_POPUP,
-            calendar_x,
-            primary_bar_rect.bottom,
-            CAL_WIDTH,
-            CAL_HEIGHT,
-            None,
-            None,
-            hinstance,
-            None,
-        )
-        .map_err(Error::Windows)?;
-        let calendar_gpu = gpu::create_surface(calendar_hwnd, CAL_WIDTH, CAL_HEIGHT);
+        // `WS_EX_NOREDIRECTIONBITMAP` drops the window's opaque GDI
+        // redirection surface, which is what lets DirectComposition content
+        // composite to the desktop with its alpha intact and the DWM
+        // Acrylic backdrop show through (spec §9.1). Without it the
+        // redirection bitmap is painted over the material and the window
+        // is opaque no matter what the backdrop attribute says.
+        //
+        // It is only safe on the GPU path: a window with no redirection
+        // bitmap cannot be painted by GDI at all, so if DirectComposition
+        // is unavailable the window would be invisible rather than merely
+        // un-translucent. The style is therefore gated on `gpu::is_enabled`,
+        // and the per-window surface is verified below.
+        let mut calendar_translucent = gpu::is_enabled();
+        let calendar_ex_style = |translucent: bool| {
+            if translucent {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
+            } else {
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW
+            }
+        };
+        let mut make_calendar = |translucent: bool| unsafe {
+            CreateWindowExW(
+                calendar_ex_style(translucent),
+                w!("GroveShellCalendar"),
+                w!("GroveShell Calendar"),
+                WS_POPUP,
+                calendar_x,
+                primary_bar_rect.bottom,
+                CAL_WIDTH,
+                CAL_HEIGHT,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+            .map_err(Error::Windows)
+        };
+        let mut calendar_hwnd = make_calendar(calendar_translucent)?;
+        let mut calendar_gpu = gpu::create_surface(calendar_hwnd, CAL_WIDTH, CAL_HEIGHT);
+
+        // The process-wide GPU check above can still be followed by a
+        // per-window failure (the overview has hit
+        // `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` since 2026-07-30).
+        // Without a redirection bitmap that would leave an invisible
+        // calendar, so rebuild the window opaque and take the GDI path.
+        if calendar_translucent && calendar_gpu.is_none() {
+            tracing::warn!(
+                "calendar DirectComposition surface failed; rebuilding the window                  opaque so it stays visible on the GDI path"
+            );
+            let _ = DestroyWindow(calendar_hwnd);
+            calendar_translucent = false;
+            calendar_hwnd = make_calendar(false)?;
+            calendar_gpu = gpu::create_surface(calendar_hwnd, CAL_WIDTH, CAL_HEIGHT);
+        }
+        state::set_calendar_translucent(calendar_translucent);
 
         // Quick Settings flyout, right-aligned under the primary bar's
         // right label. Unlike the bar itself, `QS_WIDTH`/`QS_HEIGHT` are
