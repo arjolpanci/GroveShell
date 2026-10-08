@@ -10,5 +10,6 @@
 #![allow(dead_code)]
 
 pub(crate) mod color;
+pub(crate) mod material;
 pub(crate) mod metrics;
 pub(crate) mod motion;
