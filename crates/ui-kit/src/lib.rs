@@ -6,8 +6,10 @@
 //! time it had its own palette it drifted into something that matched
 //! neither Windows nor the shell.
 
+pub mod canvas;
 pub mod design;
 pub mod glyph;
+pub mod gpu;
 pub mod icons;
 pub mod runtime;
 pub mod text;

@@ -5,7 +5,6 @@
 mod bar;
 mod bar_gpu;
 mod calendar;
-mod canvas;
 /// The design tokens live in the shared kit now (`apps/settings` draws
 /// from the same ones). Re-exported under the name every module in this
 /// binary already calls them by, so `super::design::color::text()` keeps
@@ -15,7 +14,7 @@ mod desktop_dock;
 mod dock;
 mod dock_pins;
 mod flyout;
-mod gpu;
+pub(crate) use groveshell_ui_kit::{canvas, gpu};
 mod hotplug;
 pub(crate) use groveshell_ui_kit::icons;
 mod monitors;

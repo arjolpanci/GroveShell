@@ -26,13 +26,13 @@
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT;
 
-use super::icons::Icon;
+use crate::icons::Icon;
 
 /// The drawing operations the shell's panels actually use.
 ///
 /// Deliberately small: this is the set the panels need, not a general 2D
 /// API. Anything added here has to be implementable on both backends.
-pub(crate) trait Canvas {
+pub trait Canvas {
     /// Sets the color later `text`, `icon` and `glyph` calls draw in.
     fn set_text_color(&mut self, color: COLORREF);
 
@@ -76,7 +76,7 @@ pub(crate) trait Canvas {
 // ---------------------------------------------------------------------
 
 /// Draws onto a GDI device context. Opaque by construction.
-pub(crate) struct GdiCanvas {
+pub struct GdiCanvas {
     hdc: windows::Win32::Graphics::Gdi::HDC,
     dpi: u32,
     color: u32,
@@ -86,10 +86,10 @@ pub(crate) struct GdiCanvas {
 impl GdiCanvas {
     /// SAFETY: `hdc` must be a valid device context for as long as this
     /// canvas is used.
-    pub(crate) unsafe fn new(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) -> Self {
+    pub unsafe fn new(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) -> Self {
         use windows::Win32::Graphics::Gdi::{SetBkMode, TRANSPARENT};
         SetBkMode(hdc, TRANSPARENT);
-        Self { hdc, dpi, color: 0, font_px: super::design::typography::BODY_PX }
+        Self { hdc, dpi, color: 0, font_px: crate::design::typography::BODY_PX }
     }
 }
 
@@ -188,9 +188,9 @@ impl Canvas for GdiCanvas {
         // SAFETY: as `fill_rect`; the font is deselected and deleted.
         unsafe {
             SetTextColor(self.hdc, COLORREF(self.color));
-            let font = super::util::ui_font(self.font_px, self.dpi);
+            let font = crate::text::ui_font(self.font_px, self.dpi);
             let previous = SelectObject(self.hdc, font);
-            super::util::draw_text_in(self.hdc, rect, s, flags);
+            crate::text::draw_text_in(self.hdc, rect, s, flags);
             SelectObject(self.hdc, previous);
             let _ = DeleteObject(font);
         }
@@ -199,14 +199,14 @@ impl Canvas for GdiCanvas {
     fn icon_colored(&mut self, rect: RECT, icon: Icon, color: COLORREF) {
         // SAFETY: as `fill_rect`.
         unsafe {
-            super::icons::draw_icon(self.hdc, rect, icon, color);
+            crate::icons::draw_icon(self.hdc, rect, icon, color);
         }
     }
 
     fn glyph(&mut self, rect: RECT, glyph: &str) {
         // SAFETY: as `fill_rect`.
         unsafe {
-            super::icons::draw_fluent_glyph(self.hdc, rect, glyph, COLORREF(self.color));
+            crate::icons::draw_fluent_glyph(self.hdc, rect, glyph, COLORREF(self.color));
         }
     }
 }
@@ -218,7 +218,7 @@ impl Canvas for GdiCanvas {
 /// Draws onto a Direct2D device context backed by a DirectComposition
 /// surface, so anything not drawn stays transparent and whatever DWM
 /// material sits behind the window shows through.
-pub(crate) struct D2DCanvas<'a> {
+pub struct D2DCanvas<'a> {
     ctx: &'a windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
     dpi: u32,
     color: u32,
@@ -226,11 +226,11 @@ pub(crate) struct D2DCanvas<'a> {
 }
 
 impl<'a> D2DCanvas<'a> {
-    pub(crate) fn new(
+    pub fn new(
         ctx: &'a windows::Win32::Graphics::Direct2D::ID2D1DeviceContext,
         dpi: u32,
     ) -> Self {
-        Self { ctx, dpi, color: 0, font_px: super::design::typography::BODY_PX }
+        Self { ctx, dpi, color: 0, font_px: crate::design::typography::BODY_PX }
     }
 
     fn rect(r: RECT) -> windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F {
@@ -253,19 +253,19 @@ impl Canvas for D2DCanvas<'_> {
     }
 
     fn fill_rect(&mut self, rect: RECT, color: COLORREF) {
-        super::gpu::fill_rect(self.ctx, Self::rect(rect), color.0);
+        crate::gpu::fill_rect(self.ctx, Self::rect(rect), color.0);
     }
 
     fn fill_round_rect(&mut self, rect: RECT, radius: i32, color: COLORREF) {
-        super::gpu::fill_rounded_rect(self.ctx, Self::rect(rect), radius as f32, color.0);
+        crate::gpu::fill_rounded_rect(self.ctx, Self::rect(rect), radius as f32, color.0);
     }
 
     fn fill_round_rect_alpha(&mut self, rect: RECT, radius: i32, color: COLORREF, alpha: f32) {
-        super::gpu::fill_rounded_rect_alpha(self.ctx, Self::rect(rect), radius as f32, color.0, alpha);
+        crate::gpu::fill_rounded_rect_alpha(self.ctx, Self::rect(rect), radius as f32, color.0, alpha);
     }
 
     fn stroke_round_rect(&mut self, rect: RECT, radius: i32, color: COLORREF, width: f32) {
-        super::gpu::stroke_rounded_rect(
+        crate::gpu::stroke_rounded_rect(
             self.ctx,
             Self::rect(rect),
             radius as f32,
@@ -279,7 +279,7 @@ impl Canvas for D2DCanvas<'_> {
         // A circle is a rounded rect whose radius is half its shorter
         // side, so Direct2D needs no separate ellipse primitive.
         let radius = ((rect.right - rect.left).min(rect.bottom - rect.top) / 2).max(0);
-        super::gpu::fill_rounded_rect(self.ctx, Self::rect(rect), radius as f32, color.0);
+        crate::gpu::fill_rounded_rect(self.ctx, Self::rect(rect), radius as f32, color.0);
     }
 
     fn text(&mut self, rect: RECT, s: &str, flags: DRAW_TEXT_FORMAT) {
@@ -289,14 +289,14 @@ impl Canvas for D2DCanvas<'_> {
         // only exposes leading/centered; a right-aligned label is rare in
         // the panels and reads acceptably centered in its own rect.
         let centered = centered || (flags.0 & DT_RIGHT.0) != 0;
-        super::gpu::draw_text_in_font(
+        crate::gpu::draw_text_in_font(
             self.ctx,
             Self::rect(rect),
             s,
             self.color,
-            super::state::scaled(self.font_px, self.dpi) as f32,
+            crate::runtime::scaled(self.font_px, self.dpi) as f32,
             centered,
-            super::design::typography::resolved_ui_face(),
+            crate::design::typography::resolved_ui_face(),
         );
     }
 
@@ -306,7 +306,7 @@ impl Canvas for D2DCanvas<'_> {
         // face is present.
         let previous = self.color;
         self.color = color.0;
-        if let Some(g) = super::icons::fluent_glyph(icon) {
+        if let Some(g) = crate::icons::fluent_glyph(icon) {
             self.glyph(rect, g);
         }
         self.color = previous;
@@ -314,14 +314,14 @@ impl Canvas for D2DCanvas<'_> {
 
     fn glyph(&mut self, rect: RECT, glyph: &str) {
         let size = (rect.bottom - rect.top).max(1) as f32;
-        super::gpu::draw_text_in_font(
+        crate::gpu::draw_text_in_font(
             self.ctx,
             Self::rect(rect),
             glyph,
             self.color,
             size,
             true,
-            super::design::typography::ICON_FACE,
+            crate::design::typography::ICON_FACE,
         );
     }
 }
