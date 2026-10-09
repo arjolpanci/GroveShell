@@ -304,7 +304,3 @@ the plan that implements §3 and §8:
   implemented; the window uses the standard caption with a dark-mode
   tint plus a page-title band. Arguably more native — worth deciding
   explicitly rather than by omission.
-- Unexplained: `groveshell-settings` exited once during verification
-  with no panic on stderr and no shutdown log line. Twenty synchronous
-  `WM_MOUSEMOVE` messages and four consecutive resizes do not reproduce
-  it.
