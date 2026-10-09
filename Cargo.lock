@@ -462,6 +462,7 @@ dependencies = [
  "groveshell-common",
  "groveshell-config",
  "groveshell-ipc",
+ "groveshell-ui-kit",
  "ico",
  "image",
  "serde_json",

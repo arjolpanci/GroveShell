@@ -12,7 +12,7 @@
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER};
 
-use super::layout::{PageLayout, RowRects};
+use super::layout::{PageLayout, RowRects, ROW_PAD_X};
 use super::{Card, Control, Row, Severity};
 use crate::canvas::Canvas;
 use crate::design::{color, metrics, typography};
@@ -136,7 +136,7 @@ fn paint_row(
         }
     }
 
-    paint_control(canvas, row, shift(rects.control, scroll), dpi);
+    paint_control(canvas, row, shift(rects.control, scroll), r, dpi);
 
     if focused {
         // The system focus rectangle: a stroke just inside the row, in
@@ -145,7 +145,10 @@ fn paint_row(
     }
 }
 
-fn paint_control(canvas: &mut dyn Canvas, row: &Row, rect: RECT, dpi: u32) {
+/// `rect` is the control itself; `row_rect` is the whole row, used by
+/// the slider to place its value label beyond the track (see
+/// `layout::SLIDER_LABEL_WIDTH` for why the label is not inside `rect`).
+fn paint_control(canvas: &mut dyn Canvas, row: &Row, rect: RECT, row_rect: RECT, dpi: u32) {
     let enabled = row.enabled;
     match &row.control {
         Control::Toggle { on } => {
@@ -188,14 +191,16 @@ fn paint_control(canvas: &mut dyn Canvas, row: &Row, rect: RECT, dpi: u32) {
             );
         }
         Control::Slider { value, min, max, unit } => {
-            let label_width = scaled(48, dpi);
-            let track_rect = RECT { right: rect.right - label_width, ..rect };
+            // The track spans the whole control rect: that rect is what
+            // `input::hit_test` maps a click across, so a track drawn
+            // any narrower would put the thumb somewhere the cursor is
+            // not.
             let track_height = scaled(SLIDER_TRACK_HEIGHT, dpi);
             let middle = (rect.top + rect.bottom) / 2;
             let track = RECT {
-                left: track_rect.left,
+                left: rect.left,
                 top: middle - track_height / 2,
-                right: track_rect.right,
+                right: rect.right,
                 bottom: middle + track_height / 2,
             };
             canvas.fill_round_rect(track, track_height / 2, COLORREF(color::stroke()));
@@ -225,7 +230,7 @@ fn paint_control(canvas: &mut dyn Canvas, row: &Row, rect: RECT, dpi: u32) {
             canvas.set_text_color(COLORREF(color::text()));
             canvas.set_font_size(typography::BODY_PX);
             canvas.text(
-                RECT { left: track.right, ..rect },
+                RECT { left: track.right, right: row_rect.right - scaled(ROW_PAD_X, dpi), ..rect },
                 &format!("{}{}", value.round() as i32, unit),
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );

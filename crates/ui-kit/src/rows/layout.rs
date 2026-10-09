@@ -35,7 +35,7 @@ const CARD_GAP: i32 = 4;
 /// Extra gap before a card that introduces a new captioned group.
 const GROUP_GAP: i32 = 20;
 /// Padding from the card's edge to its content.
-const ROW_PAD_X: i32 = 16;
+pub(crate) const ROW_PAD_X: i32 = 16;
 /// The icon column: a 20px glyph, 12px of air, then the text.
 const ICON_SIZE: i32 = 20;
 const ICON_GUTTER: i32 = ICON_SIZE + 12;
@@ -43,12 +43,22 @@ const ICON_GUTTER: i32 = ICON_SIZE + 12;
 const TEXT_CONTROL_GAP: i32 = 16;
 /// Top and bottom margin of the whole content column.
 const PAGE_PAD_Y: i32 = 16;
+/// Minimum air between the content column and the edges of the area it
+/// sits in. Windows 11 Settings never runs a card flush against the
+/// window frame, even on a narrow window where the column has stopped
+/// growing and has no centring margin of its own.
+const PAGE_PAD_X: i32 = 24;
 
 /// Widths each control reserves on the right-hand side of a row.
 const TOGGLE_WIDTH: i32 = 40;
 /// The `On`/`Off` label Windows draws to the left of a switch.
 const TOGGLE_LABEL_WIDTH: i32 = 28;
 const SLIDER_WIDTH: i32 = 200;
+/// Room reserved to the right of a slider's track for its value label
+/// ("32px"). It sits outside the control rect on purpose: the control
+/// rect is what a click is mapped across, so anything that is not the
+/// draggable track must not be inside it.
+pub(crate) const SLIDER_LABEL_WIDTH: i32 = 48;
 const CHOICE_WIDTH: i32 = 160;
 const ACTION_WIDTH: i32 = 120;
 
@@ -76,7 +86,7 @@ pub struct PageLayout {
 fn control_width(control: &Control, dpi: u32) -> i32 {
     let logical = match control {
         Control::Toggle { .. } => TOGGLE_LABEL_WIDTH + TOGGLE_WIDTH,
-        Control::Slider { .. } => SLIDER_WIDTH,
+        Control::Slider { .. } => SLIDER_WIDTH + SLIDER_LABEL_WIDTH,
         Control::Choice { .. } => CHOICE_WIDTH,
         Control::Action { .. } => ACTION_WIDTH,
         Control::Link | Control::Status { .. } | Control::None => 0,
@@ -93,9 +103,10 @@ fn row_height(row: &Row, dpi: u32) -> i32 {
 /// rail. The column is centred and clamped to
 /// `MIN_CONTENT_WIDTH..=MAX_CONTENT_WIDTH`.
 pub fn layout_page(cards: &[Card], content: RECT, dpi: u32) -> PageLayout {
-    let available = (content.right - content.left).max(scaled(MIN_CONTENT_WIDTH, dpi));
+    let pad = scaled(PAGE_PAD_X, dpi);
+    let available = (content.right - content.left - pad * 2).max(scaled(MIN_CONTENT_WIDTH, dpi) - pad * 2);
     let column_width = available.min(scaled(MAX_CONTENT_WIDTH, dpi));
-    let left = content.left + (available - column_width) / 2;
+    let left = content.left + pad + (available - column_width) / 2;
     let right = left + column_width;
 
     let pad_x = scaled(ROW_PAD_X, dpi);
@@ -130,10 +141,18 @@ pub fn layout_page(cards: &[Card], content: RECT, dpi: u32) -> PageLayout {
 
             let width = control_width(&row.control, dpi);
             let control_left = (rect.right - pad_x - width).max(rect.left + pad_x);
+            // A slider's value label lives outside the control rect, so
+            // the rect is exactly the track a click is mapped across.
+            let control_right = rect.right
+                - pad_x
+                - match row.control {
+                    Control::Slider { .. } => scaled(SLIDER_LABEL_WIDTH, dpi),
+                    _ => 0,
+                };
             let control = RECT {
                 left: control_left,
                 top: rect.top,
-                right: rect.right - pad_x,
+                right: control_right.max(control_left),
                 bottom: rect.bottom,
             };
 
@@ -237,12 +256,43 @@ mod tests {
     }
 
     #[test]
+    fn the_column_never_touches_the_edges_of_the_content_area() {
+        // Windows 11 Settings always leaves air between the card and the
+        // window edge; a card flush against the frame reads as broken.
+        let cards = vec![Card { caption: None, rows: vec![row(1, None)] }];
+        for width in [MIN_CONTENT_WIDTH, 700, 900, 1200] {
+            let area = RECT { left: 0, top: 0, right: width, bottom: 600 };
+            let card = layout_page(&cards, area, 96).cards[0].0;
+            assert!(card.left > area.left, "card touches the left edge at width {width}");
+            assert!(card.right < area.right, "card touches the right edge at width {width}");
+        }
+    }
+
+    #[test]
     fn the_content_column_stops_growing_on_a_very_wide_window() {
         let wide = RECT { left: 0, top: 0, right: 4000, bottom: 600 };
         let cards = vec![Card { caption: None, rows: vec![row(1, None)] }];
         let layout = layout_page(&cards, wide, 96);
         let card = layout.cards[0].0;
         assert!(card.right - card.left <= MAX_CONTENT_WIDTH);
+    }
+
+    #[test]
+    fn a_sliders_control_rect_is_the_track_the_user_actually_drags() {
+        // `hit_test` maps a click across the control rect, and `paint`
+        // draws the track inside it. If the two disagree the thumb lands
+        // somewhere other than the cursor, so the rect must be the track
+        // alone, with the value label reserved beyond its right edge.
+        let slider = Row::new(1, "Height")
+            .with_control(Control::Slider { value: 24.0, min: 24.0, max: 48.0, unit: "px" });
+        let cards = vec![Card { caption: None, rows: vec![slider] }];
+        let layout = layout_page(&cards, content(), 96);
+        let r = &layout.cards[0].1[0];
+        let label_room = r.row.right - r.control.right;
+        assert!(
+            label_room >= SLIDER_LABEL_WIDTH,
+            "only {label_room}px left for the value label; the track would overlap it"
+        );
     }
 
     #[test]
