@@ -11,6 +11,7 @@ pub mod design;
 pub mod glyph;
 pub mod gpu;
 pub mod icons;
+pub mod rows;
 pub mod runtime;
 pub mod text;
 pub mod theme;
