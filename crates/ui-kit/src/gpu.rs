@@ -20,22 +20,22 @@ use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice2, IDC
 use windows::Win32::Graphics::DirectWrite::{DWriteCreateFactory, IDWriteFactory, DWRITE_FACTORY_TYPE_SHARED};
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 
-pub(crate) struct GpuContext {
-    pub(crate) dcomp_device: IDCompositionDesktopDevice,
+pub struct GpuContext {
+    pub dcomp_device: IDCompositionDesktopDevice,
     #[allow(dead_code)] // will be read by overview GPU state in later tasks
-    pub(crate) d2d_factory: ID2D1Factory1,
-    pub(crate) dwrite_factory: IDWriteFactory,
+    pub d2d_factory: ID2D1Factory1,
+    pub dwrite_factory: IDWriteFactory,
 }
 
 thread_local! {
-    pub(crate) static GPU: RefCell<Option<GpuContext>> = const { RefCell::new(None) };
+    pub static GPU: RefCell<Option<GpuContext>> = const { RefCell::new(None) };
 }
 
 /// Sets up the process-wide D3D11/DirectComposition/DirectWrite devices,
 /// once. Must be called before any GPU-rendered window is created. The
 /// decision (GPU available or not) is made exactly here and never
 /// revisited — every later caller just checks [`is_enabled`].
-pub(crate) fn init() {
+pub fn init() {
     match try_init() {
         Ok(ctx) => GPU.with(|g| *g.borrow_mut() = Some(ctx)),
         Err(e) => {
@@ -75,7 +75,7 @@ fn try_init() -> windows::core::Result<GpuContext> {
 
 /// Whether the process-wide GPU setup succeeded. Decided once, at
 /// startup, by [`init`] — never re-checked or retried afterwards.
-pub(crate) fn is_enabled() -> bool {
+pub fn is_enabled() -> bool {
     GPU.with(|g| g.borrow().is_some())
 }
 
@@ -87,7 +87,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI
 /// root visual covering the client area, and the surface Direct2D draws
 /// into. Fields are private — every window holding a `GpuSurface` only
 /// ever passes it back into this module's own functions.
-pub(crate) struct GpuSurface {
+pub struct GpuSurface {
     /// The window's composition target. `Some` only for the *first*
     /// surface created for a window — a window can hold exactly one
     /// target, and asking for a second fails with
@@ -103,15 +103,15 @@ pub(crate) struct GpuSurface {
 }
 
 impl GpuSurface {
-    pub(crate) fn width(&self) -> i32 {
+    pub fn width(&self) -> i32 {
         self.width
     }
 
-    pub(crate) fn height(&self) -> i32 {
+    pub fn height(&self) -> i32 {
         self.height
     }
 
-    pub(crate) fn visual(&self) -> &IDCompositionVisual2 {
+    pub fn visual(&self) -> &IDCompositionVisual2 {
         &self.visual
     }
 }
@@ -121,7 +121,7 @@ impl GpuSurface {
 /// or if this specific window's setup fails even though the process-wide
 /// setup succeeded — both cases mean the caller should keep using its
 /// existing GDI painting for this window, unchanged.
-pub(crate) fn create_surface(hwnd: HWND, width: i32, height: i32) -> Option<GpuSurface> {
+pub fn create_surface(hwnd: HWND, width: i32, height: i32) -> Option<GpuSurface> {
     GPU.with(|g| {
         let g = g.borrow();
         let ctx = g.as_ref()?;
@@ -175,7 +175,7 @@ unsafe fn try_create_visual(
 ///
 /// The caller is responsible for attaching the returned surface's visual
 /// with `AddVisual`; until it does, the surface renders nowhere.
-pub(crate) fn create_child_surface(width: i32, height: i32) -> Option<GpuSurface> {
+pub fn create_child_surface(width: i32, height: i32) -> Option<GpuSurface> {
     GPU.with(|g| {
         let g = g.borrow();
         let ctx = g.as_ref()?;
@@ -195,7 +195,7 @@ pub(crate) fn create_child_surface(width: i32, height: i32) -> Option<GpuSurface
 /// Sets `surface`'s root visual opacity (0.0–1.0) and commits. No-op if
 /// the process-wide GPU setup isn't available.
 #[allow(dead_code)] // will be called by overview GPU state in later tasks
-pub(crate) fn set_opacity(surface: &GpuSurface, opacity: f32) {
+pub fn set_opacity(surface: &GpuSurface, opacity: f32) {
     GPU.with(|g| {
         let g = g.borrow();
         let Some(ctx) = g.as_ref() else { return };
@@ -216,7 +216,7 @@ pub(crate) fn set_opacity(surface: &GpuSurface, opacity: f32) {
 /// GPU setup isn't available. Used by callers that only touched visuals
 /// or transforms directly and didn't already go through `redraw`/
 /// `set_opacity`, both of which commit internally.
-pub(crate) fn commit() {
+pub fn commit() {
     GPU.with(|g| {
         let g = g.borrow();
         if let Some(ctx) = g.as_ref() {
@@ -243,7 +243,7 @@ use windows::Win32::Graphics::DirectWrite::{
 /// up the new content. `draw` receives a device context whose origin is
 /// already adjusted for `BeginDraw`'s update offset, so callers can draw
 /// as if the surface's own top-left were always `(0, 0)`.
-pub(crate) fn redraw<F>(surface: &GpuSurface, draw: F)
+pub fn redraw<F>(surface: &GpuSurface, draw: F)
 where
     F: FnOnce(&ID2D1DeviceContext),
 {
@@ -278,7 +278,7 @@ where
     });
 }
 
-pub(crate) fn fill_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u32) {
+pub fn fill_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u32) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`
     // (enforced by `redraw`'s closure scope).
     unsafe {
@@ -292,7 +292,7 @@ pub(crate) fn fill_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u3
 /// only partially cover their window (the floating desktop dock draws a
 /// panel at the bottom and leaves the headroom above it see-through) so
 /// stale pixels from a previous, differently-sized frame never linger.
-pub(crate) fn clear_transparent(ctx: &ID2D1DeviceContext) {
+pub fn clear_transparent(ctx: &ID2D1DeviceContext) {
     let transparent = D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
     unsafe {
@@ -303,7 +303,7 @@ pub(crate) fn clear_transparent(ctx: &ID2D1DeviceContext) {
 /// Fills `rect` with `colorref` at the given `alpha` (0..1) — used for
 /// the overview backdrop's dim scrim, which needs partial transparency
 /// that `fill_rect`'s always-opaque brush can't express.
-pub(crate) fn fill_rect_alpha(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u32, alpha: f32) {
+pub fn fill_rect_alpha(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorref: u32, alpha: f32) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
     unsafe {
         let mut color = colorref_to_d2d(colorref);
@@ -318,7 +318,7 @@ pub(crate) fn fill_rect_alpha(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, colorr
 /// no rounded-rect clip — the overview backdrop upscales a small,
 /// smoothly-downscaled wallpaper this way, and the linear upscale is
 /// exactly what turns the downscaled source into a soft, even blur.
-pub(crate) fn draw_bitmap_stretched(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, bitmap: &ID2D1Bitmap) {
+pub fn draw_bitmap_stretched(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, bitmap: &ID2D1Bitmap) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`;
     // `bitmap` is owned by the caller for the duration of the call.
     unsafe {
@@ -326,7 +326,7 @@ pub(crate) fn draw_bitmap_stretched(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, 
     }
 }
 
-pub(crate) fn draw_text(
+pub fn draw_text(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
     text: &str,
@@ -339,7 +339,7 @@ pub(crate) fn draw_text(
 
 /// [`draw_text`] with an explicit font family — the bar needs the Windows
 /// 11 UI face and the Segoe Fluent Icons face, not just the default.
-pub(crate) fn draw_text_in_font(
+pub fn draw_text_in_font(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
     text: &str,
@@ -417,7 +417,7 @@ use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 /// bitmap via the WIC bridge. `None` on any failure — callers already
 /// treat a missing bitmap as "draw the placeholder chip instead",
 /// matching today's GDI behavior.
-pub(crate) fn bitmap_from_hbitmap(ctx: &ID2D1DeviceContext, hbitmap: HBITMAP) -> Option<ID2D1Bitmap> {
+pub fn bitmap_from_hbitmap(ctx: &ID2D1DeviceContext, hbitmap: HBITMAP) -> Option<ID2D1Bitmap> {
     // SAFETY: `hbitmap` is a valid, caller-owned GDI bitmap for the
     // duration of this call; every COM object created here is released
     // when it goes out of scope at the end of the function.
@@ -440,7 +440,7 @@ pub(crate) fn bitmap_from_hbitmap(ctx: &ID2D1DeviceContext, hbitmap: HBITMAP) ->
 /// Draws `bitmap` stretched to fill `rect`, clipped to a rounded rect
 /// of `radius`. Mirrors `overview.rs`'s GDI `StretchBlt`-into-a-
 /// `CreateRoundRectRgn`-clip pattern.
-pub(crate) fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, bitmap: &ID2D1Bitmap) {
+pub fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, bitmap: &ID2D1Bitmap) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
     unsafe {
         let geometry = GPU.with(|g| {
@@ -503,7 +503,7 @@ pub(crate) fn draw_rounded_bitmap(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, ra
 /// An `ID2D1Bitmap` from a tightly packed 32-bit BGRA buffer — the shape
 /// the captured tray-icon pixels are already in, so the bar's D2D path can
 /// draw them without a detour through an `HBITMAP`.
-pub(crate) fn bitmap_from_bgra(
+pub fn bitmap_from_bgra(
     ctx: &ID2D1DeviceContext,
     pixels: &[u8],
     size: i32,
@@ -542,7 +542,7 @@ pub(crate) fn bitmap_from_bgra(
     }
 }
 
-pub(crate) fn fill_rounded_rect_alpha(
+pub fn fill_rounded_rect_alpha(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
     radius: f32,
@@ -567,7 +567,7 @@ pub(crate) fn fill_rounded_rect_alpha(
     }
 }
 
-pub(crate) fn fill_rounded_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, colorref: u32) {
+pub fn fill_rounded_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radius: f32, colorref: u32) {
     // SAFETY: `ctx` is a live device context between `BeginDraw`/`EndDraw`.
     unsafe {
         let geometry = GPU.with(|g| {
@@ -588,7 +588,7 @@ pub(crate) fn fill_rounded_rect(ctx: &ID2D1DeviceContext, rect: D2D_RECT_F, radi
 /// edge — the Direct2D replacement for the GDI multi-ring shadow/glow
 /// approximation. `alpha` (0..1) drives fade-in for the hover glow;
 /// shadow callers always pass a fixed alpha.
-pub(crate) fn stroke_rounded_rect(
+pub fn stroke_rounded_rect(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
     radius: f32,
