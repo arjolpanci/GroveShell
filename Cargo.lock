@@ -476,6 +476,7 @@ dependencies = [
  "groveshell-common",
  "groveshell-config",
  "groveshell-ipc",
+ "groveshell-ui-kit",
  "groveshell-window-model",
  "serde",
  "serde_json",

@@ -10,11 +10,11 @@ use windows::Win32::Graphics::Dwm::{
     DWMWCP_ROUND, DWM_SYSTEMBACKDROP_TYPE, DWM_WINDOW_CORNER_PREFERENCE,
 };
 
-use super::super::state;
+use crate::runtime as state;
 
 /// Which kind of shell surface a window is, for material purposes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Surface {
+pub enum Surface {
     /// The top bar: permanent chrome, full monitor width, flush against
     /// the screen's top edge.
     Bar,
@@ -24,7 +24,7 @@ pub(crate) enum Surface {
 
 /// Mica for the bar, Acrylic for flyouts — matching what Windows itself
 /// puts behind its own equivalents.
-pub(crate) fn backdrop_for(surface: Surface) -> DWM_SYSTEMBACKDROP_TYPE {
+pub fn backdrop_for(surface: Surface) -> DWM_SYSTEMBACKDROP_TYPE {
     match surface {
         Surface::Bar => DWMSBT_MAINWINDOW,
         Surface::Flyout => DWMSBT_TRANSIENTWINDOW,
@@ -33,7 +33,7 @@ pub(crate) fn backdrop_for(surface: Surface) -> DWM_SYSTEMBACKDROP_TYPE {
 
 /// Round corners on flyouts only. The bar is full-width and flush to the
 /// top edge, so rounding it would notch the screen corners.
-pub(crate) fn corner_for(surface: Surface) -> DWM_WINDOW_CORNER_PREFERENCE {
+pub fn corner_for(surface: Surface) -> DWM_WINDOW_CORNER_PREFERENCE {
     match surface {
         Surface::Bar => DWMWCP_DONOTROUND,
         Surface::Flyout => DWMWCP_ROUND,
@@ -42,7 +42,7 @@ pub(crate) fn corner_for(surface: Surface) -> DWM_WINDOW_CORNER_PREFERENCE {
 
 /// `DWMWA_USE_IMMERSIVE_DARK_MODE` wants "is dark", so it is the inverse
 /// of the light-theme flag.
-pub(crate) fn dark_mode_flag(light: bool) -> BOOL {
+pub fn dark_mode_flag(light: bool) -> BOOL {
     BOOL::from(!light)
 }
 
@@ -54,7 +54,7 @@ pub(crate) fn dark_mode_flag(light: bool) -> BOOL {
 /// failure *is* the feature detection — no version probe, no registry read
 /// (spec §3.3). A `false` return tells the caller to fall back to the
 /// legacy blur-behind path and keep painting its own rounded corners.
-pub(crate) fn apply(hwnd: HWND, surface: Surface) -> bool {
+pub fn apply(hwnd: HWND, surface: Surface) -> bool {
     let dark = dark_mode_flag(state::light_theme());
     let backdrop = backdrop_for(surface);
     let corner = corner_for(surface);

@@ -10,11 +10,11 @@
 //! call expects. Keeping one conversion site means the rest of the code
 //! never hand-swaps bytes.
 
-use super::super::state;
+use crate::runtime as state;
 
 /// Convert a `0x00RRGGBB` web-order value to a Win32 `COLORREF`
 /// (`0x00BBGGRR`) by swapping the red and blue bytes.
-pub(crate) fn rgb(hex: u32) -> u32 {
+pub fn rgb(hex: u32) -> u32 {
     let r = (hex >> 16) & 0xFF;
     let g = (hex >> 8) & 0xFF;
     let b = hex & 0xFF;
@@ -26,13 +26,13 @@ pub(crate) fn rgb(hex: u32) -> u32 {
 /// byte on top. So dropping the alpha yields a `COLORREF` directly, no
 /// swap. (`ColorizationColor`, used only as a fallback, is ARGB instead and
 /// is swapped through [`rgb`] at its read site.)
-pub(crate) fn accent_from_dword(abgr: u32) -> u32 {
+pub fn accent_from_dword(abgr: u32) -> u32 {
     abgr & 0x00FF_FFFF
 }
 
 /// The fallback accent used when the registry can't be read: a modern
 /// Win11-ish blue (`#4CC2FF`).
-pub(crate) fn accent_fallback() -> u32 {
+pub fn accent_fallback() -> u32 {
     rgb(0x004C_C2FF)
 }
 
@@ -56,12 +56,12 @@ fn light() -> bool {
 macro_rules! theme_token {
     ($live:ident, $pure:ident, $hc:expr, $light:expr, $dark:expr, $doc:expr) => {
         #[doc = $doc]
-        pub(crate) fn $live() -> u32 {
+        pub fn $live() -> u32 {
             $pure(hc(), light())
         }
 
         #[doc = $doc]
-        pub(crate) fn $pure(high_contrast: bool, light: bool) -> u32 {
+        pub fn $pure(high_contrast: bool, light: bool) -> u32 {
             if high_contrast {
                 rgb($hc)
             } else if light {
@@ -129,12 +129,12 @@ theme_token!(
 
 /// Accent for active/selected/focus emphasis: the live Windows accent in
 /// normal mode, yellow in high contrast (matching the Phase 6 palette).
-pub(crate) fn accent() -> u32 {
+pub fn accent() -> u32 {
     if hc() { rgb(0x00FF_FF00) } else { state::accent() }
 }
 
 /// Text drawn on top of an [`accent`] fill.
-pub(crate) fn accent_text() -> u32 {
+pub fn accent_text() -> u32 {
     contrasting_text(accent())
 }
 
@@ -154,7 +154,7 @@ fn contrasting_text(background: u32) -> u32 {
 /// then `ColorizationColor` (ARGB), then falls back to [`accent_fallback`].
 /// Safe to call from the UI thread at startup and on a colorization-change
 /// broadcast.
-pub(crate) fn refresh_accent() {
+pub fn refresh_accent() {
     let value = read_dwm_dword("AccentColor")
         .map(accent_from_dword)
         .or_else(|| read_dwm_dword("ColorizationColor").map(|argb| rgb(argb & 0x00FF_FFFF)))
@@ -169,8 +169,8 @@ pub(crate) fn refresh_accent() {
 /// A `None` from the registry means the key has never been written (a fresh
 /// account, or pre-1809 Windows); that maps to dark, which is the shell's
 /// historical appearance.
-pub(crate) fn refresh_theme() {
-    state::set_light_theme(super::super::theme::apps_use_light_theme().unwrap_or(false));
+pub fn refresh_theme() {
+    state::set_light_theme(crate::theme::apps_use_light_theme().unwrap_or(false));
 }
 
 fn read_dwm_dword(value_name: &str) -> Option<u32> {

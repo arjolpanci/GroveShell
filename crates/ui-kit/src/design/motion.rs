@@ -3,7 +3,7 @@
 //! surface animates with one consistent feel. Built on the existing
 //! `state::animation_config()` mirror.
 
-use super::super::state;
+use crate::runtime as state;
 
 /// The interval every animation timer in the shell runs at.
 ///
@@ -17,23 +17,23 @@ use super::super::state;
 ///
 /// Going below 15 buys nothing without `timeBeginPeriod`, which raises
 /// the granularity process-wide and costs power.
-pub(crate) const FRAME_INTERVAL_MS: u32 = 15;
+pub const FRAME_INTERVAL_MS: u32 = 15;
 
 /// Duration for small, snappy transitions (hover highlights, presses).
-pub(crate) const FAST_MS: u32 = 180;
+pub const FAST_MS: u32 = 180;
 
 /// Duration for larger transitions (flyouts opening, dock reveal).
-pub(crate) const BASE_MS: u32 = 250;
+pub const BASE_MS: u32 = 250;
 
 /// Cubic ease-out: fast start, gentle settle. `f(0)=0`, `f(1)=1`.
-pub(crate) fn ease_out_cubic(t: f32) -> f32 {
+pub fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     let inv = 1.0 - t;
     1.0 - inv * inv * inv
 }
 
 /// Cubic ease-in-out: gentle at both ends. `f(0)=0`, `f(0.5)=0.5`, `f(1)=1`.
-pub(crate) fn ease_in_out_cubic(t: f32) -> f32 {
+pub fn ease_in_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.5 {
         4.0 * t * t * t
@@ -46,14 +46,14 @@ pub(crate) fn ease_in_out_cubic(t: f32) -> f32 {
 /// The effective duration of a named transition given the live animation
 /// config: zero when reduced motion is on (so transitions resolve
 /// instantly), otherwise the named value times `animation_scale`.
-pub(crate) fn effective_ms(named: u32) -> u32 {
+pub fn effective_ms(named: u32) -> u32 {
     let (scale, reduced) = state::animation_config();
     effective_ms_with(named, reduced, scale)
 }
 
 /// Pure core of [`effective_ms`], split out so the scaling/reduced-motion
 /// rule is unit-testable without touching thread-local state.
-pub(crate) fn effective_ms_with(named: u32, reduced: bool, scale: f32) -> u32 {
+pub fn effective_ms_with(named: u32, reduced: bool, scale: f32) -> u32 {
     if reduced {
         0
     } else {

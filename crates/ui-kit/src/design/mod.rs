@@ -9,8 +9,8 @@
 // warning-clean rather than churning the token list task by task.
 #![allow(dead_code)]
 
-pub(crate) mod color;
-pub(crate) mod material;
-pub(crate) mod metrics;
-pub(crate) mod motion;
-pub(crate) mod typography;
+pub mod color;
+pub mod material;
+pub mod metrics;
+pub mod motion;
+pub mod typography;

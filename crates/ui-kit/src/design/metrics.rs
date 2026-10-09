@@ -7,20 +7,20 @@
 //! same `state::scaled` / per-monitor DPI helpers the rest of the UI uses.
 
 /// Corner radius for chips, buttons, hover highlights.
-pub(crate) const RADIUS_CHIP: i32 = 8;
+pub const RADIUS_CHIP: i32 = 8;
 
 /// Corner radius for cards and flyouts.
-pub(crate) const RADIUS_CARD: i32 = 12;
+pub const RADIUS_CARD: i32 = 12;
 
 /// Base spacing unit; layouts step in multiples of this.
-pub(crate) const SPACING: i32 = 8;
+pub const SPACING: i32 = 8;
 
 /// Hairline border/divider width.
-pub(crate) const STROKE_WIDTH: i32 = 1;
+pub const STROKE_WIDTH: i32 = 1;
 
 /// The single drop-shadow spec for elevated surfaces (flyouts, cards).
 #[derive(Clone, Copy)]
-pub(crate) struct Shadow {
+pub struct Shadow {
     pub blur: i32,
     pub dx: i32,
     pub dy: i32,
@@ -30,6 +30,6 @@ pub(crate) struct Shadow {
 }
 
 /// The shared elevation shadow: soft, slightly downward.
-pub(crate) fn shadow() -> Shadow {
+pub fn shadow() -> Shadow {
     Shadow { blur: 18, dx: 0, dy: 6, color: 0x0000_0000 }
 }

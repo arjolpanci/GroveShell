@@ -24,7 +24,7 @@ pub(crate) const ANIM_TIMER_INTERVAL_MS: u32 = super::design::motion::FRAME_INTE
 pub(crate) const CLOCK_TIMER_ID: usize = 2;
 
 pub(crate) fn scaled(v: i32, dpi: u32) -> i32 {
-    (v * dpi as i32 + 48) / 96
+    groveshell_ui_kit::runtime::scaled(v, dpi)
 }
 
 /// Effective DPI of the primary monitor — used only where a value must
@@ -137,25 +137,10 @@ pub(crate) fn primary_bar_hwnd() -> Option<HWND> {
 }
 
 thread_local! {
-    /// Mirrors `AppState.config.appearance.{animation_scale,reduced_motion}`
-    /// outside `STATE`'s `RefCell`, for the same reason `PRIMARY_BAR_HWND`
-    /// mirrors the primary bar's `HWND` above — except the problem here
-    /// isn't cross-thread access, it's *same-thread re-entrancy*:
-    /// `util::progress_dur` is called from deep inside animation code
-    /// (`overview::on_animation_tick` and friends) that already holds
-    /// `STATE`'s borrow for the whole duration of its work, so a second,
-    /// nested `STATE.with(|s| s.borrow())` inside `progress_dur` panics
-    /// with "RefCell already mutably borrowed" the instant an overview
-    /// animates (confirmed live: this crashed the process on the very
-    /// first `WM_TIMER` tick after opening Activities). A separate
-    /// thread-local `Cell` has no aliasing relationship with `STATE`'s
-    /// `RefCell` at all, so `progress_dur` can read it regardless of
-    /// what borrow `STATE` is currently under. Kept in sync at every
-    /// place `AppState.config` is set or replaced (initial load in
-    /// `main`, and the `WM_APP_CONFIG_RELOADED` handler) via
-    /// `set_animation_config`.
-    static ANIMATION_SCALE: Cell<f32> = const { Cell::new(1.0) };
-    static REDUCED_MOTION: Cell<bool> = const { Cell::new(false) };
+    // The animation, accent, light-theme and high-contrast mirrors moved
+    // to `groveshell_ui_kit::runtime`, which the design tokens read
+    // directly now that they live in the kit; the re-entrancy rationale
+    // that kept them out of `STATE` moved with them.
 
     /// Same idea, same reason, for `AppState.config.appearance.{dock_icon_size,dock_alignment}`:
     /// `dock::dock_layout` used to read these straight out of `STATE`, and
@@ -189,33 +174,11 @@ thread_local! {
     /// (which already resizes the real bar windows to this value).
     static TOP_BAR_HEIGHT: Cell<i32> = const { Cell::new(BAR_HEIGHT) };
 
-    /// Same re-entrancy-safe mirror pattern for the two Phase 6 config
-    /// fields the render/reconcile paths read from inside a held `STATE`
-    /// borrow: the high-contrast flag (read by every `palette::*` accessor,
-    /// which is called from deep inside bar/overview painting) and the
-    /// compatibility ignore list (read by `filter_ignored`, called on the
-    /// window snapshot before it's folded into `STATE`). Kept in sync at
-    /// the same two places as the others via `set_compat_a11y_config`.
-    static HIGH_CONTRAST: Cell<bool> = const { Cell::new(false) };
+    /// The same re-entrancy-safe mirror pattern, for the compatibility
+    /// ignore list: `filter_ignored` reads it on the window snapshot
+    /// before the records are folded into `STATE`. Kept in sync at the
+    /// same two places as the others via `set_compat_a11y_config`.
     static IGNORE_RULES: RefCell<Vec<groveshell_config::IgnoreRule>> = const { RefCell::new(Vec::new()) };
-
-    /// The live Windows accent color as a `COLORREF`, read from the DWM
-    /// registry by `design::color::refresh_accent` at startup and whenever
-    /// Windows broadcasts a colorization change. Same re-entrancy-safe
-    /// mirror pattern as above so `design::color::accent()` — called from
-    /// deep inside bar/flyout painting that already holds `STATE`'s borrow —
-    /// can read it without touching `STATE`. Defaults to the fallback accent
-    /// (`#4CC2FF`) until the first read.
-    static ACCENT: Cell<u32> = const { Cell::new(0x00FF_C24C) };
-
-    /// Whether Windows is currently in light-apps mode, read from
-    /// `AppsUseLightTheme` by `design::color::refresh_theme` at startup and
-    /// on every `ImmersiveColorSet` broadcast. Same re-entrancy-safe mirror
-    /// rationale as `ACCENT` above: the color tokens are read from inside
-    /// bar/flyout paint, which already holds `STATE`'s borrow, and a nested
-    /// `STATE.with(borrow)` panics. Defaults to `false` (dark), which is
-    /// also what a machine that has never touched personalization gets.
-    static LIGHT_THEME: Cell<bool> = const { Cell::new(false) };
 
     /// See `set_calendar_translucent`. Defaults to false so any path that
     /// reads it before startup finishes gets the safe, opaque answer.
@@ -237,44 +200,12 @@ pub(crate) fn calendar_translucent() -> bool {
     CALENDAR_TRANSLUCENT.with(|c| c.get())
 }
 
-/// Stores whether Windows is in light-apps mode. Called by
-/// `design::color::refresh_theme` after reading the registry.
-pub(crate) fn set_light_theme(light: bool) {
-    LIGHT_THEME.with(|c| c.set(light));
-}
-
-/// Whether the light palette is active. Safe to call from anywhere,
-/// including from inside an active `STATE.with` borrow — see the mirror's
-/// doc comment.
-pub(crate) fn light_theme() -> bool {
-    LIGHT_THEME.with(|c| c.get())
-}
-
-/// Stores the current accent `COLORREF`. Called by
-/// `design::color::refresh_accent` after reading the registry.
-pub(crate) fn set_accent(colorref: u32) {
-    ACCENT.with(|c| c.set(colorref));
-}
-
-/// The live accent `COLORREF`. Safe to call from inside a held `STATE`
-/// borrow — see the mirror's doc comment.
-pub(crate) fn accent() -> u32 {
-    ACCENT.with(|c| c.get())
-}
-
-/// Updates the re-entrancy-safe mirror of the high-contrast flag and the
-/// compatibility ignore list. Call this every time `AppState.config` is set
-/// or replaced.
+/// Pushes the high-contrast flag to the UI kit (where the color tokens
+/// read it) and updates this binary's compatibility ignore list. Call
+/// this every time `AppState.config` is set or replaced.
 pub(crate) fn set_compat_a11y_config(high_contrast: bool, ignore: &[groveshell_config::IgnoreRule]) {
-    HIGH_CONTRAST.with(|c| c.set(high_contrast));
+    groveshell_ui_kit::runtime::set_high_contrast(high_contrast);
     IGNORE_RULES.with(|c| *c.borrow_mut() = ignore.to_vec());
-}
-
-/// Whether the high-contrast palette is active. Safe to call from anywhere,
-/// including from inside an active `STATE.with` borrow — see the mirror's
-/// doc comment.
-pub(crate) fn high_contrast() -> bool {
-    HIGH_CONTRAST.with(|c| c.get())
 }
 
 /// Drops every window matching a compatibility ignore rule, so ignored
@@ -304,15 +235,14 @@ pub(crate) fn filter_ignored(
 /// Updates the re-entrancy-safe mirror of the animation-affecting config
 /// fields. Call this every time `AppState.config` is set or replaced.
 pub(crate) fn set_animation_config(scale: f32, reduced_motion: bool) {
-    ANIMATION_SCALE.with(|c| c.set(scale));
-    REDUCED_MOTION.with(|c| c.set(reduced_motion));
+    groveshell_ui_kit::runtime::set_animation_config(scale, reduced_motion);
 }
 
 /// Reads the re-entrancy-safe mirror of the animation-affecting config
 /// fields. Safe to call from anywhere, including from inside an active
 /// `STATE.with` borrow — see `ANIMATION_SCALE`'s doc comment.
 pub(crate) fn animation_config() -> (f32, bool) {
-    (ANIMATION_SCALE.with(|c| c.get()), REDUCED_MOTION.with(|c| c.get()))
+    groveshell_ui_kit::runtime::animation_config()
 }
 
 /// Updates the re-entrancy-safe mirror of the dock-affecting config

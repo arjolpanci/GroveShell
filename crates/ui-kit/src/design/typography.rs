@@ -9,24 +9,24 @@
 use std::cell::Cell;
 
 /// Small, secondary text: workspace labels, tray captions.
-pub(crate) const CAPTION_PX: i32 = 12;
+pub const CAPTION_PX: i32 = 12;
 
 /// Default UI text: bar labels, flyout rows. Windows 11's own body size.
-pub(crate) const BODY_PX: i32 = 14;
+pub const BODY_PX: i32 = 14;
 
 /// Flyout and section headers.
-pub(crate) const SUBTITLE_PX: i32 = 20;
+pub const SUBTITLE_PX: i32 = 20;
 
 /// The Windows 11 UI typeface. Ships only on Windows 11, hence the
 /// fallback to the face every earlier release has.
 const VARIABLE_FACE: &str = "Segoe UI Variable Text";
 const FALLBACK_FACE: &str = "Segoe UI";
 
-/// The icon typeface, for [`super::super::icons`]'s glyph path.
-pub(crate) const ICON_FACE: &str = "Segoe Fluent Icons";
+/// The icon typeface, for [`crate::icons`]'s glyph path.
+pub const ICON_FACE: &str = "Segoe Fluent Icons";
 
 /// Which UI face to request, given whether the variable font is installed.
-pub(crate) fn ui_face(variable_available: bool) -> &'static str {
+pub fn ui_face(variable_available: bool) -> &'static str {
     if variable_available {
         VARIABLE_FACE
     } else {
@@ -43,7 +43,7 @@ thread_local! {
 }
 
 /// The UI face to use on this machine, probing once on first call.
-pub(crate) fn resolved_ui_face() -> &'static str {
+pub fn resolved_ui_face() -> &'static str {
     ui_face(VARIABLE_AVAILABLE.with(|c| match c.get() {
         Some(known) => known,
         None => {
@@ -56,7 +56,7 @@ pub(crate) fn resolved_ui_face() -> &'static str {
 
 /// Whether the Fluent icon font is installed, probed once. When it is not,
 /// callers fall back to the bundled PNG icons.
-pub(crate) fn icon_font_available() -> bool {
+pub fn icon_font_available() -> bool {
     ICONS_AVAILABLE.with(|c| match c.get() {
         Some(known) => known,
         None => {
