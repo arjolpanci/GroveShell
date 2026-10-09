@@ -20,23 +20,26 @@ pub enum Surface {
     Bar,
     /// A transient pop-up anchored under the bar (Quick Settings, calendar).
     Flyout,
+    /// An ordinary application window: Mica, rounded corners, and a
+    /// title bar tinted to match the system theme. The settings window.
+    Window,
 }
 
 /// Mica for the bar, Acrylic for flyouts — matching what Windows itself
 /// puts behind its own equivalents.
 pub fn backdrop_for(surface: Surface) -> DWM_SYSTEMBACKDROP_TYPE {
     match surface {
-        Surface::Bar => DWMSBT_MAINWINDOW,
+        Surface::Bar | Surface::Window => DWMSBT_MAINWINDOW,
         Surface::Flyout => DWMSBT_TRANSIENTWINDOW,
     }
 }
 
-/// Round corners on flyouts only. The bar is full-width and flush to the
-/// top edge, so rounding it would notch the screen corners.
+/// Everything rounds except the bar, which is full-width and flush to
+/// the top edge: rounding it would notch the screen corners.
 pub fn corner_for(surface: Surface) -> DWM_WINDOW_CORNER_PREFERENCE {
     match surface {
         Surface::Bar => DWMWCP_DONOTROUND,
-        Surface::Flyout => DWMWCP_ROUND,
+        Surface::Flyout | Surface::Window => DWMWCP_ROUND,
     }
 }
 
@@ -100,7 +103,15 @@ mod tests {
     }
 
     #[test]
-    fn only_flyouts_get_rounded_corners() {
+    fn an_app_window_gets_mica_and_rounded_corners() {
+        // The settings window is ordinary desktop chrome: the same Mica
+        // the bar gets, but rounded like every other app window.
+        assert_eq!(backdrop_for(Surface::Window).0, 2);
+        assert_eq!(corner_for(Surface::Window).0, 2);
+    }
+
+    #[test]
+    fn the_bar_alone_refuses_rounded_corners() {
         // The bar spans the full monitor width flush against the top
         // edge, so rounding it would cut visible notches out of the
         // screen corners. DWMWCP_DONOTROUND = 1, DWMWCP_ROUND = 2.

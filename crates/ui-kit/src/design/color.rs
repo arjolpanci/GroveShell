@@ -204,6 +204,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tokens_differ_between_light_and_dark() {
+        assert_ne!(text_for(false, true), text_for(false, false));
+        assert_ne!(surface_base_for(false, true), surface_base_for(false, false));
+    }
+
+    // Review Focus 1: high contrast must stay legible, not merely different.
+    #[test]
+    fn high_contrast_keeps_text_and_surface_at_opposite_ends() {
+        for light in [true, false] {
+            assert_ne!(text_for(true, light), surface_base_for(true, light));
+            assert_ne!(text_for(true, light), surface_raised_for(true, light));
+        }
+    }
+
+
+    #[test]
     fn accent_foreground_stays_legible_on_light_and_dark_accents() {
         assert_eq!(contrasting_text(accent_fallback()), rgb(0));
         assert_eq!(contrasting_text(rgb(0xFFFFFF)), rgb(0));
