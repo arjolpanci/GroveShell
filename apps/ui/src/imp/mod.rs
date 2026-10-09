@@ -16,6 +16,7 @@ mod dock_pins;
 mod flyout;
 pub(crate) use groveshell_ui_kit::{canvas, gpu};
 mod hotplug;
+pub(crate) use groveshell_ui_kit::glyph;
 pub(crate) use groveshell_ui_kit::icons;
 mod monitors;
 mod monitor_workspaces;
@@ -379,8 +380,24 @@ pub fn main() -> Result<()> {
         // bar's clock label, clamped so it never runs off that
         // monitor's edges.
         let primary_bar_width = primary_bar_rect.right - primary_bar_rect.left;
-        let calendar_x = (primary_bar_rect.left + primary_bar_width / 2 - CAL_WIDTH / 2)
-            .clamp(primary_bar_rect.left, (primary_bar_rect.right - CAL_WIDTH).max(primary_bar_rect.left));
+        // Both flyouts size their windows in physical pixels, so every
+        // logical measurement is scaled for the primary monitor. The
+        // calendar used to skip this and drew at half size on a 200%
+        // display.
+        //
+        // Taken from the enumerated monitor, not `GetDpiForWindow` on
+        // the bar: this early in startup that call answers 96 even on a
+        // 200% monitor, which silently halves every flyout sized from it.
+        let primary_dpi = monitors
+            .iter()
+            .find(|m| m.is_primary)
+            .map(|m| m.dpi)
+            .unwrap_or(96)
+            .max(96);
+        let cal_width = scaled(CAL_WIDTH, primary_dpi);
+        let cal_height = scaled(CAL_HEIGHT, primary_dpi);
+        let calendar_x = (primary_bar_rect.left + primary_bar_width / 2 - cal_width / 2)
+            .clamp(primary_bar_rect.left, (primary_bar_rect.right - cal_width).max(primary_bar_rect.left));
         // `WS_EX_NOREDIRECTIONBITMAP` drops the window's opaque GDI
         // redirection surface, which is what lets DirectComposition content
         // composite to the desktop with its alpha intact and the DWM
@@ -393,7 +410,7 @@ pub fn main() -> Result<()> {
         // is unavailable the window would be invisible rather than merely
         // un-translucent. The style is therefore gated on `gpu::is_enabled`,
         // and the per-window surface is verified below.
-        let mut calendar_translucent = gpu::is_enabled();
+        let calendar_translucent = gpu::is_enabled();
         let calendar_ex_style = |translucent: bool| {
             if translucent {
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
@@ -409,8 +426,8 @@ pub fn main() -> Result<()> {
                 WS_POPUP,
                 calendar_x,
                 primary_bar_rect.bottom,
-                CAL_WIDTH,
-                CAL_HEIGHT,
+                cal_width,
+                cal_height,
                 None,
                 None,
                 hinstance,
@@ -419,7 +436,7 @@ pub fn main() -> Result<()> {
             .map_err(Error::Windows)
         };
         let mut calendar_hwnd = make_calendar(calendar_translucent)?;
-        let mut calendar_gpu = gpu::create_surface(calendar_hwnd, CAL_WIDTH, CAL_HEIGHT);
+        let mut calendar_gpu = gpu::create_surface(calendar_hwnd, cal_width, cal_height);
 
         // The process-wide GPU check above can still be followed by a
         // per-window failure (the overview has hit
@@ -431,11 +448,11 @@ pub fn main() -> Result<()> {
                 "calendar DirectComposition surface failed; rebuilding the window                  opaque so it stays visible on the GDI path"
             );
             let _ = DestroyWindow(calendar_hwnd);
-            calendar_translucent = false;
             calendar_hwnd = make_calendar(false)?;
-            calendar_gpu = gpu::create_surface(calendar_hwnd, CAL_WIDTH, CAL_HEIGHT);
+            calendar_gpu = gpu::create_surface(calendar_hwnd, cal_width, cal_height);
         }
-        state::set_calendar_translucent(calendar_translucent);
+        // Nothing reads a translucency flag any more: which `Canvas`
+        // backend the paint path picks already encodes it.
 
         // Quick Settings flyout, right-aligned under the primary bar's
         // right label. Unlike the bar itself, `QS_WIDTH`/`QS_HEIGHT` are
@@ -448,7 +465,6 @@ pub fn main() -> Result<()> {
         // every side (room for the drop shadow) and layered with a
         // color-key so that margin — and the card's rounded corners —
         // are actually transparent; see the module docs on `paint_quick_settings`.
-        let primary_dpi = GetDpiForWindow(primary_bar_hwnd).max(96);
         let qs_margin = scaled(QS_SHADOW_MARGIN, primary_dpi);
         let qs_width = scaled(QS_WIDTH, primary_dpi) + qs_margin * 2;
         let qs_height = scaled(QS_HEIGHT, primary_dpi) + qs_margin * 2;
@@ -932,7 +948,29 @@ unsafe extern "system" fn wndproc(
                 LRESULT(0)
             }
             Role::Calendar => {
-                paint_calendar(hwnd);
+                // Same `render_calendar` either way; the surface decides
+                // whether it lands on the translucent Direct2D backend or
+                // the opaque GDI one, exactly as Quick Settings does.
+                let surface = STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|st| st.calendar_gpu.as_ref().map(|g| g as *const gpu::GpuSurface))
+                });
+                match surface {
+                    Some(surface) => {
+                        let dpi = GetDpiForWindow(hwnd).max(96);
+                        // SAFETY: the surface lives in `AppState`, which
+                        // outlives this call; the raw pointer exists only
+                        // so `STATE`'s borrow ends before `redraw`, which
+                        // re-enters code that borrows `STATE` again.
+                        let surface = unsafe { &*surface };
+                        gpu::redraw(surface, |ctx| calendar::paint_calendar_gpu(ctx, dpi));
+                        let mut ps = windows::Win32::Graphics::Gdi::PAINTSTRUCT::default();
+                        let _ = windows::Win32::Graphics::Gdi::BeginPaint(hwnd, &mut ps);
+                        let _ = windows::Win32::Graphics::Gdi::EndPaint(hwnd, &ps);
+                    }
+                    None => paint_calendar(hwnd),
+                }
                 LRESULT(0)
             }
             Role::QuickSettings => {
@@ -989,6 +1027,12 @@ unsafe extern "system" fn wndproc(
                     let x = (lparam.0 & 0xFFFF) as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
                     on_quick_settings_mouse_down(hwnd, x, y);
+                    LRESULT(0)
+                }
+                Role::Calendar => {
+                    let x = (lparam.0 & 0xFFFF) as i32;
+                    let y = ((lparam.0 >> 16) & 0xFFFF) as i32;
+                    calendar::on_calendar_click(hwnd, x, y);
                     LRESULT(0)
                 }
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),

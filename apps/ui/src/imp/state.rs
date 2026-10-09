@@ -180,24 +180,6 @@ thread_local! {
     /// same two places as the others via `set_compat_a11y_config`.
     static IGNORE_RULES: RefCell<Vec<groveshell_config::IgnoreRule>> = const { RefCell::new(Vec::new()) };
 
-    /// See `set_calendar_translucent`. Defaults to false so any path that
-    /// reads it before startup finishes gets the safe, opaque answer.
-    static CALENDAR_TRANSLUCENT: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Whether the calendar window was created without a redirection bitmap,
-/// so its Direct2D content composites translucently over the DWM Acrylic
-/// backdrop. False when the GPU path was unavailable and the window fell
-/// back to opaque GDI painting — the paint code must then fill its card
-/// rather than clearing to alpha 0, or the flyout would render as a
-/// black rectangle.
-pub(crate) fn set_calendar_translucent(translucent: bool) {
-    CALENDAR_TRANSLUCENT.with(|c| c.set(translucent));
-}
-
-/// See [`set_calendar_translucent`]. Read from paint, hence the mirror.
-pub(crate) fn calendar_translucent() -> bool {
-    CALENDAR_TRANSLUCENT.with(|c| c.get())
 }
 
 /// Pushes the high-contrast flag to the UI kit (where the color tokens

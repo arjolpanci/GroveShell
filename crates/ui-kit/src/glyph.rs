@@ -13,6 +13,7 @@ pub const HOME: &str = "\u{E80F}";
 pub const ABOUT: &str = "\u{E946}";
 pub const STARTUP: &str = "\u{E7E8}";
 pub const CHEVRON_DOWN: &str = "\u{E70D}";
+pub const CHEVRON_LEFT: &str = "\u{E76B}";
 pub const CHEVRON_RIGHT: &str = "\u{E76C}";
 pub const OK: &str = "\u{E73E}";
 pub const WARNING: &str = "\u{E7BA}";
@@ -32,6 +33,7 @@ const ALL: &[(&str, &str)] = &[
     ("ABOUT", ABOUT),
     ("STARTUP", STARTUP),
     ("CHEVRON_DOWN", CHEVRON_DOWN),
+    ("CHEVRON_LEFT", CHEVRON_LEFT),
     ("CHEVRON_RIGHT", CHEVRON_RIGHT),
     ("OK", OK),
     ("WARNING", WARNING),
