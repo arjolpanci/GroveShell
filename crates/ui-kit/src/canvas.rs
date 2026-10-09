@@ -69,6 +69,16 @@ pub trait Canvas {
 
     /// Draws a bare Segoe Fluent Icons glyph in the current color.
     fn glyph(&mut self, rect: RECT, glyph: &str);
+
+    /// Restricts later drawing to `rect` until [`Canvas::pop_clip`].
+    ///
+    /// A scrolling surface needs this: its content is drawn at an offset
+    /// and would otherwise paint over whatever chrome sits above the
+    /// scrolling area. Calls pair strictly.
+    fn push_clip(&mut self, rect: RECT);
+
+    /// Undoes the most recent [`Canvas::push_clip`].
+    fn pop_clip(&mut self);
 }
 
 // ---------------------------------------------------------------------
@@ -81,6 +91,8 @@ pub struct GdiCanvas {
     dpi: u32,
     color: u32,
     font_px: i32,
+    /// `SaveDC` handles, one per unmatched `push_clip`.
+    saved_states: Vec<i32>,
 }
 
 impl GdiCanvas {
@@ -89,7 +101,13 @@ impl GdiCanvas {
     pub unsafe fn new(hdc: windows::Win32::Graphics::Gdi::HDC, dpi: u32) -> Self {
         use windows::Win32::Graphics::Gdi::{SetBkMode, TRANSPARENT};
         SetBkMode(hdc, TRANSPARENT);
-        Self { hdc, dpi, color: 0, font_px: crate::design::typography::BODY_PX }
+        Self {
+            hdc,
+            dpi,
+            color: 0,
+            font_px: crate::design::typography::BODY_PX,
+            saved_states: Vec::new(),
+        }
     }
 }
 
@@ -209,6 +227,26 @@ impl Canvas for GdiCanvas {
             crate::icons::draw_fluent_glyph(self.hdc, rect, glyph, COLORREF(self.color));
         }
     }
+
+    fn push_clip(&mut self, rect: RECT) {
+        use windows::Win32::Graphics::Gdi::{IntersectClipRect, SaveDC};
+        // SAFETY: `self.hdc` is valid by this type's construction
+        // contract; `SaveDC`/`RestoreDC` bracket the clip so `pop_clip`
+        // restores exactly the state that was current here.
+        unsafe {
+            self.saved_states.push(SaveDC(self.hdc));
+            IntersectClipRect(self.hdc, rect.left, rect.top, rect.right, rect.bottom);
+        }
+    }
+
+    fn pop_clip(&mut self) {
+        use windows::Win32::Graphics::Gdi::RestoreDC;
+        let Some(state) = self.saved_states.pop() else { return };
+        // SAFETY: `state` came from this DC's own `SaveDC` above.
+        unsafe {
+            let _ = RestoreDC(self.hdc, state);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -244,6 +282,26 @@ impl<'a> D2DCanvas<'a> {
 }
 
 impl Canvas for D2DCanvas<'_> {
+    fn push_clip(&mut self, rect: RECT) {
+        // SAFETY: `self.ctx` is inside an active `BeginDraw`/`EndDraw`
+        // bracket (see `gpu::redraw`), which is what Direct2D requires
+        // for a clip; `pop_clip` pairs with this.
+        unsafe {
+            self.ctx.PushAxisAlignedClip(
+                &Self::rect(rect),
+                windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_ALIASED,
+            );
+        }
+    }
+
+    fn pop_clip(&mut self) {
+        // SAFETY: pairs with `push_clip` above, inside the same draw
+        // bracket.
+        unsafe {
+            self.ctx.PopAxisAlignedClip();
+        }
+    }
+
     fn set_text_color(&mut self, color: COLORREF) {
         self.color = color.0;
     }
@@ -283,19 +341,22 @@ impl Canvas for D2DCanvas<'_> {
     }
 
     fn text(&mut self, rect: RECT, s: &str, flags: DRAW_TEXT_FORMAT) {
-        use windows::Win32::Graphics::Gdi::{DT_CENTER, DT_RIGHT};
-        let centered = (flags.0 & DT_CENTER.0) != 0;
-        // DirectWrite has a trailing alignment, but `gpu::draw_text_in_font`
-        // only exposes leading/centered; a right-aligned label is rare in
-        // the panels and reads acceptably centered in its own rect.
-        let centered = centered || (flags.0 & DT_RIGHT.0) != 0;
-        crate::gpu::draw_text_in_font(
+        use windows::Win32::Graphics::Gdi::{DT_CENTER, DT_END_ELLIPSIS, DT_RIGHT};
+        let align = if (flags.0 & DT_CENTER.0) != 0 {
+            crate::gpu::TextAlign::Center
+        } else if (flags.0 & DT_RIGHT.0) != 0 {
+            crate::gpu::TextAlign::Trailing
+        } else {
+            crate::gpu::TextAlign::Leading
+        };
+        crate::gpu::draw_text_aligned(
             self.ctx,
             Self::rect(rect),
             s,
             self.color,
             crate::runtime::scaled(self.font_px, self.dpi) as f32,
-            centered,
+            align,
+            (flags.0 & DT_END_ELLIPSIS.0) != 0,
             crate::design::typography::resolved_ui_face(),
         );
     }

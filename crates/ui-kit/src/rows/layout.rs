@@ -174,9 +174,45 @@ pub fn layout_page(cards: &[Card], content: RECT, dpi: u32) -> PageLayout {
     PageLayout { cards: laid_out, content_height }
 }
 
+/// How a slider's value is written next to its track.
+///
+/// A range only a couple of units wide is meaningless as an integer:
+/// the animation-speed slider runs 0.5x to 2.0x, so rounding would print
+/// "1x" from 0.5 all the way to 1.4. Narrow ranges get a decimal.
+pub fn format_slider_value(value: f32, min: f32, max: f32, unit: &str) -> String {
+    if (max - min).abs() < 5.0 {
+        format!("{value:.1}{unit}")
+    } else {
+        format!("{}{unit}", value.round() as i32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_wide_slider_range_is_written_as_a_whole_number() {
+        assert_eq!(format_slider_value(32.0, 24.0, 48.0, "px"), "32px");
+        assert_eq!(format_slider_value(41.4, 32.0, 64.0, "px"), "41px");
+    }
+
+    #[test]
+    fn a_narrow_slider_range_keeps_a_decimal() {
+        // 0.5x..2.0x: rounding would read "1x" across most of the track.
+        assert_eq!(format_slider_value(0.5, 0.5, 2.0, "x"), "0.5x");
+        assert_eq!(format_slider_value(1.3, 0.5, 2.0, "x"), "1.3x");
+        assert_eq!(format_slider_value(2.0, 0.5, 2.0, "x"), "2.0x");
+    }
+
+    #[test]
+    fn every_step_of_a_narrow_range_reads_differently() {
+        let labels: Vec<String> = (0..=15)
+            .map(|i| format_slider_value(0.5 + i as f32 * 0.1, 0.5, 2.0, "x"))
+            .collect();
+        let unique: std::collections::BTreeSet<&String> = labels.iter().collect();
+        assert_eq!(unique.len(), labels.len(), "distinct values share a label: {labels:?}");
+    }
 
     fn row(id: u32, description: Option<&str>) -> Row {
         Row {
