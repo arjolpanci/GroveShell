@@ -2,15 +2,27 @@
 //! the light/dark and high-contrast flags, the animation config, and DPI
 //! scaling.
 //!
-//! Thread-local `Cell`s rather than a struct threaded through every
-//! call: these are read from inside paint paths that already hold other
-//! borrows, and a nested `RefCell` borrow panics (see
-//! `apps/ui/src/imp/state.rs`, where this pattern started).
+//! Thread-local `Cell`s rather than fields on the host app's state, and
+//! that shape is not an accident. These values are read from deep inside
+//! paint and animation code that already holds `apps/ui`'s `STATE`
+//! `RefCell` borrow for the whole duration of its work; a second, nested
+//! `STATE.with(|s| s.borrow())` panics with "RefCell already mutably
+//! borrowed". Both known cases were confirmed live, as process aborts:
+//! the animation config on the first `WM_TIMER` tick after opening
+//! Activities, and the dock metrics the moment the mouse moved over an
+//! open overview. A separate `Cell` has no aliasing relationship with
+//! that `RefCell`, so a token accessor can read it under any borrow.
+//!
+//! Whoever owns the config pushes each value here when it is loaded or
+//! reloaded; nothing in the kit reads a config file itself.
 
 use std::cell::Cell;
 
 thread_local! {
-    static ACCENT: Cell<u32> = const { Cell::new(0x00B1_6300) };
+    /// Defaults to the shell's fallback accent (`#4CC2FF`) until
+    /// `design::color::refresh_accent` has read the real one, matching
+    /// what `apps/ui`'s mirror has always started at.
+    static ACCENT: Cell<u32> = const { Cell::new(0x00FF_C24C) };
     static LIGHT_THEME: Cell<bool> = const { Cell::new(false) };
     static HIGH_CONTRAST: Cell<bool> = const { Cell::new(false) };
     static ANIMATION_SCALE: Cell<f32> = const { Cell::new(1.0) };

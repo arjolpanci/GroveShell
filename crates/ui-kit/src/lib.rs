@@ -6,4 +6,6 @@
 //! time it had its own palette it drifted into something that matched
 //! neither Windows nor the shell.
 
+pub mod design;
 pub mod runtime;
+pub mod theme;
