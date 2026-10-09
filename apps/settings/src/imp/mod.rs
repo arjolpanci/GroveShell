@@ -14,6 +14,20 @@ use groveshell_common::Result;
 use process::ManagedProcesses;
 
 pub fn run() -> Result<()> {
+    // Before any window exists, and before anything reads a DPI. Without
+    // it the process is DPI-unaware: `GetDpiForWindow` answers 96
+    // everywhere, every `scaled()` becomes the identity, `WM_DPICHANGED`
+    // never arrives, and DWM bitmap-stretches the window above 100%
+    // scale — blurry text in a settings app whose whole point is looking
+    // native. `apps/ui` declares the same context for the same reason.
+    // SAFETY: a process-wide setting with no preconditions; failure only
+    // means an older Windows that cannot honor it.
+    let _ = unsafe {
+        windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
+            windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        )
+    };
+
     let _log_guard = groveshell_common::logging::init("settings")?;
     tracing::info!("groveshell-settings starting");
 

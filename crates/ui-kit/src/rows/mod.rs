@@ -7,6 +7,7 @@
 //! is clickable, and what Tab reaches cannot drift apart — the rule the
 //! shell already follows for its bar regions and Quick Settings controls.
 
+pub mod dropdown;
 pub mod input;
 pub mod layout;
 pub mod paint;

@@ -6,6 +6,9 @@
 //! Fixing that is the next plan's job (see the spec's §8); this one only
 //! moves the existing information onto the new rows.
 
+use std::cell::RefCell;
+use std::time::{Duration, Instant};
+
 use groveshell_ui_kit::glyph;
 use groveshell_ui_kit::rows::{Card, Control, Row, Severity};
 
@@ -21,6 +24,56 @@ const ROW_PROCESS_BASE: u32 = 10;
 
 const PROCESSES: [&str; 3] = ["watchdog", "host", "ui"];
 
+/// How long a health reading stays good for.
+///
+/// `cards()` is called on every paint *and* on every mouse move, wheel
+/// notch, click and key press — the window rebuilds its rows rather than
+/// caching them. Sampling CPU costs a 200ms sleep per process and the
+/// host ping is a synchronous pipe round trip, so reading them inline
+/// froze the window under the pointer. They are read at most this often
+/// instead, which is far faster than a human reads a status line.
+const HEALTH_MAX_AGE: Duration = Duration::from_secs(2);
+
+#[derive(Clone)]
+struct HealthSnapshot {
+    taken: Instant,
+    summary: Result<(), String>,
+    processes: Vec<(String, Severity)>,
+    running: bool,
+}
+
+thread_local! {
+    static HEALTH: RefCell<Option<HealthSnapshot>> = const { RefCell::new(None) };
+}
+
+/// The current reading, taken afresh only once it is older than
+/// [`HEALTH_MAX_AGE`].
+fn health() -> HealthSnapshot {
+    let fresh = HEALTH.with(|h| {
+        h.borrow()
+            .as_ref()
+            .filter(|s| s.taken.elapsed() < HEALTH_MAX_AGE)
+            .cloned()
+    });
+    if let Some(snapshot) = fresh {
+        return snapshot;
+    }
+    let snapshot = HealthSnapshot {
+        taken: Instant::now(),
+        summary: health_summary(),
+        processes: PROCESSES.iter().map(|name| process_detail(name)).collect(),
+        running: crate::imp::tray::is_ui_running(),
+    };
+    HEALTH.with(|h| *h.borrow_mut() = Some(snapshot.clone()));
+    snapshot
+}
+
+/// Drops the cached reading, so the next paint shows the new state
+/// rather than up to [`HEALTH_MAX_AGE`] of stale one.
+pub(crate) fn invalidate_health() {
+    HEALTH.with(|h| *h.borrow_mut() = None);
+}
+
 pub(crate) struct HomePage;
 
 impl HomePage {
@@ -31,10 +84,10 @@ impl HomePage {
 
 impl Page for HomePage {
     fn cards(&self) -> Vec<Card> {
-        let running = crate::imp::tray::is_ui_running();
-        let health = health_summary();
+        let snapshot = health();
+        let running = snapshot.running;
 
-        let status = match (&health, running) {
+        let status = match (&snapshot.summary, running) {
             (Ok(()), _) => Row::new(ROW_STATUS, "GroveShell is running")
                 .with_description(format!("version {}", env!("CARGO_PKG_VERSION")))
                 .with_glyph(glyph::HOME)
@@ -64,15 +117,15 @@ impl Page for HomePage {
             .with_glyph(glyph::STARTUP)
             .with_control(Control::Toggle { on: autostart::is_enabled() });
 
-        let processes = PROCESSES
+        let processes = snapshot
+            .processes
             .iter()
             .enumerate()
-            .map(|(index, name)| {
-                let (description, severity) = process_detail(name);
-                Row::new(ROW_PROCESS_BASE + index as u32, *name)
-                    .with_description(description)
+            .map(|(index, (description, severity))| {
+                Row::new(ROW_PROCESS_BASE + index as u32, PROCESSES[index])
+                    .with_description(description.clone())
                     .with_glyph(glyph::ABOUT)
-                    .with_control(Control::Status { severity })
+                    .with_control(Control::Status { severity: *severity })
             })
             .collect();
 
@@ -84,7 +137,12 @@ impl Page for HomePage {
 
     fn on_activate(&mut self, id: u32) {
         match id {
-            ROW_TOGGLE_SHELL => toggle_groveshell(),
+            ROW_TOGGLE_SHELL => {
+                toggle_groveshell();
+                // Starting or stopping the shell is exactly when the
+                // cached reading is wrong.
+                invalidate_health();
+            }
             ROW_AUTOSTART => {
                 let next = !autostart::is_enabled();
                 autostart::set_enabled(next);

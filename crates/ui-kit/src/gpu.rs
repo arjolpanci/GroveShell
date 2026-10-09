@@ -232,11 +232,14 @@ pub fn commit() {
 use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Direct2D::Common::{D2D1_COLOR_F, D2D_RECT_F};
-use windows::Win32::Graphics::Direct2D::{ID2D1DeviceContext, D2D1_DRAW_TEXT_OPTIONS_NONE};
+use windows::Win32::Graphics::Direct2D::{
+    ID2D1DeviceContext, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NONE,
+};
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
-    DWRITE_TEXT_ALIGNMENT_LEADING,
+    DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TRIMMING,
+    DWRITE_TRIMMING_GRANULARITY_CHARACTER, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 
 /// Draws into `surface` via `draw`, then commits so the compositor picks
@@ -339,6 +342,14 @@ pub fn draw_text(
 
 /// [`draw_text`] with an explicit font family — the bar needs the Windows
 /// 11 UI face and the Segoe Fluent Icons face, not just the default.
+/// Where a line sits horizontally in its rectangle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextAlign {
+    Leading,
+    Center,
+    Trailing,
+}
+
 pub fn draw_text_in_font(
     ctx: &ID2D1DeviceContext,
     rect: D2D_RECT_F,
@@ -346,6 +357,36 @@ pub fn draw_text_in_font(
     colorref: u32,
     size: f32,
     center_horizontally: bool,
+    family: &str,
+) {
+    draw_text_aligned(
+        ctx,
+        rect,
+        text,
+        colorref,
+        size,
+        if center_horizontally { TextAlign::Center } else { TextAlign::Leading },
+        false,
+        family,
+    );
+}
+
+/// `draw_text_in_font` with the two things a settings row needs that the
+/// shell's own panels never did: a real trailing alignment, and
+/// single-line ellipsis trimming.
+///
+/// Without `ellipsize`, DirectWrite's default is to *wrap*, and with the
+/// paragraph alignment centered a description too long for its rect grows
+/// a second line that bleeds out of the band it was given — it does not
+/// clip, because `D2D1_DRAW_TEXT_OPTIONS_NONE` does not clip either.
+pub fn draw_text_aligned(
+    ctx: &ID2D1DeviceContext,
+    rect: D2D_RECT_F,
+    text: &str,
+    colorref: u32,
+    size: f32,
+    align: TextAlign,
+    ellipsize: bool,
     family: &str,
 ) {
     GPU.with(|g| {
@@ -366,12 +407,28 @@ pub fn draw_text_in_font(
             ) else {
                 return;
             };
-            let _ = format.SetTextAlignment(if center_horizontally {
-                DWRITE_TEXT_ALIGNMENT_CENTER
-            } else {
-                DWRITE_TEXT_ALIGNMENT_LEADING
+            let _ = format.SetTextAlignment(match align {
+                TextAlign::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+                TextAlign::Trailing => DWRITE_TEXT_ALIGNMENT_TRAILING,
+                TextAlign::Leading => DWRITE_TEXT_ALIGNMENT_LEADING,
             });
             let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+            let mut options = D2D1_DRAW_TEXT_OPTIONS_NONE;
+            if ellipsize {
+                let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                if let Ok(sign) = gpu_ctx.dwrite_factory.CreateEllipsisTrimmingSign(&format) {
+                    let trimming = DWRITE_TRIMMING {
+                        granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER,
+                        delimiter: 0,
+                        delimiterCount: 0,
+                    };
+                    let _ = format.SetTrimming(&trimming, &sign);
+                }
+                // Belt and braces: trimming decides where the ellipsis
+                // goes, clipping guarantees nothing escapes the rect.
+                options = D2D1_DRAW_TEXT_OPTIONS_CLIP;
+            }
 
             let Ok(brush) = ctx.CreateSolidColorBrush(&colorref_to_d2d(colorref), None) else {
                 return;
@@ -382,7 +439,7 @@ pub fn draw_text_in_font(
                 &format,
                 &rect,
                 &brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                options,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         }

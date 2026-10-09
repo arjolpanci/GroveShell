@@ -12,6 +12,7 @@
 use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT, DT_SINGLELINE, DT_VCENTER};
 
+use super::dropdown;
 use super::layout::{PageLayout, RowRects, ROW_PAD_X};
 use super::{Card, Control, Row, Severity};
 use crate::canvas::Canvas;
@@ -26,18 +27,28 @@ const TOGGLE_HEIGHT: i32 = 20;
 const TOGGLE_WIDTH: i32 = 40;
 const SLIDER_TRACK_HEIGHT: i32 = 4;
 const SLIDER_THUMB_RADIUS: i32 = 8;
+/// The chevron on a choice row, as a square. Small and centred, like the
+/// one on a WinUI ComboBox.
+const CHEVRON_SIZE: i32 = 12;
 
 /// Paints every card and row. `focused` and `hovered` are row ids;
 /// `scroll` shifts the whole page up by that many pixels.
+///
+/// `viewport` is the area the page is allowed to paint in. Scrolling
+/// moves rows up past the top of it, and without a clip they would be
+/// drawn over whatever chrome sits above — the page title, in the
+/// settings window's case.
 pub fn paint_page(
     canvas: &mut dyn Canvas,
     cards: &[Card],
     layout: &PageLayout,
+    viewport: RECT,
     focused: Option<u32>,
     hovered: Option<u32>,
     scroll: i32,
     dpi: u32,
 ) {
+    canvas.push_clip(viewport);
     for (card_index, (card_rect, row_rects)) in layout.cards.iter().enumerate() {
         let Some(card) = cards.get(card_index) else { continue };
 
@@ -73,6 +84,7 @@ pub fn paint_page(
             }
         }
     }
+    canvas.pop_clip();
 }
 
 fn shift(rect: RECT, scroll: i32) -> RECT {
@@ -231,7 +243,7 @@ fn paint_control(canvas: &mut dyn Canvas, row: &Row, rect: RECT, row_rect: RECT,
             canvas.set_font_size(typography::BODY_PX);
             canvas.text(
                 RECT { left: track.right, right: row_rect.right - scaled(ROW_PAD_X, dpi), ..rect },
-                &format!("{}{}", value.round() as i32, unit),
+                &super::layout::format_slider_value(*value, *min, *max, unit),
                 DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
             );
         }
@@ -249,14 +261,24 @@ fn paint_control(canvas: &mut dyn Canvas, row: &Row, rect: RECT, row_rect: RECT,
             );
             canvas.set_text_color(COLORREF(if enabled { color::text() } else { color::text_muted() }));
             canvas.set_font_size(typography::BODY_PX);
-            let chevron = scaled(24, dpi);
+            let chevron_box = scaled(CHEVRON_SIZE, dpi);
+            let chevron_left = rect.right - scaled(12, dpi) - chevron_box;
             canvas.text(
-                RECT { left: rect.left + scaled(12, dpi), right: rect.right - chevron, ..rect },
+                RECT { left: rect.left + scaled(12, dpi), right: chevron_left, ..rect },
                 options.get(*selected).copied().unwrap_or(""),
                 DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
+            // A small, vertically centred square: `glyph` sizes the mark
+            // to the rect it is given, so a full-row-height rect here
+            // drew an enormous arrow.
+            let middle = (rect.top + rect.bottom) / 2;
             canvas.glyph(
-                RECT { left: rect.right - chevron, ..rect },
+                RECT {
+                    left: chevron_left,
+                    top: middle - chevron_box / 2,
+                    right: chevron_left + chevron_box,
+                    bottom: middle + chevron_box / 2,
+                },
                 glyph::CHEVRON_DOWN,
             );
         }
@@ -298,4 +320,57 @@ fn paint_control(canvas: &mut dyn Canvas, row: &Row, rect: RECT, row_rect: RECT,
 fn inset_vertically(rect: RECT, dpi: u32) -> RECT {
     let inset = scaled(metrics::SPACING, dpi);
     RECT { top: rect.top + inset, bottom: rect.bottom - inset, ..rect }
+}
+
+/// Paints an open dropdown over the page.
+///
+/// Called after [`paint_page`] so the list sits above the rows it
+/// covers. `hovered` is the option under the cursor, not a row id.
+pub fn paint_dropdown(
+    canvas: &mut dyn Canvas,
+    options: &[&str],
+    selected: usize,
+    hovered: Option<usize>,
+    popup: RECT,
+    dpi: u32,
+) {
+    let radius = scaled(CARD_RADIUS, dpi);
+    canvas.fill_round_rect(popup, radius, COLORREF(color::surface_overlay()));
+    canvas.stroke_round_rect(popup, radius, COLORREF(color::stroke()), 1.0);
+
+    for (index, option) in options.iter().enumerate() {
+        let rect = dropdown::option_rect(popup, index, dpi);
+        if hovered == Some(index) {
+            canvas.fill_round_rect(
+                RECT {
+                    left: rect.left + scaled(4, dpi),
+                    right: rect.right - scaled(4, dpi),
+                    ..rect
+                },
+                radius,
+                COLORREF(color::surface_raised()),
+            );
+        }
+        if index == selected {
+            // The accent bar marking the current value, the same mark
+            // the nav rail uses for the current page.
+            canvas.fill_round_rect(
+                RECT {
+                    left: rect.left + scaled(4, dpi),
+                    top: rect.top + scaled(8, dpi),
+                    right: rect.left + scaled(7, dpi),
+                    bottom: rect.bottom - scaled(8, dpi),
+                },
+                scaled(2, dpi),
+                COLORREF(color::accent()),
+            );
+        }
+        canvas.set_text_color(COLORREF(color::text()));
+        canvas.set_font_size(typography::BODY_PX);
+        canvas.text(
+            RECT { left: rect.left + scaled(16, dpi), ..rect },
+            option,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    }
 }

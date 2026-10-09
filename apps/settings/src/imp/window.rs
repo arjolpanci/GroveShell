@@ -12,9 +12,10 @@ use std::cell::RefCell;
 use groveshell_ui_kit::canvas::Canvas;
 use groveshell_ui_kit::design::{color, material, typography};
 use groveshell_ui_kit::gpu::GpuSurface;
+use groveshell_ui_kit::rows::dropdown;
 use groveshell_ui_kit::rows::input::{clamp_scroll, hit_test, next_focus, Hit};
 use groveshell_ui_kit::rows::layout::{layout_page, PageLayout, MIN_CONTENT_WIDTH};
-use groveshell_ui_kit::rows::{paint::paint_page, Card, Control};
+use groveshell_ui_kit::rows::{paint::paint_dropdown, paint::paint_page, Card, Control};
 use groveshell_ui_kit::runtime::scaled;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -24,18 +25,19 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE, VK_DOWN, VK_LEFT, VK_RETURN,
-    VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE, VK_DOWN,
+    VK_ESCAPE, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, LoadCursorW, RegisterClassW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, LoadCursorW,
+    RegisterClassW,
     SetForegroundWindow, SetWindowPos, ShowWindow, IDC_ARROW, MINMAXINFO, SWP_NOACTIVATE,
     SWP_NOZORDER, SW_RESTORE, SW_SHOW, WNDCLASSW, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
+    WM_CAPTURECHANGED, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_PAINT, WM_SETTINGCHANGE, WM_SIZE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use super::nav::{nav_hit_test, nav_layout, next_nav, NAV_ITEMS, NAV_WIDTH};
@@ -58,7 +60,21 @@ struct WindowState {
     selected_nav: usize,
     scroll: i32,
     focused_row: Option<u32>,
+    /// Whether the focus ring should be drawn. Windows shows it for
+    /// keyboard focus only: a ring that appears under every mouse click
+    /// is noise, and its absence is how a pointer user can tell the
+    /// keyboard is not driving.
+    focus_visible: bool,
     hovered_row: Option<u32>,
+    /// The choice row whose dropdown is open, if any. While this is set
+    /// the list owns the mouse: it is hit-tested before the rows beneath
+    /// it, and a click anywhere else closes it.
+    open_choice: Option<u32>,
+    hovered_option: Option<usize>,
+    /// The slider row currently being dragged, while the mouse is
+    /// captured. `Hit::SliderDrag` names a drag; without this it was
+    /// only ever a single click at the press point.
+    dragging_slider: Option<u32>,
     tracking_mouse: bool,
 }
 
@@ -167,48 +183,84 @@ pub(crate) fn open_settings_window() {
         let _ = RegisterClassW(&class);
 
         let (x, y, width, height) = spawn_rect();
-        // `WS_EX_NOREDIRECTIONBITMAP` drops the opaque GDI redirection
-        // surface so the DirectComposition content — and the Mica behind
-        // it — is what reaches the screen. Deliberately not a tool window:
-        // this should behave like any other application window, including
-        // in the shell's own Activities overview.
-        let hwnd = CreateWindowExW(
-            WS_EX_NOREDIRECTIONBITMAP,
-            w!("GroveShellSettingsWindow"),
-            w!("GroveShell Settings"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            x,
-            y,
-            width,
-            height,
-            None,
-            None,
-            hinstance,
-            None,
-        );
-        let Ok(hwnd) = hwnd else { return };
 
+        // `WS_EX_NOREDIRECTIONBITMAP` drops the opaque GDI redirection
+        // bitmap so the DirectComposition content — and the Mica behind
+        // it — is what reaches the screen. It is only safe once a surface
+        // actually exists: a window without a redirection bitmap cannot
+        // be painted by GDI at all, so a window that failed to get a
+        // surface would be invisible rather than merely opaque. So build
+        // it translucent, check, and rebuild it opaque if the surface
+        // failed — the same two-attempt shape as `bar_gpu`'s bar window.
+        // Deliberately not a tool window: this should behave like any
+        // other application window, including in the shell's own
+        // Activities overview.
+        let make = |translucent: bool| {
+            let ex = if translucent { WS_EX_NOREDIRECTIONBITMAP } else { Default::default() };
+            CreateWindowExW(
+                ex,
+                w!("GroveShellSettingsWindow"),
+                w!("GroveShell Settings"),
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                x,
+                y,
+                width,
+                height,
+                None,
+                None,
+                hinstance,
+                None,
+            )
+        };
+
+        let Ok(mut hwnd) = make(true) else { return };
         let mut client = RECT::default();
         let _ = GetClientRect(hwnd, &mut client);
+        let mut surface = surface::create(hwnd, client.right, client.bottom);
+        if surface.is_none() {
+            tracing::warn!("settings window surface unavailable; rebuilding the window opaque");
+            let _ = DestroyWindow(hwnd);
+            let Ok(opaque) = make(false) else { return };
+            hwnd = opaque;
+            let _ = GetClientRect(hwnd, &mut client);
+            surface = surface::create(hwnd, client.right, client.bottom);
+        }
 
         STATE.with(|s| {
             *s.borrow_mut() = Some(WindowState {
                 hwnd,
-                surface: surface::create(hwnd, client.right, client.bottom),
+                surface,
                 selected_nav: 0,
                 scroll: 0,
                 focused_row: None,
+                focus_visible: false,
                 hovered_row: None,
+                open_choice: None,
+                hovered_option: None,
+                dragging_slider: None,
                 tracking_mouse: false,
             });
         });
 
-        color::refresh_theme();
-        color::refresh_accent();
+        refresh_system_appearance();
         material::apply(hwnd, material::Surface::Window);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
     }
+}
+
+/// Re-reads everything the design tokens resolve against.
+///
+/// The high-contrast flag is config, not a system setting, and nothing
+/// else in this process pushes it: without this the shell would repaint
+/// in the high-contrast palette while the window holding that very
+/// switch stayed in light/dark.
+fn refresh_system_appearance() {
+    color::refresh_theme();
+    color::refresh_accent();
+    groveshell_ui_kit::runtime::set_high_contrast(
+        super::config_store::current().appearance.high_contrast,
+    );
 }
 
 /// Centred on whichever monitor the cursor is on, so opening Settings
@@ -224,15 +276,25 @@ fn spawn_rect() -> (i32, i32, i32, i32) {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
+        // `CreateWindowExW` takes physical pixels, and this process is
+        // per-monitor DPI aware, so the logical default has to be scaled
+        // for the monitor it will open on. Without this the window opens
+        // at half size on a 200% display — small enough that
+        // `WM_GETMINMAXINFO` clamps it to the minimum.
+        let mut dpi_x = 96u32;
+        let mut dpi_y = 96u32;
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        let dpi = dpi_x.max(96);
+
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let work = info.rcWork;
-            let width = WINDOW_WIDTH.min(work.right - work.left);
-            let height = WINDOW_HEIGHT.min(work.bottom - work.top);
+            let width = scaled(WINDOW_WIDTH, dpi).min(work.right - work.left);
+            let height = scaled(WINDOW_HEIGHT, dpi).min(work.bottom - work.top);
             let x = work.left + ((work.right - work.left) - width) / 2;
             let y = work.top + ((work.bottom - work.top) - height) / 2;
             (x, y, width, height)
         } else {
-            (200, 200, WINDOW_WIDTH, WINDOW_HEIGHT)
+            (200, 200, scaled(WINDOW_WIDTH, dpi), scaled(WINDOW_HEIGHT, dpi))
         }
     }
 }
@@ -252,23 +314,57 @@ fn paint_window(hwnd: HWND) {
         let _ = GetClientRect(hwnd, &mut client);
     }
 
-    let (selected, scroll, focused, hovered) = STATE.with(|s| {
+    let (selected, scroll, focused, hovered, open_choice, hovered_option) = STATE.with(|s| {
         let state = s.borrow();
-        let Some(st) = state.as_ref() else { return (0, 0, None, None) };
-        (st.selected_nav, st.scroll, st.focused_row, st.hovered_row)
+        let Some(st) = state.as_ref() else { return (0, 0, None, None, None, None) };
+        (
+            st.selected_nav,
+            st.scroll,
+            st.focus_visible.then_some(st.focused_row).flatten(),
+            st.hovered_row,
+            st.open_choice,
+            st.hovered_option,
+        )
     });
 
     let (cards, layout) = page_layout(client, dpi, selected);
     let scroll = clamp_scroll(scroll, layout.content_height, client.bottom - content_rect(client, dpi).top);
+
+    // A surface can go missing mid-session: a resize whose recreate
+    // failed, or device loss. Without this the window would stay blank
+    // for the rest of the session.
+    STATE.with(|s| {
+        if let Some(st) = s.borrow_mut().as_mut() {
+            if st.surface.is_none() && groveshell_ui_kit::gpu::is_enabled() {
+                st.surface = surface::create(hwnd, client.right, client.bottom);
+                if st.surface.is_some() {
+                    tracing::info!("settings DirectComposition surface recovered");
+                }
+            }
+        }
+    });
 
     // The surface is moved out for the duration of the paint and put
     // back afterwards: `surface::paint` runs a closure that reaches back
     // into the page code, which may read `STATE`, and holding the borrow
     // across that would panic.
     let surface = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.surface.take()));
+    let open_popup = open_choice.and_then(|id| {
+        let options = match control_of(&cards, id) {
+            Some(Control::Choice { options, selected }) => (options, selected),
+            _ => return None,
+        };
+        let control = control_rect_of(&cards, &layout, id)?;
+        let popup = dropdown::popup_rect(shift_down(control, scroll), client, options.0.len(), dpi);
+        Some((options.0, options.1, popup))
+    });
+
     surface::paint(hwnd, surface.as_ref(), client, dpi, |canvas, client| {
         paint_chrome(canvas, client, dpi, selected);
-        paint_page(canvas, &cards, &layout, focused, hovered, scroll, dpi);
+        paint_page(canvas, &cards, &layout, content_rect(client, dpi), focused, hovered, scroll, dpi);
+        if let Some((options, chosen, popup)) = open_popup {
+            paint_dropdown(canvas, options, chosen, hovered_option, popup, dpi);
+        }
     });
     STATE.with(|s| {
         if let Some(st) = s.borrow_mut().as_mut() {
@@ -375,7 +471,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     if let Some(st) = s.borrow_mut().as_mut() {
                         // Recreated rather than resized: a composition
                         // surface is created at a fixed size.
+                        //
+                        // Drop the old surface and its target FIRST. A
+                        // window can hold only one DirectComposition
+                        // target, and Rust evaluates the right-hand side
+                        // before dropping the old value, so assigning
+                        // straight over this would ask for a second
+                        // target on the same HWND, fail, and leave the
+                        // window permanently unpainted — with
+                        // `WS_EX_NOREDIRECTIONBITMAP`, invisible.
+                        // `apps/ui`'s desktop dock hit exactly this.
+                        st.surface = None;
                         st.surface = surface::create(hwnd, width, height);
+                        if st.surface.is_none() {
+                            tracing::warn!(
+                                "settings surface recreate failed after resize; retrying on next paint"
+                            );
+                        }
                     }
                 });
             }
@@ -414,6 +526,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let viewport = client.bottom - content_rect(client, dpi).top;
             STATE.with(|s| {
                 if let Some(st) = s.borrow_mut().as_mut() {
+                    // A list anchored to a row that is about to move must
+                    // not stay open over the wrong one.
+                    st.open_choice = None;
+                    st.hovered_option = None;
                     st.scroll = clamp_scroll(
                         st.scroll - notches * scaled(48, dpi),
                         layout.content_height,
@@ -431,12 +547,63 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let dpi = GetDpiForWindow(hwnd).max(96);
             let mut client = RECT::default();
             let _ = GetClientRect(hwnd, &mut client);
+
+            // A drag in progress owns the mouse: track the value under
+            // the cursor even when it has left the track's rectangle.
+            let dragging = STATE.with(|s| s.borrow().as_ref().and_then(|st| st.dragging_slider));
+            if let Some(id) = dragging {
+                let (selected, scroll) = STATE
+                    .with(|s| s.borrow().as_ref().map_or((0, 0), |st| (st.selected_nav, st.scroll)));
+                let (cards, layout) = page_layout(client, dpi, selected);
+                if let (Some(track), Some(Control::Slider { min, max, .. })) =
+                    (control_rect_of(&cards, &layout, id), control_of(&cards, id))
+                {
+                    let track = shift_down(track, scroll);
+                    let width = (track.right - track.left).max(1) as f32;
+                    let fraction = ((x - track.left) as f32 / width).clamp(0.0, 1.0);
+                    set_value(selected, id, min + fraction * (max - min));
+                    repaint(hwnd);
+                }
+                return LRESULT(0);
+            }
             let (selected, scroll) =
                 STATE.with(|s| s.borrow().as_ref().map_or((0, 0), |st| (st.selected_nav, st.scroll)));
             let (cards, layout) = page_layout(client, dpi, selected);
-            let hovered = match hit_test(&cards, &layout, x, y, scroll) {
-                Hit::Row(id) | Hit::SliderDrag { id, .. } => Some(id),
-                Hit::None => None,
+            // While a list is open the cursor highlights its options,
+            // not the rows underneath.
+            let open = STATE.with(|s| s.borrow().as_ref().and_then(|st| st.open_choice));
+            if let Some(id) = open {
+                let option = match (
+                    open_popup_rect(hwnd, &cards, &layout, id, scroll, dpi),
+                    control_of(&cards, id),
+                ) {
+                    (Some(popup), Some(Control::Choice { options, .. })) => {
+                        dropdown::option_at(popup, options.len(), x, y, dpi)
+                    }
+                    _ => None,
+                };
+                let changed = STATE.with(|s| {
+                    let mut state = s.borrow_mut();
+                    let Some(st) = state.as_mut() else { return false };
+                    if st.hovered_option == option {
+                        return false;
+                    }
+                    st.hovered_option = option;
+                    true
+                });
+                if changed {
+                    repaint(hwnd);
+                }
+                return LRESULT(0);
+            }
+
+            let hovered = if y < content_rect(client, dpi).top {
+                None
+            } else {
+                match hit_test(&cards, &layout, x, y, scroll) {
+                    Hit::Row(id) | Hit::SliderDrag { id, .. } => Some(id),
+                    Hit::None => None,
+                }
             };
 
             let changed = STATE.with(|s| {
@@ -464,6 +631,28 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             LRESULT(0)
         }
 
+        WM_LBUTTONUP => {
+            let was_dragging = STATE.with(|s| {
+                s.borrow_mut().as_mut().and_then(|st| st.dragging_slider.take()).is_some()
+            });
+            if was_dragging {
+                let _ = ReleaseCapture();
+            }
+            LRESULT(0)
+        }
+
+        // Capture can be taken away without a button-up (an alt-tab, a
+        // system dialog); the drag must end with it rather than persist
+        // and swallow every later mouse move.
+        WM_CAPTURECHANGED => {
+            STATE.with(|s| {
+                if let Some(st) = s.borrow_mut().as_mut() {
+                    st.dragging_slider = None;
+                }
+            });
+            LRESULT(0)
+        }
+
         WM_MOUSELEAVE => {
             STATE.with(|s| {
                 if let Some(st) = s.borrow_mut().as_mut() {
@@ -480,12 +669,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
             let dpi = GetDpiForWindow(hwnd).max(96);
 
+            // An open dropdown is hit-tested before anything else: it
+            // is drawn over the rows, so it must take the clicks that
+            // land on it, and a click anywhere else dismisses it.
+            let open = STATE.with(|s| s.borrow().as_ref().and_then(|st| st.open_choice));
+            if let Some(id) = open {
+                let mut client = RECT::default();
+                let _ = GetClientRect(hwnd, &mut client);
+                let (selected, scroll) = STATE
+                    .with(|s| s.borrow().as_ref().map_or((0, 0), |st| (st.selected_nav, st.scroll)));
+                let (cards, layout) = page_layout(client, dpi, selected);
+                if let (Some(popup), Some(Control::Choice { options, .. })) =
+                    (open_popup_rect(hwnd, &cards, &layout, id, scroll, dpi), control_of(&cards, id))
+                {
+                    if let Some(index) = dropdown::option_at(popup, options.len(), x, y, dpi) {
+                        set_value(selected, id, index as f32);
+                    }
+                    STATE.with(|s| {
+                        if let Some(st) = s.borrow_mut().as_mut() {
+                            st.open_choice = None;
+                            st.hovered_option = None;
+                        }
+                    });
+                    repaint(hwnd);
+                    // The click is spent either way: on the option it
+                    // picked, or on dismissing the list. It must not also
+                    // act on whatever row sits underneath.
+                    return LRESULT(0);
+                }
+            }
+
             if let Some(index) = nav_hit_test(x, y, dpi) {
                 STATE.with(|s| {
                     if let Some(st) = s.borrow_mut().as_mut() {
                         st.selected_nav = index;
                         st.scroll = 0;
                         st.focused_row = None;
+                        st.open_choice = None;
+                        st.hovered_option = None;
                     }
                 });
                 repaint(hwnd);
@@ -498,28 +719,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 STATE.with(|s| s.borrow().as_ref().map_or((0, 0), |st| (st.selected_nav, st.scroll)));
             let (cards, layout) = page_layout(client, dpi, selected);
 
+            // Rows scrolled up behind the page-title band are still in
+            // the layout; a click up there must not reach them.
+            if y < content_rect(client, dpi).top {
+                return LRESULT(0);
+            }
+
             match hit_test(&cards, &layout, x, y, scroll) {
                 Hit::SliderDrag { id, value } => {
                     STATE.with(|s| {
                         if let Some(st) = s.borrow_mut().as_mut() {
                             st.focused_row = Some(id);
+                            st.focus_visible = false;
+                            st.dragging_slider = Some(id);
                         }
                     });
+                    SetCapture(hwnd);
                     set_value(selected, id, value);
                 }
                 Hit::Row(id) => {
                     STATE.with(|s| {
                         if let Some(st) = s.borrow_mut().as_mut() {
                             st.focused_row = Some(id);
+                            st.focus_visible = false;
                         }
                     });
-                    // A choice row cycles to its next option on click,
-                    // which is the whole interaction until the dropdown
-                    // itself exists.
+                    // A choice row opens its list; every other row
+                    // acts immediately.
                     match control_of(&cards, id) {
-                        Some(Control::Choice { options, selected: current }) => {
-                            let next = (current + 1) % options.len().max(1);
-                            set_value(selected, id, next as f32);
+                        Some(Control::Choice { .. }) => {
+                            STATE.with(|s| {
+                                if let Some(st) = s.borrow_mut().as_mut() {
+                                    st.open_choice = Some(id);
+                                    st.hovered_option = None;
+                                }
+                            });
                         }
                         _ => activate(selected, id),
                     }
@@ -536,6 +770,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let cards = cards_for(selected);
             let key = wparam.0 as u16;
 
+            let open = STATE.with(|s| s.borrow().as_ref().and_then(|st| st.open_choice));
+            if let Some(id) = open {
+                if key == VK_ESCAPE.0 {
+                    STATE.with(|s| {
+                        if let Some(st) = s.borrow_mut().as_mut() {
+                            st.open_choice = None;
+                            st.hovered_option = None;
+                        }
+                    });
+                    repaint(hwnd);
+                    return LRESULT(0);
+                }
+                if let Some(Control::Choice { options, selected: current }) = control_of(&cards, id) {
+                    if key == VK_UP.0 || key == VK_DOWN.0 {
+                        let count = options.len().max(1);
+                        let delta = if key == VK_UP.0 { count - 1 } else { 1 };
+                        set_value(selected, id, ((current + delta) % count) as f32);
+                        repaint(hwnd);
+                        return LRESULT(0);
+                    }
+                    if key == VK_RETURN.0 || key == VK_SPACE.0 {
+                        STATE.with(|s| {
+                            if let Some(st) = s.borrow_mut().as_mut() {
+                                st.open_choice = None;
+                                st.hovered_option = None;
+                            }
+                        });
+                        repaint(hwnd);
+                        return LRESULT(0);
+                    }
+                }
+            }
+
             if key == VK_TAB.0 {
                 let shift = GetKeyState(
                     VK_SHIFT.0 as i32,
@@ -543,22 +810,26 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     & 0x8000
                     != 0;
                 let next = next_focus(&cards, focused, !shift);
-                STATE.with(|s| {
-                    if let Some(st) = s.borrow_mut().as_mut() {
-                        st.focused_row = next;
-                    }
-                });
-                repaint(hwnd);
+                focus_row(hwnd, selected, next);
                 return LRESULT(0);
             }
 
             if key == VK_UP.0 || key == VK_DOWN.0 {
+                // With a row focused the arrows walk the rows, which is
+                // where the keyboard already is. With nothing focused
+                // they move between pages.
+                if focused.is_some() {
+                    let next = next_focus(&cards, focused, key == VK_DOWN.0);
+                    focus_row(hwnd, selected, next);
+                    return LRESULT(0);
+                }
                 let delta = if key == VK_UP.0 { -1 } else { 1 };
                 STATE.with(|s| {
                     if let Some(st) = s.borrow_mut().as_mut() {
                         st.selected_nav = next_nav(st.selected_nav, delta);
                         st.scroll = 0;
                         st.focused_row = None;
+                        st.open_choice = None;
                     }
                 });
                 repaint(hwnd);
@@ -568,9 +839,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if let Some(id) = focused {
                 if key == VK_SPACE.0 || key == VK_RETURN.0 {
                     match control_of(&cards, id) {
-                        Some(Control::Choice { options, selected: current }) => {
-                            let next = (current + 1) % options.len().max(1);
-                            set_value(selected, id, next as f32);
+                        Some(Control::Choice { .. }) => {
+                            STATE.with(|s| {
+                                if let Some(st) = s.borrow_mut().as_mut() {
+                                    st.open_choice = Some(id);
+                                    st.hovered_option = None;
+                                }
+                            });
                         }
                         _ => activate(selected, id),
                     }
@@ -595,8 +870,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // `apps/ui` reacts to the broadcast, so an open window never
         // keeps a stale palette.
         WM_SETTINGCHANGE => {
-            color::refresh_theme();
-            color::refresh_accent();
+            refresh_system_appearance();
             material::apply(hwnd, material::Surface::Window);
             repaint(hwnd);
             DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -609,6 +883,76 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+/// Moves focus to `row`, scrolling it into view.
+///
+/// Focus that lands below the fold with no scroll is focus the user
+/// cannot see — the focus rectangle would be drawn off-screen.
+fn focus_row(hwnd: HWND, page: usize, row: Option<u32>) {
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let mut client = RECT::default();
+    // SAFETY: `hwnd` is a live, process-lifetime window.
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+    let (cards, layout) = page_layout(client, dpi, page);
+    let content = content_rect(client, dpi);
+    let viewport = client.bottom - content.top;
+
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let Some(st) = state.as_mut() else { return };
+        st.focused_row = row;
+        st.focus_visible = true;
+        st.open_choice = None;
+        st.hovered_option = None;
+
+        let Some(id) = row else { return };
+        let Some(rect) = control_rect_of(&cards, &layout, id) else { return };
+        // `rect` is in content coordinates; the visible band is
+        // `scroll .. scroll + viewport` measured from `content.top`.
+        let top = rect.top - content.top;
+        let bottom = rect.bottom - content.top;
+        if top < st.scroll {
+            st.scroll = top;
+        } else if bottom > st.scroll + viewport {
+            st.scroll = bottom - viewport;
+        }
+        st.scroll = clamp_scroll(st.scroll, layout.content_height, viewport);
+    });
+    repaint(hwnd);
+}
+
+/// A rect moved into window coordinates: the layout is computed in
+/// content coordinates, which the scroll offset shifts up.
+fn shift_down(rect: RECT, scroll: i32) -> RECT {
+    RECT { top: rect.top - scroll, bottom: rect.bottom - scroll, ..rect }
+}
+
+/// The on-screen control rect of `id`, in content coordinates.
+fn control_rect_of(cards: &[Card], layout: &PageLayout, id: u32) -> Option<RECT> {
+    for (card_index, (_, row_rects)) in layout.cards.iter().enumerate() {
+        let card = cards.get(card_index)?;
+        for (row_index, rects) in row_rects.iter().enumerate() {
+            if card.rows.get(row_index).is_some_and(|r| r.id == id) {
+                return Some(rects.control);
+            }
+        }
+    }
+    None
+}
+
+/// The popup rect for the currently open choice, if one is open.
+fn open_popup_rect(hwnd: HWND, cards: &[Card], layout: &PageLayout, id: u32, scroll: i32, dpi: u32) -> Option<RECT> {
+    let Some(Control::Choice { options, .. }) = control_of(cards, id) else { return None };
+    let control = control_rect_of(cards, layout, id)?;
+    let mut client = RECT::default();
+    // SAFETY: `hwnd` is a live, process-lifetime window.
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut client);
+    }
+    Some(dropdown::popup_rect(shift_down(control, scroll), client, options.len(), dpi))
 }
 
 /// The control belonging to `id` on the current page, cloned out so no
