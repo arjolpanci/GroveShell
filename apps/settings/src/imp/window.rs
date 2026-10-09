@@ -188,7 +188,6 @@ pub(crate) fn open_settings_window() {
         );
         let Ok(hwnd) = hwnd else { return };
 
-        let dpi = GetDpiForWindow(hwnd).max(96);
         let mut client = RECT::default();
         let _ = GetClientRect(hwnd, &mut client);
 
@@ -209,7 +208,6 @@ pub(crate) fn open_settings_window() {
         material::apply(hwnd, material::Surface::Window);
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
-        let _ = scaled(0, dpi); // dpi is read again per paint; this keeps the call honest
     }
 }
 
@@ -263,30 +261,21 @@ fn paint_window(hwnd: HWND) {
     let (cards, layout) = page_layout(client, dpi, selected);
     let scroll = clamp_scroll(scroll, layout.content_height, client.bottom - content_rect(client, dpi).top);
 
-    STATE.with(|s| {
-        if let Some(st) = s.borrow_mut().as_mut() {
-            st.surface.take().map(|surface| {
-                s_restore(st, surface);
-            });
-        }
-    });
-
-    let surface_taken = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.surface.take()));
-    surface::paint(hwnd, surface_taken.as_ref(), client, dpi, |canvas, client| {
+    // The surface is moved out for the duration of the paint and put
+    // back afterwards: `surface::paint` runs a closure that reaches back
+    // into the page code, which may read `STATE`, and holding the borrow
+    // across that would panic.
+    let surface = STATE.with(|s| s.borrow_mut().as_mut().and_then(|st| st.surface.take()));
+    surface::paint(hwnd, surface.as_ref(), client, dpi, |canvas, client| {
         paint_chrome(canvas, client, dpi, selected);
         paint_page(canvas, &cards, &layout, focused, hovered, scroll, dpi);
     });
     STATE.with(|s| {
         if let Some(st) = s.borrow_mut().as_mut() {
-            st.surface = surface_taken;
+            st.surface = surface;
             st.scroll = scroll;
         }
     });
-}
-
-/// Puts a surface back after a paint that didn't happen.
-fn s_restore(state: &mut WindowState, surface: GpuSurface) {
-    state.surface = Some(surface);
 }
 
 /// The window's own chrome: the backdrop fill, the nav rail and the page
@@ -542,9 +531,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
 
         WM_KEYDOWN => {
-            let dpi = GetDpiForWindow(hwnd).max(96);
-            let mut client = RECT::default();
-            let _ = GetClientRect(hwnd, &mut client);
             let (selected, focused) = STATE
                 .with(|s| s.borrow().as_ref().map_or((0, None), |st| (st.selected_nav, st.focused_row)));
             let cards = cards_for(selected);
@@ -601,7 +587,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     }
                 }
             }
-            let _ = (dpi, client);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
