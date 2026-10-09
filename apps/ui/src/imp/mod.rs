@@ -17,7 +17,7 @@ mod dock_pins;
 mod flyout;
 mod gpu;
 mod hotplug;
-mod icons;
+pub(crate) use groveshell_ui_kit::icons;
 mod monitors;
 mod monitor_workspaces;
 mod movesize;

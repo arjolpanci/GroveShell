@@ -29,7 +29,7 @@ use windows::Win32::UI::Shell::SHCreateMemStream;
 /// matches the state they already know, rather than this module
 /// guessing thresholds itself.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum Icon {
+pub enum Icon {
     Wifi,
     WifiOff,
     Volume2,
@@ -58,7 +58,7 @@ pub(crate) enum Icon {
 /// but draws a device pill, and the battery run turned out to be `E850`
 /// (empty) through `E859` (full) with the charging variants living
 /// separately at `E83E`/`E83F`.
-pub(crate) fn fluent_glyph(icon: Icon) -> Option<&'static str> {
+pub fn fluent_glyph(icon: Icon) -> Option<&'static str> {
     Some(match icon {
         Icon::Wifi => "\u{E701}",
         Icon::WifiOff => "\u{EB5E}",
@@ -82,21 +82,21 @@ pub(crate) fn fluent_glyph(icon: Icon) -> Option<&'static str> {
 impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
-            Icon::Wifi => include_bytes!("../../resources/icons/png/wifi.png"),
-            Icon::WifiOff => include_bytes!("../../resources/icons/png/wifi-off.png"),
-            Icon::Volume2 => include_bytes!("../../resources/icons/png/volume-2.png"),
-            Icon::Volume1 => include_bytes!("../../resources/icons/png/volume-1.png"),
-            Icon::VolumeX => include_bytes!("../../resources/icons/png/volume-x.png"),
-            Icon::Bluetooth => include_bytes!("../../resources/icons/png/bluetooth.png"),
-            Icon::BluetoothOff => include_bytes!("../../resources/icons/png/bluetooth-off.png"),
-            Icon::Plane => include_bytes!("../../resources/icons/png/plane.png"),
-            Icon::BatteryFull => include_bytes!("../../resources/icons/png/battery-full.png"),
-            Icon::BatteryMedium => include_bytes!("../../resources/icons/png/battery-medium.png"),
-            Icon::BatteryLow => include_bytes!("../../resources/icons/png/battery-low.png"),
-            Icon::BatteryWarning => include_bytes!("../../resources/icons/png/battery-warning.png"),
-            Icon::BatteryCharging => include_bytes!("../../resources/icons/png/battery-charging.png"),
-            Icon::Sun => include_bytes!("../../resources/icons/png/sun.png"),
-            Icon::Moon => include_bytes!("../../resources/icons/png/moon.png"),
+            Icon::Wifi => include_bytes!("../resources/icons/png/wifi.png"),
+            Icon::WifiOff => include_bytes!("../resources/icons/png/wifi-off.png"),
+            Icon::Volume2 => include_bytes!("../resources/icons/png/volume-2.png"),
+            Icon::Volume1 => include_bytes!("../resources/icons/png/volume-1.png"),
+            Icon::VolumeX => include_bytes!("../resources/icons/png/volume-x.png"),
+            Icon::Bluetooth => include_bytes!("../resources/icons/png/bluetooth.png"),
+            Icon::BluetoothOff => include_bytes!("../resources/icons/png/bluetooth-off.png"),
+            Icon::Plane => include_bytes!("../resources/icons/png/plane.png"),
+            Icon::BatteryFull => include_bytes!("../resources/icons/png/battery-full.png"),
+            Icon::BatteryMedium => include_bytes!("../resources/icons/png/battery-medium.png"),
+            Icon::BatteryLow => include_bytes!("../resources/icons/png/battery-low.png"),
+            Icon::BatteryWarning => include_bytes!("../resources/icons/png/battery-warning.png"),
+            Icon::BatteryCharging => include_bytes!("../resources/icons/png/battery-charging.png"),
+            Icon::Sun => include_bytes!("../resources/icons/png/sun.png"),
+            Icon::Moon => include_bytes!("../resources/icons/png/moon.png"),
         }
     }
 }
@@ -105,7 +105,7 @@ impl Icon {
 /// just "on/off" — muted always wins, then a rough two-way split
 /// between "quiet" and "loud" since Lucide only ships one mid-level
 /// variant (`volume-1`) between silent and full.
-pub(crate) fn volume_icon(muted: bool, percent: u32) -> Icon {
+pub fn volume_icon(muted: bool, percent: u32) -> Icon {
     if muted || percent == 0 {
         Icon::VolumeX
     } else if percent < 50 {
@@ -118,7 +118,7 @@ pub(crate) fn volume_icon(muted: bool, percent: u32) -> Icon {
 /// Picks the battery glyph for a percentage/charging pair — charging
 /// always shows the bolt icon regardless of level, matching how
 /// Windows' own battery icon behaves.
-pub(crate) fn battery_icon(percent: u8, charging: bool) -> Icon {
+pub fn battery_icon(percent: u8, charging: bool) -> Icon {
     if charging {
         Icon::BatteryCharging
     } else if percent <= 15 {
@@ -184,13 +184,13 @@ fn bitmap_for(icon: Icon) -> Option<*mut GpBitmap> {
 ///
 /// SAFETY: `hdc` must be a valid device context currently being painted
 /// into.
-pub(crate) unsafe fn draw_icon(hdc: HDC, rect: RECT, icon: Icon, color: COLORREF) {
+pub unsafe fn draw_icon(hdc: HDC, rect: RECT, icon: Icon, color: COLORREF) {
     // Prefer the system icon font: it is what every other Windows 11
     // surface draws, and it scales as an outline instead of stretching a
     // fixed-size bitmap. The bundled PNGs stay as the fallback for
     // pre-Windows-11 machines and for the one state Fluent has no glyph
     // for (see `fluent_glyph`).
-    if super::design::typography::icon_font_available() {
+    if crate::design::typography::icon_font_available() {
         if let Some(glyph) = fluent_glyph(icon) {
             draw_glyph(hdc, rect, glyph, color);
             return;
@@ -316,7 +316,7 @@ unsafe fn draw_glyph(hdc: HDC, rect: RECT, glyph: &str, color: COLORREF) {
         DT_CENTER, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, TRANSPARENT,
     };
 
-    let face = HSTRING::from(super::design::typography::ICON_FACE);
+    let face = HSTRING::from(crate::design::typography::ICON_FACE);
     let size = (rect.bottom - rect.top).max(1);
     let font = CreateFontW(
         -size,
@@ -355,8 +355,8 @@ unsafe fn draw_glyph(hdc: HDC, rect: RECT, glyph: &str, color: COLORREF) {
 ///
 /// SAFETY: `hdc` must be a valid device context the caller is painting
 /// into; see [`draw_glyph`].
-pub(crate) unsafe fn draw_fluent_glyph(hdc: HDC, rect: RECT, glyph: &str, color: COLORREF) -> bool {
-    if !super::design::typography::icon_font_available() {
+pub unsafe fn draw_fluent_glyph(hdc: HDC, rect: RECT, glyph: &str, color: COLORREF) -> bool {
+    if !crate::design::typography::icon_font_available() {
         return false;
     }
     draw_glyph(hdc, rect, glyph, color);
