@@ -43,10 +43,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub(crate) const QS_WIDTH: i32 = 420;
-pub(crate) const QS_HEIGHT: i32 = 396;
+/// Sized to the tallest page, which is Wi-Fi: its network list plus the
+/// three links beneath it. Home needs less and leaves the remainder
+/// empty — the panel is one window for every page, so the height is the
+/// maximum, not the average. It came down from 396 with the chips.
+pub(crate) const QS_HEIGHT: i32 = 360;
 pub(crate) const QS_TIMER_ID: usize = 71;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Page {
     Home,
     Wifi,
@@ -85,13 +89,20 @@ const QS_CARD_ALPHA: f32 = 0.78;
 
 const QS_PADDING: i32 = 16;
 const QS_CHIP_GAP: i32 = 12;
-const QS_CHIP_HEIGHT: i32 = 60;
+/// Measured off Windows 11's own quick settings: its chips are about
+/// this tall. At 60 they dominated the panel as four saturated slabs.
+const QS_CHIP_HEIGHT: i32 = 48;
 const QS_CHIP_RADIUS: i32 = 6;
 const QS_CARD_RADIUS: i32 = 8;
 const QS_ROW_GAP: i32 = 18;
 const QS_VOLUME_ROW_HEIGHT: i32 = 32;
 const QS_BATTERY_ROW_HEIGHT: i32 = 28;
 const QS_ICON_SIZE: i32 = 20;
+/// The header band detail pages draw their back button and title into.
+/// Home leaves it empty.
+const QS_HEADER_HEIGHT: i32 = 8;
+/// The header band on a detail page, which does carry a control.
+const QS_DETAIL_HEADER_HEIGHT: i32 = 44;
 
 /// The app's signature accent (the same light blue `draw_glow_border`
 /// uses for hover glows elsewhere) — reused here for the volume fill
@@ -101,6 +112,15 @@ const QS_ICON_SIZE: i32 = 20;
 /// Below this battery percentage the glyph and text turn a warning red
 /// rather than the normal foreground color.
 const QS_LOW_BATTERY_PERCENT: u8 = 20;
+/// Room the Wi-Fi page keeps at the bottom of the card for its three
+/// links, measured up from the card's bottom edge.
+const QS_WIFI_FOOTER_HEIGHT: i32 = 86;
+/// Where the network list starts, below the back-button header.
+const QS_NETWORK_ROWS_TOP: i32 = 96;
+/// Row-to-row distance in the network list; each row is 36 tall.
+const QS_NETWORK_ROW_PITCH: i32 = 40;
+/// Segoe Fluent's padlock, marking a secured network.
+const QS_LOCK_GLYPH: &str = "\u{E72E}";
 
 struct QsLayout {
     card: RECT,
@@ -138,7 +158,10 @@ fn qs_layout(dpi: u32) -> QsLayout {
     let battery_h = scaled(QS_BATTERY_ROW_HEIGHT, dpi);
     let icon = scaled(QS_ICON_SIZE, dpi);
 
-    let chips_top = pad + scaled(40, dpi);
+    // Home has no title — Windows' quick settings does not label itself,
+    // and the band was 40px of nothing. Detail pages still draw a header
+    // in the same space, because a back button belongs there.
+    let chips_top = pad + scaled(QS_HEADER_HEIGHT, dpi);
     let chip_w = (content_right - pad - chip_gap) / 2;
     let wifi_chip = RECT {
         left: pad,
@@ -315,24 +338,44 @@ fn render_panel(c: &mut dyn Canvas, dpi: u32) {
     let accent = COLORREF(super::design::color::accent());
 
     let page = INTERACTION.with(|i| i.borrow().page);
-    c.set_text_color( text_color);
-    c.text(
-        RECT {
-            left: layout.card.left + scaled(16, dpi),
-            top: layout.card.top + scaled(10, dpi),
-            right: layout.card.right - scaled(16, dpi),
-            bottom: layout.card.top + scaled(44, dpi),
-        },
-        match page {
-            Page::Home => "Control center",
-            Page::Wifi => "‹   Wi-Fi",
-            Page::Bluetooth => "‹   Bluetooth",
-            Page::Theme => "‹   Appearance",
-            Page::Airplane => "‹   Radios",
-            Page::Sound => "‹   Sound output",
-        },
-        DT_SINGLELINE | DT_VCENTER,
-    );
+
+    // Home carries no title. Windows' own quick settings does not label
+    // itself, and a heading on a panel you opened on purpose is a line
+    // of furniture. Detail pages do get one, because the back button
+    // beside it is a control the user needs.
+    if page != Page::Home {
+        let header = RECT {
+            left: layout.card.left + scaled(12, dpi),
+            top: layout.card.top + scaled(8, dpi),
+            right: layout.card.right - scaled(12, dpi),
+            bottom: layout.card.top + scaled(QS_DETAIL_HEADER_HEIGHT, dpi),
+        };
+        let back = scaled(20, dpi);
+        let mid = (header.top + header.bottom) / 2;
+        c.set_text_color(text_color);
+        c.glyph(
+            RECT {
+                left: header.left + scaled(4, dpi),
+                top: mid - back / 2,
+                right: header.left + scaled(4, dpi) + back,
+                bottom: mid + back / 2,
+            },
+            super::glyph::CHEVRON_LEFT,
+        );
+        c.text(
+            RECT { left: header.left + scaled(32, dpi), ..header },
+            match page {
+                Page::Wifi => "Wi-Fi",
+                Page::Bluetooth => "Bluetooth",
+                Page::Theme => "Appearance",
+                Page::Airplane => "Radios",
+                Page::Sound => "Sound output",
+                Page::Home => "",
+            },
+            DT_SINGLELINE | DT_VCENTER,
+        );
+    }
+
     if page != Page::Home {
         paint_details(c, dpi, page);
         return;
@@ -633,6 +676,20 @@ fn split_arrow(chip: RECT, dpi: u32) -> RECT {
     }
 }
 
+/// The Segoe Fluent bar glyph for a signal strength percentage.
+///
+/// Windows shows bars, not a number: "97%" is a diagnostic, and reading
+/// it costs more attention than glancing at four bars. Four buckets,
+/// clamped, so anything out of range still resolves to a real glyph.
+fn signal_glyph(percent: u8) -> &'static str {
+    match percent {
+        0..=24 => "\u{E904}",
+        25..=49 => "\u{E905}",
+        50..=74 => "\u{E906}",
+        _ => "\u{E907}",
+    }
+}
+
 fn chip_foreground(on: bool, available: bool) -> COLORREF {
     COLORREF(if !available {
         super::design::color::text_muted()
@@ -681,7 +738,7 @@ fn detail_links(page: Page) -> Vec<(&'static str, &'static str)> {
 fn targets(dpi: u32, page: Page) -> Vec<RECT> {
     let l = qs_layout(dpi);
     if page == Page::Wifi {
-        let count = visible_networks().len();
+        let count = visible_networks(dpi).len();
         let mut rows = vec![RECT {
             left: l.card.left + scaled(12, dpi),
             top: l.card.top + scaled(8, dpi),
@@ -689,7 +746,8 @@ fn targets(dpi: u32, page: Page) -> Vec<RECT> {
             bottom: l.card.top + scaled(44, dpi),
         }];
         for n in 0..count {
-            let top = l.card.top + scaled(96 + n as i32 * 40, dpi);
+            let top =
+                l.card.top + scaled(QS_NETWORK_ROWS_TOP + n as i32 * QS_NETWORK_ROW_PITCH, dpi);
             rows.push(RECT {
                 left: l.card.left + scaled(16, dpi),
                 top,
@@ -697,7 +755,10 @@ fn targets(dpi: u32, page: Page) -> Vec<RECT> {
                 bottom: top + scaled(36, dpi),
             });
         }
-        let top = l.card.top + scaled(310, dpi);
+        // Anchored to the card's bottom edge, not a fixed offset from its
+        // top: the old `card.top + 310` happened to fit the card height of
+        // the day and escaped it the moment that changed.
+        let top = l.card.bottom - scaled(QS_WIFI_FOOTER_HEIGHT, dpi);
         rows.push(RECT {
             left: l.card.left + scaled(16, dpi),
             top,
@@ -712,9 +773,9 @@ fn targets(dpi: u32, page: Page) -> Vec<RECT> {
         });
         rows.push(RECT {
             left: l.card.left + scaled(16, dpi),
-            top: l.card.top + scaled(354, dpi),
+            top: top + scaled(40, dpi),
             right: l.card.right - scaled(16, dpi),
-            bottom: l.card.top + scaled(382, dpi),
+            bottom: top + scaled(68, dpi),
         });
         return rows;
     }
@@ -758,11 +819,14 @@ fn targets(dpi: u32, page: Page) -> Vec<RECT> {
         bottom: l.battery_row.bottom + scaled(32, dpi),
     });
     rows.push(l.battery_row);
+    // Directly under "Sound output", not pinned to the card's bottom
+    // edge: pinning it left a band of nothing between the two links.
+    let sound_bottom = l.battery_row.bottom + scaled(32, dpi);
     rows.push(RECT {
         left: l.card.left + scaled(16, dpi),
         right: l.card.right - scaled(16, dpi),
-        top: l.card.bottom - scaled(40, dpi),
-        bottom: l.card.bottom - scaled(12, dpi),
+        top: sound_bottom + scaled(4, dpi),
+        bottom: sound_bottom + scaled(32, dpi),
     });
     rows.push(l.volume_track);
     rows
@@ -779,26 +843,8 @@ fn paint_details(c: &mut dyn Canvas, dpi: u32, page: Page) {
         paint_networks(c, dpi);
         return;
     }
-    let l = qs_layout(dpi);
-    let message = match page {
-        Page::Wifi => "Connect to nearby Wi-Fi networks or manage your saved connections.",
-        Page::Bluetooth => "Find and pair headphones, keyboards and other nearby devices.",
-        Page::Theme => "Personalize your desktop with Windows colors, themes and backgrounds.",
-        Page::Airplane => "The tile switches radios together. Use Windows airplane mode for the system airplane-mode setting.",
-        Page::Sound => "Select speakers or headphones and set the volume for individual apps.",
-        Page::Home => "",
-    };
-    c.set_text_color( COLORREF(super::design::color::text_muted()));
-    c.text(
-        RECT {
-            left: l.card.left + scaled(16, dpi),
-            top: l.card.top + scaled(52, dpi),
-            right: l.card.right - scaled(16, dpi),
-            bottom: l.card.top + scaled(104, dpi),
-        },
-        message,
-        windows::Win32::Graphics::Gdi::DT_WORDBREAK,
-    );
+    // No explanatory paragraph: Windows does not explain this surface,
+    // and the row labels already say where they go.
     for (rect, (label, _)) in targets(dpi, page)
         .into_iter()
         .skip(1)
@@ -809,15 +855,30 @@ fn paint_details(c: &mut dyn Canvas, dpi: u32, page: Page) {
             scaled(6, dpi),
             COLORREF(super::design::color::surface_overlay()),
         );
-        c.set_text_color( COLORREF(super::design::color::text()));
+        c.set_text_color(COLORREF(super::design::color::text()));
+        let chevron = scaled(20, dpi);
         c.text(
             RECT {
                 left: rect.left + scaled(12, dpi),
-                right: rect.right - scaled(12, dpi),
+                right: rect.right - chevron - scaled(8, dpi),
                 ..rect
             },
-            &format!("{label}   ›"),
-            DT_SINGLELINE | DT_VCENTER,
+            label,
+            DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS,
+        );
+        // The chevron is right-aligned in its own square, the way every
+        // navigation row in Windows draws it, rather than trailing the
+        // label wherever the text happens to end.
+        let mid = (rect.top + rect.bottom) / 2;
+        c.set_text_color(COLORREF(super::design::color::text_muted()));
+        c.glyph(
+            RECT {
+                left: rect.right - chevron - scaled(8, dpi),
+                top: mid - chevron / 2,
+                right: rect.right - scaled(8, dpi),
+                bottom: mid + chevron / 2,
+            },
+            super::glyph::CHEVRON_RIGHT,
         );
     }
     draw_focus(c, dpi, page);
@@ -888,8 +949,10 @@ fn open_windows(hwnd: HWND, uri: &str) {
 }
 
 fn activate(hwnd: HWND, page: Page, index: usize) {
+    // SAFETY: plain query on a live window.
+    let dpi = unsafe { GetDpiForWindow(hwnd).max(96) };
     if page == Page::Wifi {
-        let networks = visible_networks();
+        let networks = visible_networks(dpi);
         if index == 0 {
             change_page(hwnd, Page::Home);
         } else if let Some(network) = networks.get(index - 1) {
@@ -957,7 +1020,10 @@ fn change_page(hwnd: HWND, page: Page) {
         let mut i = i.borrow_mut();
         i.page = page;
         i.hover = None;
-        i.focus = Some(0);
+        // Not `Some(0)`: seeding focus here drew the accent ring around
+        // every detail page's back button whether or not the keyboard
+        // was in use, which tells the user nothing. Tab sets it.
+        i.focus = None;
         i.motion.open();
     });
     if page == Page::Wifi {
@@ -1015,12 +1081,27 @@ pub(crate) fn on_key(hwnd: HWND, key: u32) -> bool {
     true
 }
 
-fn visible_networks() -> Vec<super::wifi::Network> {
+/// How many network rows fit between the list's top and the links at
+/// the bottom of the card.
+///
+/// Derived rather than fixed: it used to be a hardcoded 5, which fit the
+/// card height of the day and started overlapping the links the moment
+/// that height changed.
+fn max_visible_networks(dpi: u32) -> usize {
+    let l = qs_layout(dpi);
+    let first_top = l.card.top + scaled(QS_NETWORK_ROWS_TOP, dpi);
+    let footer_top = l.card.bottom - scaled(QS_WIFI_FOOTER_HEIGHT, dpi);
+    let pitch = scaled(QS_NETWORK_ROW_PITCH, dpi).max(1);
+    (((footer_top - first_top) / pitch).max(0)) as usize
+}
+
+fn visible_networks(dpi: u32) -> Vec<super::wifi::Network> {
+    let max = max_visible_networks(dpi);
     let networks = control_state::snapshot().networks;
     let offset = INTERACTION
         .with(|i| i.borrow().network_offset)
-        .min(networks.len().saturating_sub(5));
-    networks.into_iter().skip(offset).take(5).collect()
+        .min(networks.len().saturating_sub(max));
+    networks.into_iter().skip(offset).take(max).collect()
 }
 
 pub(crate) fn scroll_networks(hwnd: HWND, delta: i32) {
@@ -1042,7 +1123,7 @@ pub(crate) fn scroll_networks(hwnd: HWND, delta: i32) {
 fn paint_networks(c: &mut dyn Canvas, dpi: u32) {
     let snapshot = control_state::snapshot();
     let l = qs_layout(dpi);
-    let networks = visible_networks();
+    let networks = visible_networks(dpi);
     let rows = targets(dpi, Page::Wifi);
     let summary = if snapshot.network_error == Some(5) {
         "Windows requires location access to list networks. Use Windows networks below.".into()
@@ -1055,29 +1136,56 @@ fn paint_networks(c: &mut dyn Canvas, dpi: u32) {
     } else if networks.is_empty() {
         "No networks found. Refresh to scan again.".into()
     } else {
-        format!(
-            "{} nearby networks · scroll or Page Up / Down for more",
-            snapshot.networks.len()
-        )
+        // Nothing else: the list is visibly a list, and telling the user
+        // how to scroll it is a developer's note, not a label.
+        String::new()
     };
-    c.set_text_color( COLORREF(super::design::color::text_muted()));
-    c.text(
-        RECT {
-            left: l.card.left + scaled(16, dpi),
-            top: l.card.top + scaled(52, dpi),
-            right: l.card.right - scaled(16, dpi),
-            bottom: l.card.top + scaled(92, dpi),
-        },
-        &summary,
-        windows::Win32::Graphics::Gdi::DT_WORDBREAK,
-    );
+    if !summary.is_empty() {
+        c.set_text_color(COLORREF(super::design::color::text_muted()));
+        c.text(
+            RECT {
+                left: l.card.left + scaled(16, dpi),
+                top: l.card.top + scaled(52, dpi),
+                right: l.card.right - scaled(16, dpi),
+                bottom: l.card.top + scaled(92, dpi),
+            },
+            &summary,
+            DT_SINGLELINE | DT_VCENTER,
+        );
+    }
     for (network, rect) in networks.iter().zip(rows.iter().skip(1)) {
         c.fill_round_rect(
             *rect,
             scaled(6, dpi),
             COLORREF(super::design::color::surface_overlay()),
         );
-        c.set_text_color( COLORREF(super::design::color::text()));
+        // Signal as bars, and a padlock when the network is secured —
+        // the two things Windows shows, in place of a "97%" readout.
+        let glyph_box = scaled(16, dpi);
+        let mid = (rect.top + rect.bottom) / 2;
+        c.set_text_color(COLORREF(super::design::color::text()));
+        c.glyph(
+            RECT {
+                left: rect.left + scaled(10, dpi),
+                top: mid - glyph_box / 2,
+                right: rect.left + scaled(10, dpi) + glyph_box,
+                bottom: mid + glyph_box / 2,
+            },
+            signal_glyph(network.signal.min(255) as u8),
+        );
+        if network.secured {
+            c.set_text_color(COLORREF(super::design::color::text_muted()));
+            c.glyph(
+                RECT {
+                    left: rect.left + scaled(28, dpi),
+                    top: mid - glyph_box / 2,
+                    right: rect.left + scaled(28, dpi) + glyph_box,
+                    bottom: mid + glyph_box / 2,
+                },
+                QS_LOCK_GLYPH,
+            );
+        }
+        c.set_text_color(COLORREF(super::design::color::text()));
         let name = if network.name.is_empty() {
             "Hidden network"
         } else {
@@ -1085,8 +1193,8 @@ fn paint_networks(c: &mut dyn Canvas, dpi: u32) {
         };
         c.text(
             RECT {
-                left: rect.left + scaled(10, dpi),
-                right: rect.right - scaled(160, dpi),
+                left: rect.left + scaled(48, dpi),
+                right: rect.right - scaled(110, dpi),
                 ..*rect
             },
             name,
@@ -1095,14 +1203,14 @@ fn paint_networks(c: &mut dyn Canvas, dpi: u32) {
                 | windows::Win32::Graphics::Gdi::DT_END_ELLIPSIS
                 | windows::Win32::Graphics::Gdi::DT_NOPREFIX,
         );
+        // One word, one line. "Set up securely" wrapped and spilled into
+        // the row below it; the padlock already says "secured".
         let detail = if network.connected {
             "Disconnect"
         } else if !network.profile.is_empty() && network.connectable {
             "Connect"
-        } else if network.secured {
-            "Set up securely ↗"
         } else {
-            "Set up ↗"
+            "Set up"
         };
         c.set_text_color(
             COLORREF(if network.connected {
@@ -1113,19 +1221,19 @@ fn paint_networks(c: &mut dyn Canvas, dpi: u32) {
         );
         c.text(
             RECT {
-                left: rect.right - scaled(160, dpi),
-                right: rect.right - scaled(8, dpi),
+                left: rect.right - scaled(110, dpi),
+                right: rect.right - scaled(10, dpi),
                 ..*rect
             },
-            &format!("{}%  {detail}", network.signal),
+            detail,
             DT_SINGLELINE | DT_VCENTER | windows::Win32::Graphics::Gdi::DT_RIGHT,
         );
     }
     c.set_text_color( COLORREF(super::design::color::text()));
     for (rect, label) in rows.iter().skip(networks.len() + 1).zip([
         "Refresh",
-        "Windows networks & passwords ↗",
-        "Manage saved networks ↗",
+        "Windows networks & passwords",
+        "Manage saved networks",
     ]) {
         c.text( *rect, label, DT_SINGLELINE | DT_VCENTER);
     }
@@ -1407,6 +1515,174 @@ pub(crate) fn toggle_quick_settings() {
 }
 
 #[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    const PAGES: [Page; 6] = [
+        Page::Home,
+        Page::Wifi,
+        Page::Bluetooth,
+        Page::Theme,
+        Page::Airplane,
+        Page::Sound,
+    ];
+    const DPIS: [u32; 4] = [96, 120, 144, 192];
+
+    #[test]
+    fn no_two_targets_on_a_page_overlap() {
+        for dpi in DPIS {
+            for page in PAGES {
+                let rows = targets(dpi, page);
+                for (i, a) in rows.iter().enumerate() {
+                    for b in rows.iter().skip(i + 1) {
+                        let disjoint = a.right <= b.left
+                            || b.right <= a.left
+                            || a.bottom <= b.top
+                            || b.bottom <= a.top;
+                        assert!(disjoint, "targets overlap at {dpi} dpi: {a:?} and {b:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_target_sits_inside_the_card() {
+        for dpi in DPIS {
+            for page in PAGES {
+                let card = qs_layout(dpi).card;
+                for r in targets(dpi, page) {
+                    assert!(
+                        r.left >= card.left && r.right <= card.right,
+                        "target escapes the card horizontally at {dpi} dpi: {r:?} vs {card:?}"
+                    );
+                    assert!(
+                        r.top >= card.top && r.bottom <= card.bottom,
+                        "target escapes the card vertically at {dpi} dpi: {r:?} vs {card:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hit_testing_agrees_with_the_layout_on_every_page() {
+        for dpi in DPIS {
+            for page in PAGES {
+                for (index, r) in targets(dpi, page).into_iter().enumerate() {
+                    let x = (r.left + r.right) / 2;
+                    let y = (r.top + r.bottom) / 2;
+                    assert_eq!(
+                        hit_target(dpi, page, x, y),
+                        Some(index),
+                        "centre of target {index} on {page:?} did not hit it at {dpi} dpi"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_home_chips_form_two_even_rows() {
+        for dpi in DPIS {
+            let l = qs_layout(dpi);
+            assert_eq!(l.wifi_chip.bottom - l.wifi_chip.top, l.theme_chip.bottom - l.theme_chip.top);
+            assert_eq!(l.wifi_chip.top, l.theme_chip.top);
+            assert_eq!(l.bluetooth_chip.top, l.airplane_chip.top);
+            assert!(l.bluetooth_chip.top >= l.wifi_chip.bottom, "chip rows collide at {dpi} dpi");
+            assert_eq!(
+                l.wifi_chip.right - l.wifi_chip.left,
+                l.theme_chip.right - l.theme_chip.left,
+                "chips are uneven at {dpi} dpi"
+            );
+        }
+    }
+
+    /// A populated Wi-Fi page. The overlap this catches was invisible to
+    /// the other layout tests, because with no snapshot the network list
+    /// is empty and the rows that collide never exist.
+    fn with_networks(count: usize) {
+        let mut snapshot = control_state::Snapshot::default();
+        snapshot.networks = (0..count)
+            .map(|i| super::super::wifi::Network {
+                name: format!("Network {i}"),
+                signal: 80,
+                secured: true,
+                connected: false,
+                connectable: true,
+                profile: String::new(),
+            })
+            .collect();
+        control_state::set_test_snapshot(snapshot);
+    }
+
+    #[test]
+    fn a_full_network_list_never_collides_with_the_links_below_it() {
+        with_networks(12);
+        for dpi in DPIS {
+            let rows = targets(dpi, Page::Wifi);
+            for (i, a) in rows.iter().enumerate() {
+                for b in rows.iter().skip(i + 1) {
+                    let disjoint = a.right <= b.left
+                        || b.right <= a.left
+                        || a.bottom <= b.top
+                        || b.bottom <= a.top;
+                    assert!(disjoint, "Wi-Fi rows overlap at {dpi} dpi: {a:?} and {b:?}");
+                }
+            }
+            let card = qs_layout(dpi).card;
+            for r in rows {
+                assert!(r.bottom <= card.bottom, "row {r:?} runs past the card at {dpi} dpi");
+            }
+        }
+        control_state::set_test_snapshot(control_state::Snapshot::default());
+    }
+
+    #[test]
+    fn the_visible_network_count_is_what_actually_fits() {
+        for dpi in DPIS {
+            let count = max_visible_networks(dpi);
+            assert!(count > 0, "no room for any network row at {dpi} dpi");
+            let l = qs_layout(dpi);
+            let last_bottom = l.card.top
+                + scaled(QS_NETWORK_ROWS_TOP + (count as i32 - 1) * QS_NETWORK_ROW_PITCH + 36, dpi);
+            let footer_top = l.card.bottom - scaled(QS_WIFI_FOOTER_HEIGHT, dpi);
+            assert!(
+                last_bottom <= footer_top,
+                "{count} rows reach {last_bottom} but the footer starts at {footer_top} at {dpi} dpi"
+            );
+        }
+    }
+
+    #[test]
+    fn each_signal_bucket_has_its_own_glyph() {
+        // One sample per bucket: all four must look different, or the
+        // bars stop carrying information.
+        let glyphs: Vec<&str> = [10, 35, 60, 90].iter().map(|p| signal_glyph(*p)).collect();
+        for (i, a) in glyphs.iter().enumerate() {
+            for b in glyphs.iter().skip(i + 1) {
+                assert_ne!(a, b, "two buckets share a glyph: {glyphs:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_bucket_boundaries_fall_where_they_are_documented() {
+        assert_eq!(signal_glyph(0), signal_glyph(24));
+        assert_ne!(signal_glyph(24), signal_glyph(25));
+        assert_eq!(signal_glyph(25), signal_glyph(49));
+        assert_ne!(signal_glyph(49), signal_glyph(50));
+        assert_eq!(signal_glyph(50), signal_glyph(74));
+        assert_ne!(signal_glyph(74), signal_glyph(75));
+    }
+
+    #[test]
+    fn an_out_of_range_strength_still_resolves() {
+        assert_eq!(signal_glyph(100), signal_glyph(255));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1484,12 +1760,16 @@ mod tests {
 
     #[test]
     fn network_list_clamps_when_a_scan_removes_entries() {
+        // The visible count is whatever fits above the links now, not a
+        // fixed 5 — but a stale offset must still land on the last page
+        // of entries rather than past the end.
+        let fits = max_visible_networks(96);
         control_state::set_test_snapshot(example_snapshot());
         INTERACTION.with(|i| i.borrow_mut().network_offset = 100);
-        assert_eq!(visible_networks().len(), 5);
-        assert_eq!(visible_networks().last().unwrap().name, "Other network");
+        assert_eq!(visible_networks(96).len(), fits);
+        assert_eq!(visible_networks(96).last().unwrap().name, "Other network");
         control_state::set_test_snapshot(control_state::Snapshot::default());
-        assert!(visible_networks().is_empty());
+        assert!(visible_networks(96).is_empty());
         assert_eq!(targets(96, Page::Wifi).len(), 4);
     }
 
