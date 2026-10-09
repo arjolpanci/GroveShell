@@ -484,6 +484,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "groveshell-ui-kit"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "groveshell-watchdog"
 version = "0.1.0"
 dependencies = [
