@@ -269,3 +269,42 @@ boundary is the test plan.
 
 Steps 1–3 are invisible to the user and land first; step 4 is where the
 app visibly changes.
+
+## 12. Known gaps carried forward
+
+The rendering work (§5-§7, the pages, the nav rail) is implemented. A
+whole-branch review raised three Critical and eight Important findings;
+all were fixed. These are the ones deliberately left, to be picked up by
+the plan that implements §3 and §8:
+
+- `WM_GETMINMAXINFO` constrains *window* size where *client* size was
+  meant, so the minimum is ~16px tighter than the layout asks for.
+  `layout_page`'s own clamp absorbs it today; compute it through
+  `AdjustWindowRectExForDpi`.
+- `Control::Status` reserves no width, so a long status title ellipsises
+  into its severity glyph rather than before it.
+- A toggle's `On`/`Off` label gets 20px and no ellipsis flag.
+- Nothing draws a scrollbar or any other scroll affordance, so a
+  scrollable page gives no sign there is more below it.
+- Choice rows display raw config identifiers — `autohide`, `CtrlAlt`,
+  `top_left`. Not a regression, but it reads as a developer dashboard,
+  which is what §2 set out to remove. The display label wants to be
+  separate from the stored value.
+- `pages::Page::on_activate` takes `&mut self`, so the window holds a
+  `RefCell` borrow across `toggle_groveshell()`, which blocks for up to
+  3s per child. Today that is a frozen window, not a panic, because
+  none of those paths pump messages — but `cards()` borrows the same
+  cell, so the day one does, the process aborts. All six page structs
+  are stateless; `&self` would remove the hazard outright.
+- `material::apply`'s return value is discarded. §3.3 describes `false`
+  as the feature detection that should select the legacy blur-behind
+  path; on pre-22621 Windows the window currently gets no backdrop and,
+  with `WS_EX_NOREDIRECTIONBITMAP`, a transparent nav rail.
+- §7's "custom title-bar region carrying the app name" is not
+  implemented; the window uses the standard caption with a dark-mode
+  tint plus a page-title band. Arguably more native — worth deciding
+  explicitly rather than by omission.
+- Unexplained: `groveshell-settings` exited once during verification
+  with no panic on stderr and no shutdown log line. Twenty synchronous
+  `WM_MOUSEMOVE` messages and four consecutive resizes do not reproduce
+  it.
