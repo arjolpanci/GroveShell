@@ -2,7 +2,10 @@
 //! and dispatching clicks on the primary bar's Activities/workspace-dots/
 //! clock/Quick-Settings regions.
 
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use std::cell::Cell;
+use std::time::{Duration, Instant};
+
+use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC, DeleteObject,
     Ellipse, FillRect, RoundRect, SelectObject, SetBkMode, SetTextColor, SRCCOPY,
@@ -13,9 +16,11 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABE_TOP, ABM_NEW, ABM_QUERYPOS, ABM_REMOVE, ABM_SETPOS, APPBARDATA,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, TrackMouseEvent, TRACKMOUSEEVENT, TME_LEAVE, VK_LBUTTON,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SetWindowPos,
+    GetCursorPos, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_NOACTIVATE, SetWindowPos,
 };
 
 use super::icons::{battery_icon, draw_icon, volume_icon, Icon};
@@ -244,6 +249,105 @@ fn region_at(x: i32, dpi: u32, bar_width: i32, bar_h: i32, is_primary: bool, wor
         }
     }
     None
+}
+
+// A pop-up anchored to a bar button closes on the *mouse-down* of a
+// click — Win32 deactivates a flyout, and `TrackPopupMenu` dismisses the
+// session menu, before the button is ever released — while the bar
+// dispatches its own clicks on `WM_LBUTTONUP` (see `on_bar_click`). With
+// nothing remembering that dismissal, the release of the very click that
+// closed a pop-up opens it straight back up, so a bar button can never
+// read as a toggle.
+//
+// [`note_popup_click_dismissed`] records the anchor whose pop-up an
+// in-progress click just closed; the `on_bar_click` that click ends in
+// consumes the record and does nothing, leaving the pop-up closed.
+//
+// A `Cell` thread-local rather than a field on `STATE`: this is written
+// from flyout `wndproc` paths that already borrow `STATE` elsewhere in
+// the same call, and a nested `RefCell` borrow panics.
+thread_local! {
+    static CLICK_DISMISSED: Cell<Option<(BarRegion, Instant)>> = const { Cell::new(None) };
+}
+
+/// How long a recorded dismissal can still swallow a click. The release
+/// it belongs to lands one click-hold later, and *any* bar click consumes
+/// the record regardless — so this only bounds the single case where that
+/// release never reaches a bar at all: press the button, drag off the
+/// bar, release there.
+const DISMISS_GRACE: Duration = Duration::from_secs(1);
+
+/// Records that `anchor`'s pop-up was just dismissed by a click still in
+/// progress: the left button is still down, and it went down on `anchor`
+/// itself. Both conditions matter — a keyboard dismiss (Escape) or a
+/// click that landed anywhere else must leave the next click free to open
+/// the pop-up again.
+pub(crate) fn note_popup_click_dismissed(anchor: BarRegion) {
+    if !left_button_down() || region_under_cursor() != Some(anchor) {
+        return;
+    }
+    CLICK_DISMISSED.with(|cell| cell.set(Some((anchor, Instant::now()))));
+}
+
+/// Whether a click on `region` is the release of the click that dismissed
+/// that region's own pop-up. Pure, so the toggle rule is testable without
+/// a message loop.
+fn dismissal_swallows(
+    record: Option<(BarRegion, Instant)>,
+    region: BarRegion,
+    now: Instant,
+) -> bool {
+    match record {
+        Some((anchor, at)) => {
+            anchor == region && now.saturating_duration_since(at) < DISMISS_GRACE
+        }
+        None => false,
+    }
+}
+
+/// `GetAsyncKeyState`, not `GetKeyState`: the latter reports the input
+/// state as of the last message this thread *retrieved*, and a pop-up is
+/// deactivated before the bar's own `WM_LBUTTONDOWN` is ever dispatched —
+/// so mid-click it still reads the button as up. The async state is the
+/// physical one, which is what "a click is in progress" means here.
+fn left_button_down() -> bool {
+    // SAFETY: `GetAsyncKeyState` is a precondition-free system call.
+    unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
+}
+
+/// The bar region under the mouse cursor right now, on whichever bar it
+/// is over. `region_at` wants a bar-local x, and a dismissal is noticed
+/// from a pop-up's own `wndproc` — which has no click coordinates of its
+/// own — so the point comes from the cursor instead.
+fn region_under_cursor() -> Option<BarRegion> {
+    let mut pt = POINT::default();
+    // SAFETY: `GetCursorPos` only writes through `pt` for this call.
+    unsafe { GetCursorPos(&mut pt) }.ok()?;
+    let (hwnd, bar_left, bar_width, is_primary, monitor) = STATE.with(|s| {
+        s.borrow().as_ref().and_then(|st| {
+            st.bars
+                .iter()
+                .find(|b| {
+                    (b.rect.left..b.rect.right).contains(&pt.x)
+                        && (b.rect.top..b.rect.bottom).contains(&pt.y)
+                })
+                .map(|b| {
+                    (b.hwnd, b.rect.left, b.rect.right - b.rect.left, b.is_primary, b.monitor.clone())
+                })
+        })
+    })?;
+    // SAFETY: `hwnd` came from the live bar list a moment ago.
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    let bar_h = scaled(super::state::BAR_HEIGHT, dpi);
+    let workspace_count = STATE
+        .with(|s| {
+            s.borrow()
+                .as_ref()
+                .and_then(|st| st.workspaces.get(monitor.as_str()))
+                .map(|t| t.workspace_ids().len())
+        })
+        .unwrap_or(0);
+    region_at(pt.x - bar_left, dpi, bar_width, bar_h, is_primary, workspace_count)
 }
 
 /// Registers `bar_hwnd` as a top-edge AppBar and reserves a
@@ -531,7 +635,15 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
         .with(|s| s.borrow().as_ref().and_then(|st| st.workspaces.get(monitor)).map(|t| t.workspace_ids().len()))
         .unwrap_or(0);
 
-    match region_at(x, dpi, bar_width, bar_h, is_primary, workspace_count) {
+    let region = region_at(x, dpi, bar_width, bar_h, is_primary, workspace_count);
+    // Every bar click consumes a pending dismissal, so at most the one
+    // click that closed a pop-up is ever swallowed.
+    let dismissed = CLICK_DISMISSED.with(|cell| cell.take());
+    if region.is_some_and(|r| dismissal_swallows(dismissed, r, Instant::now())) {
+        return;
+    }
+
+    match region {
         Some(BarRegion::Activities) => super::overview::toggle_overview_for(monitor),
         Some(BarRegion::Dots) => {
             let dots_x = scaled(WS_DOTS_X, dpi);
@@ -764,5 +876,35 @@ pub(crate) fn raise_bars_topmost() {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_click_that_dismissed_a_popup_does_not_reopen_it() {
+        let now = Instant::now();
+        assert!(dismissal_swallows(Some((BarRegion::Clock, now)), BarRegion::Clock, now));
+    }
+
+    #[test]
+    fn a_click_on_a_different_button_still_opens_it() {
+        let now = Instant::now();
+        assert!(!dismissal_swallows(Some((BarRegion::Clock, now)), BarRegion::QsPill, now));
+    }
+
+    #[test]
+    fn a_stale_dismissal_never_swallows_a_later_click() {
+        let now = Instant::now();
+        let stale = now
+            .checked_sub(DISMISS_GRACE + Duration::from_millis(1))
+            .expect("machine has been up longer than the grace period");
+        assert!(!dismissal_swallows(Some((BarRegion::Clock, stale)), BarRegion::Clock, now));
+    }
+
+    #[test]
+    fn a_plain_click_with_nothing_dismissed_opens_the_popup() {
+        assert!(!dismissal_swallows(None, BarRegion::SessionButton, Instant::now()));
     }
 }

@@ -60,7 +60,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use groveshell_window_model::registry::WindowRegistry;
 use groveshell_window_model::workspace::WorkspaceTracker;
 
-use bar::{on_bar_click, on_bar_hover, on_bar_mouse_leave, paint_bar, register_appbar, unregister_appbar, QS_LABEL_MARGIN};
+use bar::{
+    note_popup_click_dismissed, on_bar_click, on_bar_hover, on_bar_mouse_leave, paint_bar,
+    register_appbar, unregister_appbar, BarRegion, QS_LABEL_MARGIN,
+};
 use calendar::{hide_calendar, paint_calendar, CAL_HEIGHT, CAL_WIDTH};
 use monitors::{enumerate_monitors, monitor_index_for_center};
 use movesize::{
@@ -1201,9 +1204,21 @@ unsafe extern "system" fn wndproc(
             // clicking away from the real taskbar's date/time or quick
             // settings panel does.
             if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                // This deactivation *is* the mouse-down of the click that
+                // dismissed the flyout, and that click may be on the very
+                // bar button that opened it — note it before closing, so
+                // the release the bar dispatches on leaves the flyout
+                // closed instead of re-opening it (the button is a
+                // toggle; see `bar::note_popup_click_dismissed`).
                 match role {
-                    Role::Calendar => hide_calendar(false),
-                    Role::QuickSettings => hide_quick_settings(false),
+                    Role::Calendar => {
+                        note_popup_click_dismissed(BarRegion::Clock);
+                        hide_calendar(false);
+                    }
+                    Role::QuickSettings => {
+                        note_popup_click_dismissed(BarRegion::QsPill);
+                        hide_quick_settings(false);
+                    }
                     _ => {}
                 }
             }

@@ -87,6 +87,14 @@ pub(crate) fn show(owner: HWND) {
             None,
         );
         let _ = DestroyMenu(menu);
+        if chosen.0 == 0 {
+            // Dismissed rather than chosen. `TrackPopupMenu`'s modal loop
+            // swallowed the dismissing mouse-down, but the bar still sees
+            // its `WM_LBUTTONUP` — if that click was on the session button
+            // itself, note it so the release doesn't pop the menu straight
+            // back up (the button is a toggle).
+            super::bar::note_popup_click_dismissed(super::bar::BarRegion::SessionButton);
+        }
 
         let Some(action) = action_from_id(chosen.0 as u32) else {
             return;
