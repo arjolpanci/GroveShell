@@ -1,16 +1,11 @@
 //! Small painting/animation helpers shared across bar, calendar, quick
 //! settings, and overview rendering.
 
-use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DrawTextW, DRAW_TEXT_FORMAT, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_PITCH, HDC, HFONT, OUT_DEFAULT_PRECIS,
-};
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Graphics::Gdi::HFONT;
+use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
 use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow};
-
-use super::state::scaled;
 
 /// The UI font sized for the bar at `dpi` (caller owns the handle and
 /// must `DeleteObject` it after deselecting).
@@ -22,42 +17,9 @@ pub(crate) fn bar_font(dpi: u32) -> HFONT {
     ui_font(super::design::typography::BODY_PX, dpi)
 }
 
-/// The UI font at an explicit logical-pixel size. `bar_font` is this at
-/// the body size; the panels ask for caption and subtitle sizes too.
-pub(crate) fn ui_font(size_px: i32, dpi: u32) -> HFONT {
-    let face = windows::core::HSTRING::from(super::design::typography::resolved_ui_face());
-    // SAFETY: plain object creation; no aliasing or lifetime
-    // preconditions.
-    unsafe {
-        CreateFontW(
-            -scaled(size_px, dpi),
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET.0.into(),
-            OUT_DEFAULT_PRECIS.0.into(),
-            CLIP_DEFAULT_PRECIS.0.into(),
-            CLEARTYPE_QUALITY.0.into(),
-            DEFAULT_PITCH.0.into(),
-            windows::core::PCWSTR(face.as_ptr()),
-        )
-    }
-}
-
-/// SAFETY: `hdc` must be a valid device context obtained from
-/// `BeginPaint` on the window currently handling `WM_PAINT`.
-pub(crate) unsafe fn draw_text_in(hdc: HDC, rect: RECT, text: &str, format: DRAW_TEXT_FORMAT) {
-    // An empty Vec has a dangling non-null pointer. Some DrawText paths
-    // inspect the first character even with a zero character count.
-    if text.is_empty() { return; }
-    let mut wide: Vec<u16> = text.encode_utf16().collect();
-    let mut r = rect;
-    DrawTextW(hdc, &mut wide, &mut r, format | windows::Win32::Graphics::Gdi::DT_NOPREFIX);
-}
+/// Both live in the UI kit now: `canvas::GdiCanvas` is there and needs
+/// them, and `apps/settings` draws its own text through the same pair.
+pub(crate) use groveshell_ui_kit::text::{draw_text_in, ui_font};
 
 pub(crate) fn ease_out(t: f64) -> f64 {
     1.0 - (1.0 - t).powi(3)

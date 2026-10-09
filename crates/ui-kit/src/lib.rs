@@ -7,5 +7,8 @@
 //! neither Windows nor the shell.
 
 pub mod design;
+pub mod glyph;
+pub mod icons;
 pub mod runtime;
+pub mod text;
 pub mod theme;
