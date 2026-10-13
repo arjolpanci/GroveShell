@@ -156,7 +156,16 @@ pub(crate) struct CardAnim {
 /// `WM_LBUTTONDOWN` while the overview is `Open`.
 pub(crate) struct CarouselDrag {
     pub(crate) start_x: i32,
+    /// Where the carousel sat when the press landed — the value a
+    /// below-threshold "drag" is restored to before it is treated as a
+    /// click.
     pub(crate) start_offset: f64,
+    /// Last pointer x, so each move feeds the tracker a delta rather
+    /// than an absolute position.
+    pub(crate) last_x: i32,
+    /// The physics. A released drag lands through the same projection a
+    /// scroll fling does, so both feel alike.
+    pub(crate) tracker: groveshell_motion::SwipeTracker,
     /// Furthest horizontal distance from `start_x` seen so far, used at
     /// release time to distinguish a drag from a plain click.
     pub(crate) max_delta: i32,
@@ -1320,6 +1329,10 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
     // The click that starts this drag just re-activated (and re-raised)
     // the overview — put the bars back on top of it.
     raise_bars_topmost();
+    // Resolved before the mutable borrow below: `strip_pages` takes its
+    // own shared borrow, and a shared borrow taken inside a `borrow_mut`
+    // scope panics.
+    let page_count = strip_pages(monitor).0;
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
@@ -1407,6 +1420,21 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
                 ov.carousel_drag = Some(CarouselDrag {
                     start_x: x,
                     start_offset: ov.carousel.value(),
+                    last_x: x,
+                    tracker: {
+                        let mut t = groveshell_motion::SwipeTracker::new(
+                            groveshell_motion::InputKind::Touchpad,
+                        );
+                        // `allow_long_swipes` stays false: one hard flick
+                        // may advance one page, never three.
+                        t.confirm_swipe(
+                            scaled(CAROUSEL_DRAG_PAGE_DISTANCE_PX as i32, reference_dpi()) as f64,
+                            carousel_snap_points(page_count),
+                            ov.carousel.value(),
+                            ov.carousel.value().round(),
+                        );
+                        t
+                    },
                     max_delta: 0,
                 });
                 Some((ov.hwnd, false))
@@ -1551,16 +1579,17 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
         }
 
         let drag = ov.carousel_drag.as_mut()?;
-        let delta_px = x - drag.start_x;
-        drag.max_delta = drag.max_delta.max(delta_px.abs());
-        // `x`/`delta_px` are physical pixels (the overview is per-monitor
-        // DPI aware); the comfortable "swipe this far for one page"
-        // distance has to scale the same way or the drag feels twitchy
-        // and overshoots on a high-DPI display — same real pointer
-        // travel produces more raw pixels there.
-        let page_distance_px = scaled(CAROUSEL_DRAG_PAGE_DISTANCE_PX as i32, reference_dpi()) as f64;
-        let raw_offset = drag.start_offset - delta_px as f64 / page_distance_px;
-        ov.carousel.set_value(raw_offset.clamp(0.0, (workspace_count.max(1) - 1) as f64));
+        drag.max_delta = drag.max_delta.max((x - drag.start_x).abs());
+        // The tracker takes deltas, and clamps to one snap point either
+        // side of where the drag began — the swipe distance it was armed
+        // with is DPI-scaled, since `x` is in physical pixels and the
+        // same real pointer travel yields more of them on a high-DPI
+        // display.
+        let step = (drag.last_x - x) as f64;
+        drag.last_x = x;
+        let value = drag.tracker.append_event(now_ms(), step);
+        ov.carousel.set_value(value);
+        let _ = workspace_count;
         Some((ov.hwnd, MoveKind::Carousel))
     });
     let Some((overview_hwnd, kind)) = result else {
@@ -1801,21 +1830,26 @@ pub(crate) fn on_overview_drag_end(monitor: &str, x: i32, y: i32) {
         return;
     }
 
-    let target = STATE.with(|s| {
-        let state = s.borrow();
-        let Some(st) = state.as_ref() else {
-            return 0;
-        };
-        let max_index = st
-            .workspaces
-            .get(monitor)
+    // Land where the release's own momentum projects, not simply on the
+    // nearest page: a flick carries, a slow release settles.
+    let mut drag = drag;
+    let end = drag.tracker.end_from_history(now_ms());
+    let max_index = STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.workspaces.get(monitor))
             .map(|t| t.workspace_ids().len())
             .unwrap_or(0)
-            .saturating_sub(1);
-        let offset = st.overviews.get(monitor).map(|ov| ov.carousel.value()).unwrap_or(0.0);
-        offset.round().clamp(0.0, max_index as f64) as usize
+            .saturating_sub(1)
     });
+    let target = end.end_progress.round().clamp(0.0, max_index as f64) as usize;
     snap_carousel_to(monitor, target, None);
+}
+
+/// Milliseconds on the tick clock, for gesture velocity.
+fn now_ms() -> u64 {
+    // SAFETY: no preconditions; returns a tick count.
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
 }
 
 /// Drops any in-progress drag without treating it as a click or a
@@ -3640,6 +3674,35 @@ pub(crate) fn on_animation_tick(monitor: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snap_points_are_one_per_page_in_ascending_order() {
+        assert_eq!(carousel_snap_points(3), vec![0.0, 1.0, 2.0]);
+        assert_eq!(carousel_snap_points(1), vec![0.0]);
+    }
+
+    #[test]
+    fn a_workspace_set_of_zero_still_yields_one_point() {
+        // A monitor always has at least the current workspace; an empty
+        // snap-point list would make every projection a no-op.
+        assert_eq!(carousel_snap_points(0), vec![0.0]);
+    }
+
+    #[test]
+    fn a_carousel_drag_cannot_skip_a_page() {
+        let mut t = groveshell_motion::SwipeTracker::new(groveshell_motion::InputKind::Touchpad);
+        t.confirm_swipe(480.0, carousel_snap_points(5), 2.0, 2.0);
+        t.update(10_000.0);
+        assert_eq!(t.progress(), 3.0, "one page past the start, no further");
+    }
+
+    #[test]
+    fn a_carousel_flick_lands_on_the_next_page() {
+        let mut t = groveshell_motion::SwipeTracker::new(groveshell_motion::InputKind::Touchpad);
+        t.confirm_swipe(480.0, carousel_snap_points(5), 2.0, 2.0);
+        t.update(100.0);
+        assert_eq!(t.end(3.0).end_progress, 3.0);
+    }
 
     #[test]
     fn a_closed_overview_rests_at_zero_progress() {
