@@ -230,6 +230,35 @@ pub(crate) fn grid_slots(card: RectF, count: usize, dpi: u32) -> Vec<RectF> {
         .collect()
 }
 
+/// Where one window's preview sits at progress `p` — its real on-screen
+/// rect at 0, its grid slot at 1. This is the port of
+/// `workspace.js:732`, and it is what makes the overview's first frame
+/// honest: at `p = 0` every preview covers the window it was captured
+/// from, so the composed frame is indistinguishable from the desktop.
+///
+/// `home` of `None` means the window has no meaningful on-screen rect —
+/// parked on another workspace, or minimized. Flying a preview out of an
+/// empty patch of desktop would be a lie, so it stays at its slot and
+/// fades instead (see [`thumb_alpha`]).
+pub(crate) fn thumb_rect(home: Option<RectF>, slot: RectF, p: f64) -> RectF {
+    let p = p.clamp(0.0, 1.0);
+    match home {
+        Some(home) => lerp_rect(home, slot, p),
+        None => slot,
+    }
+}
+
+/// A preview's opacity at progress `p`. One that flies is opaque the
+/// whole way — it is standing in for a real window that was already on
+/// screen. One with no home fades in with the card, which is the honest
+/// thing to show for a window that is not actually anywhere.
+pub(crate) fn thumb_alpha(home: Option<RectF>, p: f64) -> f64 {
+    match home {
+        Some(_) => 1.0,
+        None => p.clamp(0.0, 1.0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +387,54 @@ mod tests {
         let slots = grid_slots(l.card, 0, i.dpi);
         assert!(slots.is_empty());
         assert!(l.card.width() > 0.0, "the card itself still has a size");
+    }
+
+    #[test]
+    fn a_preview_starts_on_its_real_window_and_lands_in_its_slot() {
+        let home = RectF::new(100.0, 100.0, 900.0, 600.0);
+        let slot = RectF::new(500.0, 400.0, 700.0, 520.0);
+        assert_eq!(thumb_rect(Some(home), slot, 0.0), home);
+        assert_eq!(thumb_rect(Some(home), slot, 1.0), slot);
+    }
+
+    #[test]
+    fn a_preview_in_flight_is_between_its_two_ends() {
+        let home = RectF::new(0.0, 0.0, 800.0, 600.0);
+        let slot = RectF::new(400.0, 300.0, 600.0, 450.0);
+        let mid = thumb_rect(Some(home), slot, 0.5);
+        assert_eq!(mid, RectF::new(200.0, 150.0, 700.0, 525.0));
+    }
+
+    #[test]
+    fn a_preview_is_fully_opaque_throughout_its_flight() {
+        let home = Some(RectF::new(0.0, 0.0, 800.0, 600.0));
+        for p in [0.0, 0.25, 0.5, 1.0] {
+            assert_eq!(thumb_alpha(home, p), 1.0);
+        }
+    }
+
+    /// Review Focus 2: a parked or minimized window has no real rect, so
+    /// it must sit at its slot and fade rather than fly from nowhere.
+    #[test]
+    fn a_preview_without_a_home_sits_at_its_slot_and_fades_in() {
+        let slot = RectF::new(500.0, 400.0, 700.0, 520.0);
+        assert_eq!(thumb_rect(None, slot, 0.0), slot);
+        assert_eq!(thumb_rect(None, slot, 0.5), slot);
+        assert_eq!(thumb_rect(None, slot, 1.0), slot);
+
+        assert_eq!(thumb_alpha(None, 0.0), 0.0);
+        assert_eq!(thumb_alpha(None, 1.0), 1.0);
+        assert!(thumb_alpha(None, 0.5) > 0.0 && thumb_alpha(None, 0.5) < 1.0);
+    }
+
+    #[test]
+    fn thumb_progress_is_clamped() {
+        let home = RectF::new(0.0, 0.0, 100.0, 100.0);
+        let slot = RectF::new(10.0, 10.0, 50.0, 50.0);
+        assert_eq!(thumb_rect(Some(home), slot, -1.0), home);
+        assert_eq!(thumb_rect(Some(home), slot, 2.0), slot);
+        assert_eq!(thumb_alpha(None, -1.0), 0.0);
+        assert_eq!(thumb_alpha(None, 7.0), 1.0);
     }
 
     #[test]
