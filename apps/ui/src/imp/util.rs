@@ -38,10 +38,6 @@ pub(crate) fn progress_dur(started: std::time::Instant, duration: std::time::Dur
     (started.elapsed().as_secs_f64() / effective_duration.as_secs_f64()).min(1.0)
 }
 
-pub(crate) fn progress(started: std::time::Instant) -> f64 {
-    progress_dur(started, super::state::ANIM_DURATION)
-}
-
 /// `SetForegroundWindow`, but reliable even when called from a context
 /// Windows doesn't consider a direct result of user input — notably
 /// from `WM_TIMER` (an animation completing, e.g. a carousel slide

@@ -207,7 +207,7 @@ pub(crate) fn switch_workspace_relative(delta: i32) {
                 let overview_open = st
                     .overviews
                     .get(&monitor)
-                    .map(|ov| matches!(ov.mode, OverviewMode::Open { .. }))
+                    .map(|ov| matches!(ov.mode, OverviewMode::Live { .. }))
                     .unwrap_or(false);
                 Some((tracker.clamped_relative_index(delta), overview_open))
             })

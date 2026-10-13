@@ -903,7 +903,7 @@ pub(crate) fn on_dock_drag_end(monitor: &str, drag: DockDrag, x: i32, y: i32) {
 
     let (card_rect, pitch) = super::overview::card_layout(monitor);
     let carousel_offset = super::state::STATE.with(|s| {
-        s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).map(|ov| ov.carousel_offset)
+        s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).map(|ov| ov.carousel.value())
     });
     let Some(carousel_offset) = carousel_offset else { return };
     if y < card_rect.top || y >= card_rect.bottom {

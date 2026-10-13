@@ -652,7 +652,7 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
             let overview_open = STATE
                 .with(|s| {
                     s.borrow().as_ref().and_then(|st| st.overviews.get(monitor))
-                        .map(|ov| matches!(ov.mode, OverviewMode::Open { .. }))
+                        .map(|ov| matches!(ov.mode, OverviewMode::Live { .. }))
                 })
                 .unwrap_or(false);
             if overview_open {

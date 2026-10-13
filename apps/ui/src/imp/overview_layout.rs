@@ -8,6 +8,10 @@
 //! dash's measured height — and rounds to integers at the Win32/D2D
 //! boundary.
 
+// Wired into the renderer in the next task; until then the constants and
+// helpers below are reachable only from their own tests.
+#![allow(dead_code)]
+
 use groveshell_motion::{lerp, lerp_rect, RectF};
 
 /// Vertical spacing as a fraction of the work area's height
