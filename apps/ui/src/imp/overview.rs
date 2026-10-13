@@ -572,6 +572,42 @@ fn thumb_slot_pairs(monitor: &str, thumbs: &[ThumbAnim]) -> Vec<(isize, groveshe
     pairs
 }
 
+/// How many workspace pages this monitor's overview has, and which one
+/// is current — what the strip needs to lay itself out and highlight.
+///
+/// Takes a **shared** `STATE` borrow, and every caller is itself inside
+/// one (the paint paths). That is sound — `RefCell` allows any number of
+/// concurrent shared borrows — but it means this must never be changed
+/// to `borrow_mut`, and must not be called from a `borrow_mut` scope:
+/// either would panic. See `state::ANIMATION_SCALE` for the `Cell`
+/// mirror pattern to use if it ever needs mutable access.
+pub(crate) fn strip_pages(monitor: &str) -> (usize, usize) {
+    STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.workspaces.get(monitor))
+            .map(|t| (t.workspace_ids().len(), t.current_index()))
+            .unwrap_or((1, 0))
+    })
+}
+
+/// Which strip page `(x, y)` falls on, if any. Overview-client coords.
+fn strip_hit(monitor: &str, x: i32, y: i32) -> Option<usize> {
+    let input = layout_input(monitor)?;
+    let layout = super::overview_layout::layout_for_state(
+        super::overview_layout::ControlsState::WindowPicker,
+        &input,
+    );
+    let (pages, _) = strip_pages(monitor);
+    super::overview_layout::strip_page_at(
+        layout.strip,
+        pages,
+        input.monitor_aspect,
+        x as f64,
+        y as f64,
+    )
+}
+
 /// How open this monitor's overview is, 0.0 when closed or absent.
 ///
 /// Consumed by the desktop dock in the next task.
@@ -605,7 +641,11 @@ pub(crate) fn layout_input(monitor: &str) -> Option<super::overview_layout::Layo
         // exactly, so the monitor's top-left is the client origin.
         work_area: groveshell_motion::RectF::new(0.0, bar, width, height),
         dpi,
-        search_height: scaled(SEARCH_ROW_HEIGHT, dpi) as f64,
+        // The search panel starts a gap below the bar and is one row
+        // tall when empty (`search_layout`), so the band it occupies is
+        // gap + row — not just the row. Measuring only the row left the
+        // strip tucked under the panel's bottom edge.
+        search_height: scaled(SEARCH_PANEL_GAP + SEARCH_ROW_HEIGHT, dpi) as f64,
         dash_height: super::dock::dash_height(dpi) as f64,
         monitor_aspect: if height > 0.0 { width / height } else { 1.0 },
     })
@@ -914,6 +954,10 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         let gpu = ov.gpu.as_ref()?;
         super::overview_gpu::paint_root(gpu, monitor, ov);
         super::overview_gpu::paint_dash(gpu, monitor, ov);
+        {
+            let (pages, current) = strip_pages(monitor);
+            super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+        }
         Some(())
     });
 
@@ -1141,6 +1185,10 @@ pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
                         let gpu = ov.gpu.as_ref()?;
                         super::overview_gpu::paint_root(gpu, monitor, ov);
                         super::overview_gpu::paint_dash(gpu, monitor, ov);
+                        {
+                            let (pages, current) = strip_pages(monitor);
+                            super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                        }
                         Some(())
                     });
                     if gpu_repainted.is_none() {
@@ -1149,6 +1197,13 @@ pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
                 }
             }
         }
+        return;
+    }
+
+    // The strip sits above every card, in its own band — a click there
+    // switches workspace and never reaches the hit-testing below.
+    if let Some(page) = strip_hit(monitor, x, y) {
+        snap_carousel_to(monitor, page, None);
         return;
     }
 
@@ -1502,6 +1557,10 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 // are repainted, not every card visual.
                 super::overview_gpu::paint_root(gpu, monitor, ov);
                 super::overview_gpu::paint_dash(gpu, monitor, ov);
+                {
+                    let (pages, current) = strip_pages(monitor);
+                    super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                }
                 if let Some(drag) = ov.window_drag.as_ref() {
                     if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
                         if let OverviewMode::Live { .. } = &ov.mode {
@@ -1519,6 +1578,10 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 // thing this tick needs.
                 super::overview_gpu::paint_root(gpu, monitor, ov);
                 super::overview_gpu::paint_dash(gpu, monitor, ov);
+                {
+                    let (pages, current) = strip_pages(monitor);
+                    super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                }
             }
             MoveKind::Carousel => {}
         }
@@ -1612,6 +1675,10 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
         // Dock hover is root content — repaint the chrome surface.
         super::overview_gpu::paint_root(gpu, monitor, ov);
         super::overview_gpu::paint_dash(gpu, monitor, ov);
+        {
+            let (pages, current) = strip_pages(monitor);
+            super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+        }
         // Thumbnail hover is card content (see `HoverTarget`) — only
         // the previously- and newly-hovered card (at most two, usually
         // the same one) are repainted.
@@ -1756,6 +1823,11 @@ pub(crate) fn on_overview_capture_lost(monitor: &str) {
 /// its workspace is current). Released anywhere else, the drag just
 /// cancels — the ghost disappears and the preview stays put.
 fn on_window_drop(monitor: &str, drag: WindowDrag, x: i32, y: i32) {
+    // Dropping onto the strip moves the window to that workspace — the
+    // same move the card drop below performs, just aimed at the
+    // miniature instead of the full card.
+    let strip_target = strip_hit(monitor, x, y);
+
     let moved = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
@@ -1766,24 +1838,31 @@ fn on_window_drop(monitor: &str, drag: WindowDrag, x: i32, y: i32) {
         // next to it instead of exactly on it. Read the overview's mode
         // and offset first (immutable), releasing that borrow before the
         // workspace tracker is taken mutably below.
-        let offset = {
-            let ov = state.overviews.get(monitor)?;
-            let OverviewMode::Live { cards, .. } = &ov.mode else {
-                return None;
-            };
-            if cards.is_empty() || y < card_rect.top || y >= card_rect.bottom {
-                return None;
+        let target = match strip_target {
+            // A drop on the strip names its page outright; no snapping.
+            Some(page) => page,
+            None => {
+                let offset = {
+                    let ov = state.overviews.get(monitor)?;
+                    let OverviewMode::Live { cards, .. } = &ov.mode else {
+                        return None;
+                    };
+                    if cards.is_empty() || y < card_rect.top || y >= card_rect.bottom {
+                        return None;
+                    }
+                    ov.carousel.value()
+                };
+                let card_center_x = (card_rect.left + card_rect.right) / 2;
+                let approx_offset = offset + (x - card_center_x) as f64 / pitch as f64;
+                let max_page = state.workspaces.get(monitor)?.workspace_ids().len().saturating_sub(1);
+                let target = approx_offset.round().clamp(0.0, max_page as f64) as usize;
+                if (approx_offset - target as f64).abs() > 0.5 {
+                    return None;
+                }
+                target
             }
-            ov.carousel.value()
         };
-        let card_center_x = (card_rect.left + card_rect.right) / 2;
-        let approx_offset = offset + (x - card_center_x) as f64 / pitch as f64;
         let tracker = state.workspaces.get_mut(monitor)?;
-        let max_page = tracker.workspace_ids().len().saturating_sub(1);
-        let target = approx_offset.round().clamp(0.0, max_page as f64) as usize;
-        if (approx_offset - target as f64).abs() > 0.5 {
-            return None;
-        }
         if target == drag.from_page {
             return None;
         }
@@ -1822,6 +1901,10 @@ fn on_window_drop(monitor: &str, drag: WindowDrag, x: i32, y: i32) {
                 let gpu = ov.gpu.as_ref()?;
                 super::overview_gpu::paint_root(gpu, monitor, ov);
                 super::overview_gpu::paint_dash(gpu, monitor, ov);
+                {
+                    let (pages, current) = strip_pages(monitor);
+                    super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                }
                 Some(())
             });
             if gpu_repainted.is_none() {
@@ -2148,6 +2231,10 @@ pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
                     let gpu = ov.gpu.as_ref()?;
                     super::overview_gpu::paint_root(gpu, monitor, ov);
                     super::overview_gpu::paint_dash(gpu, monitor, ov);
+                    {
+                        let (pages, current) = strip_pages(monitor);
+                        super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                    }
                     Some(())
                 });
                 if gpu_repainted.is_none() {
@@ -2163,6 +2250,10 @@ pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
                     let gpu = ov.gpu.as_ref()?;
                     super::overview_gpu::paint_root(gpu, monitor, ov);
                     super::overview_gpu::paint_dash(gpu, monitor, ov);
+                    {
+                        let (pages, current) = strip_pages(monitor);
+                        super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                    }
                     Some(())
                 });
                 if gpu_repainted.is_none() {
@@ -3391,6 +3482,10 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         if pop_active || dock_hover_easing {
             super::overview_gpu::paint_root(gpu, monitor, ov);
             super::overview_gpu::paint_dash(gpu, monitor, ov);
+            {
+                let (pages, current) = strip_pages(monitor);
+                super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+            }
         }
         if card_hover_easing || thumb_hover_easing {
             if let OverviewMode::Live { thumbs, .. } = &ov.mode {

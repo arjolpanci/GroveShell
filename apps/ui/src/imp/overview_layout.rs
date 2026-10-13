@@ -234,6 +234,42 @@ pub(crate) fn grid_slots(card: RectF, count: usize, dpi: u32) -> Vec<RectF> {
         .collect()
 }
 
+/// Gap between strip thumbnails, as a fraction of one thumbnail's width.
+const STRIP_GAP_RATIO: f64 = 0.08;
+
+/// One slot per workspace in the strip, each a faithful miniature of the
+/// monitor, laid out in page order and centred as a group.
+pub(crate) fn strip_slots(strip: RectF, page_count: usize, aspect: f64) -> Vec<RectF> {
+    if page_count == 0 {
+        return Vec::new();
+    }
+    let h = strip.height().max(0.0);
+    let aspect = if aspect > 0.0 { aspect } else { 1.0 };
+    let w = h * aspect;
+    let gap = w * STRIP_GAP_RATIO;
+    let total = w * page_count as f64 + gap * (page_count as f64 - 1.0);
+    let start = strip.center().0 - total / 2.0;
+    (0..page_count)
+        .map(|i| RectF::from_size(start + i as f64 * (w + gap), strip.top, w, h))
+        .collect()
+}
+
+/// Which page's strip slot contains `(x, y)`, if any. Gutters between
+/// slots deliberately hit nothing rather than rounding to a neighbour —
+/// a mis-click that switches workspace is worse than one that does
+/// nothing.
+pub(crate) fn strip_page_at(
+    strip: RectF,
+    page_count: usize,
+    aspect: f64,
+    x: f64,
+    y: f64,
+) -> Option<usize> {
+    strip_slots(strip, page_count, aspect)
+        .into_iter()
+        .position(|s| x >= s.left && x < s.right && y >= s.top && y < s.bottom)
+}
+
 /// Where one window's preview sits at progress `p` — its real on-screen
 /// rect at 0, its grid slot at 1. This is the port of
 /// `workspace.js:732`, and it is what makes the overview's first frame
@@ -391,6 +427,46 @@ mod tests {
         let slots = grid_slots(l.card, 0, i.dpi);
         assert!(slots.is_empty());
         assert!(l.card.width() > 0.0, "the card itself still has a size");
+    }
+
+    #[test]
+    fn the_strip_lays_out_one_slot_per_page_centred_in_its_band() {
+        let strip = RectF::new(0.0, 30.0, 1920.0, 84.0);
+        let slots = strip_slots(strip, 3, 16.0 / 9.0);
+        assert_eq!(slots.len(), 3);
+        for s in &slots {
+            assert!(s.top >= strip.top && s.bottom <= strip.bottom);
+            assert!((s.width() / s.height() - 16.0 / 9.0).abs() < 0.01);
+        }
+        let span_center = (slots[0].left + slots[2].right) / 2.0;
+        assert!((span_center - strip.center().0).abs() < 0.01);
+        assert!(slots[0].right <= slots[1].left);
+        assert!(slots[1].right <= slots[2].left);
+    }
+
+    #[test]
+    fn an_empty_strip_has_no_slots() {
+        assert!(strip_slots(RectF::new(0.0, 0.0, 100.0, 20.0), 0, 1.7).is_empty());
+    }
+
+    #[test]
+    fn a_zero_height_strip_does_not_produce_inverted_slots() {
+        let slots = strip_slots(RectF::new(0.0, 10.0, 1920.0, 10.0), 3, 1.7);
+        for s in &slots {
+            assert!(s.width() >= 0.0 && s.height() >= 0.0);
+        }
+    }
+
+    #[test]
+    fn hit_testing_the_strip_finds_the_page_under_the_pointer() {
+        let strip = RectF::new(0.0, 30.0, 1920.0, 84.0);
+        let slots = strip_slots(strip, 3, 16.0 / 9.0);
+        for (i, s) in slots.iter().enumerate() {
+            let (cx, cy) = s.center();
+            assert_eq!(strip_page_at(strip, 3, 16.0 / 9.0, cx, cy), Some(i));
+        }
+        assert_eq!(strip_page_at(strip, 3, 16.0 / 9.0, 5.0, 35.0), None, "gutter hits nothing");
+        assert_eq!(strip_page_at(strip, 3, 16.0 / 9.0, 960.0, 500.0), None, "below the strip");
     }
 
     #[test]

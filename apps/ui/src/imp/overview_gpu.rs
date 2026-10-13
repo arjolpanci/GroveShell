@@ -201,6 +201,14 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
             let _ = root.visual().AddVisual(dash.visual(), true, None);
         }
     }
+    // The workspace strip, on the same arrangement as the dash.
+    let strip = gpu::create_child_surface(width, height);
+    if let Some(strip) = strip.as_ref() {
+        // SAFETY: same device, same lifetime as `root`.
+        unsafe {
+            let _ = root.visual().AddVisual(strip.visual(), true, None);
+        }
+    }
     // Re-raise the chrome so it stays above the dash.
     // SAFETY: as above.
     unsafe {
@@ -213,8 +221,8 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
         chrome,
         dash,
         dash_natural: RectF::new(0.0, 0.0, width as f64, height as f64),
-        strip: None,
-        strip_natural: RectF::default(),
+        strip,
+        strip_natural: RectF::new(0.0, 0.0, width as f64, height as f64),
     })
 }
 
@@ -287,6 +295,9 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     unsafe {
         if let Some(dash) = state.dash.as_ref() {
             let _ = state.root.visual().AddVisual(dash.visual(), true, None);
+        }
+        if let Some(strip) = state.strip.as_ref() {
+            let _ = state.root.visual().AddVisual(strip.visual(), true, None);
         }
         let _ = state.root.visual().AddVisual(state.chrome.visual(), true, None);
     }
@@ -364,6 +375,9 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim],
     unsafe {
         if let Some(dash) = state.dash.as_ref() {
             let _ = state.root.visual().AddVisual(dash.visual(), true, None);
+        }
+        if let Some(strip) = state.strip.as_ref() {
+            let _ = state.root.visual().AddVisual(strip.visual(), true, None);
         }
         let _ = state.root.visual().AddVisual(state.chrome.visual(), true, None);
     }
@@ -498,6 +512,59 @@ pub(crate) fn paint_dash(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
     });
 }
 
+
+/// Paints the workspace thumbnail strip: one wallpaper-filled miniature
+/// per workspace, with the current one outlined in the accent colour.
+///
+/// Full-window surface for the same reason the dash has one — the slide
+/// stays a pure translation.
+pub(crate) fn paint_strip(gpu: &OverviewGpuState, monitor: &str, page_count: usize, current: usize) {
+    let Some(surface) = gpu.strip.as_ref() else { return };
+    let Some(input) = super::overview::layout_input(monitor) else { return };
+    let layout = super::overview_layout::layout_for_state(
+        super::overview_layout::ControlsState::WindowPicker,
+        &input,
+    );
+    let slots = super::overview_layout::strip_slots(layout.strip, page_count, input.monitor_aspect);
+    let dpi = reference_dpi();
+    let radius = scaled(4, dpi) as f32;
+
+    gpu::redraw(surface, |ctx: &ID2D1DeviceContext| {
+        gpu::clear_transparent(ctx);
+        for (page, slot) in slots.iter().enumerate() {
+            let r = D2D_RECT_F {
+                left: slot.left as f32,
+                top: slot.top as f32,
+                right: slot.right as f32,
+                bottom: slot.bottom as f32,
+            };
+            let rect = RECT {
+                left: slot.left.round() as i32,
+                top: slot.top.round() as i32,
+                right: slot.right.round() as i32,
+                bottom: slot.bottom.round() as i32,
+            };
+            // `wallpaper_hbitmap_for` deliberately serves only the card's
+            // exact size; a strip miniature needs its own small scale, which
+            // is what `backdrop_small_wallpaper` already produces.
+            let mut drew = false;
+            let (w, h) = (rect.right - rect.left, rect.bottom - rect.top);
+            if let Some(wallpaper) = super::overview::backdrop_small_wallpaper(w, h) {
+                if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, wallpaper) {
+                    gpu::draw_rounded_bitmap(ctx, r, radius, &bitmap);
+                    drew = true;
+                }
+            }
+            if !drew {
+                gpu::fill_rounded_rect(ctx, r, radius, super::design::color::surface_overlay());
+            }
+            if page == current {
+                gpu::stroke_rounded_rect(ctx, r, radius, super::design::color::accent(), 1.0, 2.0);
+            }
+        }
+    });
+}
+
 /// Applies this tick's carousel position/zoom to every card visual —
 /// the GPU-path replacement for `repaint_overview`'s full redraw.
 /// `card_layout`/`displayed_rect`/`zoom_rect` are the exact same pure
@@ -597,11 +664,17 @@ pub(crate) fn update_transforms(
         }
     }
     if let Some(strip) = &gpu_state.strip {
+        // Same arrangement as the dash: painted at its window-picker
+        // position, slid by the offset to wherever the adjustment puts it.
+        let picker = super::overview_layout::layout_for_state(
+            super::overview_layout::ControlsState::WindowPicker,
+            &input,
+        );
+        let dy = layout.strip.top - picker.strip.top;
+        let target = offset_rect(gpu_state.strip_natural, 0.0, dy);
         // SAFETY: as above.
         unsafe {
-            let _ = strip
-                .visual()
-                .SetTransform2(&surface_transform(gpu_state.strip_natural, layout.strip));
+            let _ = strip.visual().SetTransform2(&surface_transform(gpu_state.strip_natural, target));
         }
         gpu::set_opacity(strip, layout.strip_alpha as f32);
     }
