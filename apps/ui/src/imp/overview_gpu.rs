@@ -31,6 +31,45 @@ use super::overview_layout::{layout_for_progress, thumb_alpha, thumb_rect};
 use super::state::{reference_dpi, scaled};
 use super::util::{ease_out, progress_dur};
 
+/// Attaches `child` as the topmost child of `parent`, detaching it first.
+///
+/// `AddVisual` is **not** a no-op for a visual that is already a child:
+/// DirectComposition rejects it with `E_INVALIDARG`. Relying on it to
+/// re-insert meant every rebuild after the first silently failed to
+/// attach or re-raise anything, so attachment and z-order stopped being
+/// deterministic — a preview that dropped out of one rebuild and came
+/// back never rendered again. `RemoveVisual` on a visual that is not a
+/// child *is* a documented no-op, so detach-then-attach is safe for both
+/// the first attach and every re-raise.
+unsafe fn raise_child(parent: &windows::Win32::Graphics::DirectComposition::IDCompositionVisual2, child: &windows::Win32::Graphics::DirectComposition::IDCompositionVisual2) {
+    let _ = parent.RemoveVisual(child);
+    let _ = parent.AddVisual(child, true, None);
+}
+
+/// What a preview's surface should actually show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreviewSource {
+    /// The captured bitmap of the window.
+    Snapshot,
+    /// A rounded chip with the window's title.
+    TitleChip,
+}
+
+/// Decides between them.
+///
+/// A minimized window is the case worth spelling out: DWM renders
+/// nothing for one, so the capture taken for it is blank. Drawing it
+/// anyway put a large grey gradient block where a preview should be —
+/// and because a minimized window also gets no *live* DWM thumbnail
+/// laid over the top, nothing ever corrected it.
+pub(crate) fn preview_source(iconic: bool, has_snapshot: bool) -> PreviewSource {
+    if has_snapshot && !iconic {
+        PreviewSource::Snapshot
+    } else {
+        PreviewSource::TitleChip
+    }
+}
+
 /// Takes the entry matching `key` out of `pool`, but **only** if it also
 /// satisfies `still_usable`.
 ///
@@ -220,7 +259,7 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
     if let Some(dash) = dash.as_ref() {
         // SAFETY: same device, same lifetime as `root`.
         unsafe {
-            let _ = root.visual().AddVisual(dash.visual(), true, None);
+            raise_child(root.visual(), dash.visual());
         }
     }
     // The workspace strip, on the same arrangement as the dash.
@@ -228,13 +267,13 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
     if let Some(strip) = strip.as_ref() {
         // SAFETY: same device, same lifetime as `root`.
         unsafe {
-            let _ = root.visual().AddVisual(strip.visual(), true, None);
+            raise_child(root.visual(), strip.visual());
         }
     }
     // Re-raise the chrome so it stays above the dash.
     // SAFETY: as above.
     unsafe {
-        let _ = root.visual().AddVisual(chrome.visual(), true, None);
+        raise_child(root.visual(), chrome.visual());
     }
     Some(OverviewGpuState {
         root,
@@ -304,7 +343,7 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
         // long as `state` is. `AddVisual` on an already-attached visual is
         // a harmless no-op.
         unsafe {
-            let _ = state.root.visual().AddVisual(card_visual.surface.visual(), true, None);
+            raise_child(state.root.visual(), card_visual.surface.visual());
         }
     }
     // Re-insert `chrome` above every card just attached above — each
@@ -316,12 +355,12 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     // are alive for as long as `state` is.
     unsafe {
         if let Some(dash) = state.dash.as_ref() {
-            let _ = state.root.visual().AddVisual(dash.visual(), true, None);
+            raise_child(state.root.visual(), dash.visual());
         }
         if let Some(strip) = state.strip.as_ref() {
-            let _ = state.root.visual().AddVisual(strip.visual(), true, None);
+            raise_child(state.root.visual(), strip.visual());
         }
-        let _ = state.root.visual().AddVisual(state.chrome.visual(), true, None);
+        raise_child(state.root.visual(), state.chrome.visual());
     }
 }
 
@@ -391,7 +430,7 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim])
         // SAFETY: both visuals belong to the same device and outlive this
         // call; `AddVisual` on an already-attached visual is a no-op.
         unsafe {
-            let _ = state.root.visual().AddVisual(visual.surface.visual(), true, None);
+            raise_child(state.root.visual(), visual.surface.visual());
         }
     }
     // Each `AddVisual(_, true, None)` inserts at the top, so the dash and
@@ -401,12 +440,12 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim])
     // as long as `state` is.
     unsafe {
         if let Some(dash) = state.dash.as_ref() {
-            let _ = state.root.visual().AddVisual(dash.visual(), true, None);
+            raise_child(state.root.visual(), dash.visual());
         }
         if let Some(strip) = state.strip.as_ref() {
-            let _ = state.root.visual().AddVisual(strip.visual(), true, None);
+            raise_child(state.root.visual(), strip.visual());
         }
-        let _ = state.root.visual().AddVisual(state.chrome.visual(), true, None);
+        raise_child(state.root.visual(), state.chrome.visual());
     }
     state.thumbs = rebuilt;
 }
@@ -423,14 +462,25 @@ pub(crate) fn paint_thumb(thumb: &ThumbVisual, title: &str, hover_intensity: f64
         right: thumb.natural.width() as f32,
         bottom: thumb.natural.height() as f32,
     };
+    // SAFETY: a plain query; a stale handle reports false rather than
+    // misbehaving.
+    let iconic = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::IsIconic(HWND(thumb.hwnd as *mut c_void)).as_bool()
+    };
+    let has_snapshot = super::overview::window_snapshot(thumb.hwnd).is_some();
+    let source = preview_source(iconic, has_snapshot);
+
     gpu::redraw(&thumb.surface, |ctx: &ID2D1DeviceContext| {
         // The surface is rounded off, so its corners must start empty.
         gpu::clear_transparent(ctx);
-        let snapshot = super::overview::slot_scaled_snapshot(
-            thumb.hwnd,
-            thumb.natural.width().round() as i32,
-            thumb.natural.height().round() as i32,
-        );
+        let snapshot = match source {
+            PreviewSource::Snapshot => super::overview::slot_scaled_snapshot(
+                thumb.hwnd,
+                thumb.natural.width().round() as i32,
+                thumb.natural.height().round() as i32,
+            ),
+            PreviewSource::TitleChip => None,
+        };
         match snapshot.and_then(|h| gpu::bitmap_from_hbitmap(ctx, HBITMAP(h as *mut c_void))) {
             Some(bitmap) => gpu::draw_rounded_bitmap(ctx, full, radius, &bitmap),
             None => {
@@ -598,6 +648,7 @@ pub(crate) fn paint_strip(gpu: &OverviewGpuState, monitor: &str, page_count: usi
 /// functions `paint_overview` already used; only what happens with
 /// their result changes (a transform instead of a redraw).
 pub(crate) fn update_transforms(
+    overview_hwnd: HWND,
     gpu_state: &OverviewGpuState,
     monitor: &str,
     carousel_offset: f64,
@@ -610,6 +661,10 @@ pub(crate) fn update_transforms(
         return;
     };
     let layout = layout_for_progress(progress, &input);
+    // Live previews ride on the same rects the snapshots are transformed
+    // into, so a preview tracks the flight frame for frame. Collected
+    // here and handed to DWM once at the end.
+    let mut live: Vec<(HWND, RECT)> = Vec::new();
 
     for card_visual in &gpu_state.cards {
         let dx = (card_visual.page as f64 - carousel_offset) * layout.pitch;
@@ -662,14 +717,27 @@ pub(crate) fn update_transforms(
             // rendering cannot disagree.
             let home = th.home.map(to_rect_f);
             let flown = thumb_rect(home, to_rect_f(th.rect), progress);
+            let tgt = apply(flown);
             // SAFETY: as above.
             unsafe {
                 let _ = visual
                     .surface
                     .visual()
-                    .SetTransform2(&surface_transform(visual.natural, apply(flown)));
+                    .SetTransform2(&surface_transform(visual.natural, tgt));
             }
             gpu::set_opacity(&visual.surface, thumb_alpha(home, progress) as f32);
+
+            if super::thumbnails::can_preview(th.hwnd) {
+                live.push((
+                    th.hwnd,
+                    RECT {
+                        left: tgt.left.round() as i32,
+                        top: tgt.top.round() as i32,
+                        right: tgt.right.round() as i32,
+                        bottom: tgt.bottom.round() as i32,
+                    },
+                ));
+            }
         }
     }
 
@@ -705,6 +773,17 @@ pub(crate) fn update_transforms(
         }
         gpu::set_opacity(strip, layout.strip_alpha as f32);
     }
+
+    // DWM composites these above this window's own content, so the
+    // painted snapshot stays underneath as the base layer and shows
+    // through for anything DWM will not register (a window parked on
+    // another workspace has no live contents).
+    //
+    // This used to be driven from `paint_overview`, the GDI painter.
+    // Enabling the DirectComposition renderer took that function out of
+    // the frame path, which silently turned every preview into a frozen
+    // still — the renderer fix and this call belong together.
+    super::thumbnails::sync(overview_hwnd, &live);
 
     gpu::commit();
 }
@@ -1019,6 +1098,30 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             }
         }
     });
+}
+
+#[cfg(test)]
+mod preview_source_tests {
+    use super::*;
+
+    #[test]
+    fn an_on_screen_window_with_a_capture_shows_it() {
+        assert_eq!(preview_source(false, true), PreviewSource::Snapshot);
+    }
+
+    /// A minimized window has no rendered content, so the capture taken
+    /// for it is blank — it rendered as a large grey gradient block
+    /// sitting where a preview should be.
+    #[test]
+    fn a_minimized_window_shows_its_title_not_its_blank_capture() {
+        assert_eq!(preview_source(true, true), PreviewSource::TitleChip);
+    }
+
+    #[test]
+    fn no_capture_means_the_title_whatever_the_window_is_doing() {
+        assert_eq!(preview_source(false, false), PreviewSource::TitleChip);
+        assert_eq!(preview_source(true, false), PreviewSource::TitleChip);
+    }
 }
 
 #[cfg(test)]

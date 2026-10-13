@@ -948,7 +948,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, 1.0, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, 1.0, thumbs);
         Some(())
     });
 
@@ -1596,7 +1596,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel.value(), 1.0, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs);
         match kind {
             MoveKind::Window { old_page } => {
                 // A real window drag: the ghost follows the cursor (root
@@ -1721,7 +1721,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel.value(), 1.0, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs);
         // Dock hover is root content — repaint the chrome surface.
         super::overview_gpu::paint_root(gpu, monitor, ov);
         super::overview_gpu::paint_dash(gpu, monitor, ov);
@@ -3527,7 +3527,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, progress, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, progress, thumbs);
         // The drag-pop ghost's scale and the dock's hover-glow both
         // ease continuously while active, so — unlike every other
         // root/card repaint in this module — this one *does* need to

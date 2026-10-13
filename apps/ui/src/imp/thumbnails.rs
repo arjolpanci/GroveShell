@@ -34,7 +34,7 @@ use windows::Win32::Graphics::Dwm::{
     DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
     DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
 };
-use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
 
 thread_local! {
     /// destination window -> (source window -> live registration).
@@ -48,9 +48,45 @@ thread_local! {
 /// live contents for DWM to composite, so the caller keeps its captured
 /// snapshot instead of showing an empty slot.
 pub(crate) fn can_preview(source: HWND) -> bool {
-    // SAFETY: plain query; a stale handle returns false rather than
+    // SAFETY: plain queries; a stale handle reports false rather than
     // misbehaving.
-    unsafe { IsWindowVisible(source).as_bool() }
+    unsafe { previewable(IsWindowVisible(source).as_bool(), IsIconic(source).as_bool()) }
+}
+
+/// Whether DWM has anything live to composite for a source window.
+///
+/// Minimized is the case that bit: a minimized window still reports
+/// `IsWindowVisible == true`, so checking visibility alone registered a
+/// thumbnail for it. DWM then composited a blank grey rectangle — above
+/// this window's own content, so it covered the snapshot and the title
+/// chip that would otherwise have shown, and nothing could paint over
+/// it.
+pub(crate) fn previewable(visible: bool, iconic: bool) -> bool {
+    visible && !iconic
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_on_screen_window_can_be_previewed_live() {
+        assert!(previewable(true, false));
+    }
+
+    #[test]
+    fn a_minimized_window_cannot_even_though_it_reports_visible() {
+        // Measured: a minimized Firefox reports visible=true, iconic=true
+        // and rect 314x50 at -32000,-32000.
+        assert!(!previewable(true, true));
+    }
+
+    #[test]
+    fn a_hidden_window_cannot() {
+        // Parked on another workspace: `ShowWindow(SW_HIDE)`.
+        assert!(!previewable(false, false));
+        assert!(!previewable(false, true));
+    }
 }
 
 /// Points `dest`'s live previews at exactly `items`, registering what is
