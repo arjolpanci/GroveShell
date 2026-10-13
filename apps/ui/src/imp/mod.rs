@@ -22,6 +22,7 @@ mod monitors;
 mod monitor_workspaces;
 mod movesize;
 mod overview;
+mod gestures;
 mod overview_layout;
 mod overview_gpu;
 mod pending_launch;
@@ -632,6 +633,12 @@ pub fn main() -> Result<()> {
 
         install_win_event_hooks();
         install_move_size_hooks();
+        // Where the mouse hook posts scroll events. The primary bar is
+        // simply a window with a message loop that outlives every
+        // flyout; `gestures::on_scroll` resolves the monitor itself from
+        // the pointer, and sets the idle timer on that monitor's own
+        // overview window.
+        gestures::set_gesture_target(primary_bar_hwnd);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -767,6 +774,10 @@ fn sync_desktop_dock() {
 /// Not a real Win32-defined message; app-private, matching the pattern
 /// `apps/settings/src/imp/tray.rs`'s `WM_TRAYICON` uses.
 const WM_APP_CONFIG_RELOADED: u32 = WM_APP + 1;
+/// A wheel / two-finger-scroll event, posted from the low-level mouse
+/// hook (which must only enqueue) for the UI thread to turn into gesture
+/// progress. Payload packed by `gestures::pack_scroll`.
+pub(crate) const WM_APP_GESTURE_SCROLL: u32 = WM_APP + 2;
 
 /// Sent by DWM to every top-level window when the user changes their
 /// Windows accent color. Not surfaced by the `windows` crate under a
@@ -1276,6 +1287,16 @@ unsafe extern "system" fn wndproc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_APP_GESTURE_SCROLL => {
+            let (wheel, horizontal) = gestures::unpack_scroll(wparam.0);
+            let time_ms = lparam.0 as u32 as u64;
+            // The monitor under the pointer, not the one this window is
+            // on: the gesture belongs to the screen being touched.
+            if let Some(monitor) = monitors::monitor_under_cursor() {
+                gestures::on_scroll(wheel, horizontal, time_ms, &monitor);
+            }
+            LRESULT(0)
+        }
         WM_APP_CONFIG_RELOADED => {
             let config_path = groveshell_common::paths::data_dir()
                 .map(|d| d.join("config.toml"));
@@ -1430,6 +1451,11 @@ unsafe extern "system" fn wndproc(
                 ANIM_TIMER_ID => {
                     if let Role::Overview { monitor } = role {
                         on_animation_tick(&monitor);
+                    }
+                }
+                gestures::GESTURE_IDLE_TIMER_ID => {
+                    if let Role::Overview { monitor } = role {
+                        gestures::on_idle_timeout(&monitor);
                     }
                 }
                 SYNC_TIMER_ID => on_window_sync_timer(hwnd),

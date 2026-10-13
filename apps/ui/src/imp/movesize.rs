@@ -49,6 +49,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, SetWindowsHookExW, ShowWindow, UnhookWindowsHookEx, GA_ROOT, HHOOK,
     KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    PostMessageW, WM_MOUSEHWHEEL, WM_MOUSEWHEEL,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
@@ -201,13 +202,46 @@ fn toggle_overview() {
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code < 0 || !WIN_HELD.with(|h| h.get()) {
+    if code < 0 {
         return CallNextHookEx(None, code, wparam, lparam);
     }
-    // SAFETY: a low-level mouse hook's `lparam` always points to a live
-    // `MSLLHOOKSTRUCT` for the duration of this call.
-    let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
     let msg = wparam.0 as u32;
+
+    // Wheel events are handled before the modifier guard below: a
+    // two-finger touchpad scroll is a gesture in its own right, with no
+    // modifier held.
+    if msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL {
+        // SAFETY: a low-level mouse hook's `lparam` always points to a
+        // live `MSLLHOOKSTRUCT` for the duration of this call.
+        let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+        // This hook runs on the installing thread under a system-imposed
+        // timeout: Windows silently unregisters a hook that takes too
+        // long. So it does the one cheap thing it can — pack and post —
+        // and leaves every decision, and all the physics, to the UI
+        // thread.
+        let wheel = ((info.mouseData >> 16) & 0xFFFF) as u16 as i16;
+        let horizontal = msg == WM_MOUSEHWHEEL;
+        if let Some(target) = super::gestures::gesture_target() {
+            // SAFETY: `target` is a valid, process-lifetime window; a
+            // failed post is harmless (the gesture simply does not start).
+            unsafe {
+                let _ = PostMessageW(
+                    target,
+                    super::WM_APP_GESTURE_SCROLL,
+                    WPARAM(super::gestures::pack_scroll(wheel, horizontal)),
+                    LPARAM(info.time as isize),
+                );
+            }
+        }
+        // Never swallowed: applications must keep scrolling normally.
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
+    if !WIN_HELD.with(|h| h.get()) {
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+    // SAFETY: as above.
+    let info = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
 
     match msg {
         WM_LBUTTONDOWN | WM_RBUTTONDOWN if start_drag(info.pt, msg == WM_RBUTTONDOWN) => {

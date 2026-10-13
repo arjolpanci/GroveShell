@@ -572,6 +572,13 @@ fn thumb_slot_pairs(monitor: &str, thumbs: &[ThumbAnim]) -> Vec<(isize, groveshe
     pairs
 }
 
+/// One snap point per workspace page. Never empty: a monitor always has
+/// at least the workspace it is currently showing, and an empty
+/// snap-point list would make every projection and clamp a no-op.
+pub(crate) fn carousel_snap_points(page_count: usize) -> Vec<f64> {
+    (0..page_count.max(1)).map(|i| i as f64).collect()
+}
+
 /// How many workspace pages this monitor's overview has, and which one
 /// is current — what the strip needs to lay itself out and highlight.
 ///
@@ -785,6 +792,19 @@ fn window_home_rect(source: HWND, origin: (i32, i32)) -> Option<RECT> {
 /// after them), and kicks off the fade timer. No-op if the overview
 /// isn't currently `Closed` (already open or mid-animation).
 pub(crate) fn open_overview(monitor: &str) {
+    open_overview_inner(monitor, None)
+}
+
+/// Builds and shows the overview parked at `progress` instead of easing
+/// it open — what a gesture needs, since the finger owns the value from
+/// the first event. No-op if it is already built.
+pub(crate) fn open_overview_at(monitor: &str, progress: f64) {
+    open_overview_inner(monitor, Some(progress))
+}
+
+/// `animate_from` of `None` eases open; `Some(p)` parks at `p` and lets
+/// the caller drive.
+fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
     let overview_hwnd = STATE.with(|s| {
         s.borrow()
             .as_ref()
@@ -845,13 +865,21 @@ pub(crate) fn open_overview(monitor: &str) {
                 // every preview sits exactly on its real window, so the
                 // first composed frame is a picture of the desktop and
                 // nothing flashes; see `overview_layout::thumb_rect`.
-                ov.adjustment.set_value(0.0);
-                ov.adjustment.ease_to_at(
-                    1.0,
-                    super::design::motion::effective_ms(super::design::motion::BASE_MS),
-                    Easing::OutSine,
-                    Instant::now(),
-                );
+                match park_at {
+                    Some(p) => {
+                        ov.adjustment.set_value(p);
+                        ov.adjustment.set_gesture_in_progress(true);
+                    }
+                    None => {
+                        ov.adjustment.set_value(0.0);
+                        ov.adjustment.ease_to_at(
+                            1.0,
+                            super::design::motion::effective_ms(super::design::motion::BASE_MS),
+                            Easing::OutSine,
+                            Instant::now(),
+                        );
+                    }
+                }
             }
         }
     });

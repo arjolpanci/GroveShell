@@ -142,8 +142,61 @@ pub(crate) fn monitor_by_device_name<'a>(
     monitors.iter().find(|m| m.device_name == device_name)
 }
 
+/// Which connected monitor contains `point`, by device name. Falls back
+/// to the primary when the point is outside every monitor (it can be,
+/// briefly, between a hotplug and the next enumeration).
+pub(crate) fn monitor_containing(monitors: &[MonitorInfo], point: (i32, i32)) -> Option<String> {
+    let (x, y) = point;
+    monitors
+        .iter()
+        .find(|m| x >= m.rect.left && x < m.rect.right && y >= m.rect.top && y < m.rect.bottom)
+        .or_else(|| monitors.iter().find(|m| m.is_primary))
+        .or_else(|| monitors.first())
+        .map(|m| m.device_name.clone())
+}
+
+/// The monitor the pointer is currently on.
+pub(crate) fn monitor_under_cursor() -> Option<String> {
+    let mut pt = windows::Win32::Foundation::POINT::default();
+    // SAFETY: `GetCursorPos` writes a plain out-param.
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt) }.is_err() {
+        return None;
+    }
+    monitor_containing(&monitors_sorted_by_x(), (pt.x, pt.y))
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn monitor_at(left: i32, right: i32, primary: bool, name: &str) -> MonitorInfo {
+        MonitorInfo {
+            device_name: name.to_string(),
+            rect: windows::Win32::Foundation::RECT { left, top: 0, right, bottom: 1080 },
+            work: windows::Win32::Foundation::RECT { left, top: 0, right, bottom: 1080 },
+            dpi: 96,
+            is_primary: primary,
+        }
+    }
+
+    #[test]
+    fn a_point_resolves_to_the_monitor_containing_it() {
+        let monitors = vec![monitor_at(0, 1920, true, "A"), monitor_at(1920, 3840, false, "B")];
+        assert_eq!(monitor_containing(&monitors, (100, 100)).as_deref(), Some("A"));
+        assert_eq!(monitor_containing(&monitors, (2000, 100)).as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn a_point_outside_every_monitor_falls_back_to_the_primary() {
+        let monitors = vec![monitor_at(0, 1920, false, "A"), monitor_at(1920, 3840, true, "B")];
+        assert_eq!(monitor_containing(&monitors, (-5000, 100)).as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn no_monitors_resolves_to_nothing() {
+        assert_eq!(monitor_containing(&[], (0, 0)), None);
+    }
+
     use super::*;
 
     fn fake(device_name: &str, left: i32) -> MonitorInfo {
