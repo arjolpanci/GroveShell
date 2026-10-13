@@ -358,6 +358,22 @@ impl AutoHide {
         off.round() as i32
     }
 
+    /// The dock's vertical offset once the overview is taken into
+    /// account: its own autohide offset, then pushed the rest of the way
+    /// off screen as the overview arrives.
+    ///
+    /// Autohide keeps owning hot-edge and leave behaviour — that is its
+    /// own concern and unchanged. What changes is that its result is no
+    /// longer the *only* input to where the dock sits: the overview's
+    /// dash takes over the bottom of the screen, so the desktop dock
+    /// gets out of the way on the same number that brings the dash in.
+    pub(crate) fn combined_offset(&self, p: f32, height: i32, overview_progress: f32) -> i32 {
+        let own = self.offset(p, height) as f32;
+        let overview = overview_progress.clamp(0.0, 1.0);
+        let off = own + (height as f32 - own) * overview;
+        off.round() as i32
+    }
+
     /// Forces the reveal phase directly — used at dock creation to set the
     /// initial resting state (Shown for always, Hidden for autohide) and by
     /// tests.
@@ -919,7 +935,11 @@ impl DockWindow {
             }
         }
         let slide_p = self.autohide.tick(now);
-        let offset = self.autohide.offset(slide_p, self.geo.window_h);
+        // The desktop dock gets out of the way on the same number that
+        // brings the overview's dash in, so the two cross over instead of
+        // one popping as the other arrives.
+        let overview_p = self.overview_progress();
+        let offset = self.autohide.combined_offset(slide_p, self.geo.window_h, overview_p);
 
         // Ease the wave toward its target. When hidden/hiding, force it flat.
         let shown = matches!(self.autohide.phase, RevealPhase::Shown | RevealPhase::Revealing);
@@ -953,9 +973,36 @@ impl DockWindow {
         // pointer is currently over the dock (so the crest follows it
         // horizontally even when the overall progress is steady at 1.0).
         let wave_changed = (self.wave - prev_wave).abs() > f32::EPSILON;
-        if wave_changed || moved || self.autohide.is_animating() || self.cursor_x.is_some() {
+        // Mid-overview-transition counts as animating: the dock is still
+        // sliding even when its own autohide phase is at rest.
+        let overview_moving = overview_p > f32::EPSILON && overview_p < 1.0 - f32::EPSILON;
+        if wave_changed || moved || overview_moving || self.autohide.is_animating() || self.cursor_x.is_some() {
             self.repaint();
         }
+    }
+
+
+    /// How open the Activities overview is on the monitor this dock sits
+    /// on, 0.0 when it is closed.
+    ///
+    /// Matched by the dock's own bounds rather than stored at creation:
+    /// the dock is rebuilt on hotplug and config changes, and a stale
+    /// device name would silently bind it to a monitor that no longer
+    /// exists. Reads and releases `STATE` before returning, so the
+    /// caller may hold its own borrow (see `overview::progress`).
+    fn overview_progress(&self) -> f32 {
+        let monitors = super::monitors::monitors_sorted_by_x();
+        let device = monitors
+            .iter()
+            .find(|m| {
+                m.rect.left <= self.work.left
+                    && m.rect.right >= self.work.right
+                    && m.rect.top <= self.work.top
+                    && m.rect.bottom >= self.work.bottom
+            })
+            .or_else(|| monitors.iter().find(|m| m.is_primary))
+            .map(|m| m.device_name.clone());
+        device.map(|d| super::overview::progress(&d) as f32).unwrap_or(0.0)
     }
 
     /// The panel's top edge in window-local coordinates — the boundary
@@ -1052,6 +1099,43 @@ fn to_d2d(r: RECT) -> D2D_RECT_F {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shown_dock_with_no_overview_sits_at_its_resting_place() {
+        let mut a = AutoHide::new();
+        a.force(RevealPhase::Shown);
+        assert_eq!(a.combined_offset(1.0, 80, 0.0), 0);
+    }
+
+    #[test]
+    fn the_overview_pushes_a_shown_dock_fully_off_screen() {
+        let mut a = AutoHide::new();
+        a.force(RevealPhase::Shown);
+        assert_eq!(a.combined_offset(1.0, 80, 1.0), 80);
+    }
+
+    #[test]
+    fn a_half_open_overview_pushes_the_dock_half_way_down() {
+        let mut a = AutoHide::new();
+        a.force(RevealPhase::Shown);
+        assert_eq!(a.combined_offset(1.0, 80, 0.5), 40);
+    }
+
+    #[test]
+    fn an_already_hidden_dock_is_not_pushed_past_the_edge() {
+        let mut a = AutoHide::new();
+        a.force(RevealPhase::Hidden);
+        assert_eq!(a.combined_offset(1.0, 80, 1.0), 80, "never beyond fully hidden");
+        assert_eq!(a.combined_offset(1.0, 80, 0.0), 80);
+    }
+
+    #[test]
+    fn overview_progress_is_clamped() {
+        let mut a = AutoHide::new();
+        a.force(RevealPhase::Shown);
+        assert_eq!(a.combined_offset(1.0, 80, -1.0), 0);
+        assert_eq!(a.combined_offset(1.0, 80, 4.0), 80);
+    }
 
     #[test]
     fn hot_edge_from_hidden_starts_revealing_or_shows() {

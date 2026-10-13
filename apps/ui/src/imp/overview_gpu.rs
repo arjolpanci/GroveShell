@@ -192,13 +192,27 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
     unsafe {
         let _ = root.visual().AddVisual(chrome.visual(), true, None);
     }
+    // The dash gets its own full-window surface so it can slide on the
+    // adjustment as a pure translation, without repainting anything.
+    let dash = gpu::create_child_surface(width, height);
+    if let Some(dash) = dash.as_ref() {
+        // SAFETY: same device, same lifetime as `root`.
+        unsafe {
+            let _ = root.visual().AddVisual(dash.visual(), true, None);
+        }
+    }
+    // Re-raise the chrome so it stays above the dash.
+    // SAFETY: as above.
+    unsafe {
+        let _ = root.visual().AddVisual(chrome.visual(), true, None);
+    }
     Some(OverviewGpuState {
         root,
         cards: Vec::new(),
         thumbs: Vec::new(),
         chrome,
-        dash: None,
-        dash_natural: RectF::default(),
+        dash,
+        dash_natural: RectF::new(0.0, 0.0, width as f64, height as f64),
         strip: None,
         strip_natural: RectF::default(),
     })
@@ -268,9 +282,12 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     // of `root`'s children, so whichever visual is added last ends up on
     // top; this keeps the dock/search/drag-ghost chrome above every card,
     // regardless of card add/remove order this call.
-    // SAFETY: `state.chrome.visual()` was created alongside `state.root`
-    // in `create` and is alive for as long as `state` is.
+    // SAFETY: both were created alongside `state.root` in `create` and
+    // are alive for as long as `state` is.
     unsafe {
+        if let Some(dash) = state.dash.as_ref() {
+            let _ = state.root.visual().AddVisual(dash.visual(), true, None);
+        }
         let _ = state.root.visual().AddVisual(state.chrome.visual(), true, None);
     }
 }
@@ -339,12 +356,15 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim],
             let _ = state.root.visual().AddVisual(visual.surface.visual(), true, None);
         }
     }
-    // Each `AddVisual(_, true, None)` inserts at the top, so the chrome
-    // (search panel, drag ghost) has to be re-raised above the previews
-    // just added — same reasoning as `rebuild_cards`.
-    // SAFETY: `state.chrome` was created alongside `state.root` and is
-    // alive for as long as `state` is.
+    // Each `AddVisual(_, true, None)` inserts at the top, so the dash and
+    // then the chrome have to be re-raised above the previews just added
+    // — same reasoning as `rebuild_cards`.
+    // SAFETY: both were created alongside `state.root` and are alive for
+    // as long as `state` is.
     unsafe {
+        if let Some(dash) = state.dash.as_ref() {
+            let _ = state.root.visual().AddVisual(dash.visual(), true, None);
+        }
         let _ = state.root.visual().AddVisual(state.chrome.visual(), true, None);
     }
     state.thumbs = rebuilt;
@@ -389,6 +409,91 @@ pub(crate) fn paint_thumb(thumb: &ThumbVisual, title: &str, hover_intensity: f64
                 hover_intensity as f32,
                 2.0,
             );
+        }
+    });
+}
+
+
+/// Paints the dash onto its own full-window surface.
+///
+/// Full-window rather than a tight band so the drawing keeps the window
+/// coordinates `dock_layout` already returns — the slide is then a pure
+/// translation of the whole surface, with no coordinate rewriting and no
+/// risk of clipping a magnified icon against a tight band's edge.
+pub(crate) fn paint_dash(gpu: &OverviewGpuState, monitor: &str, ov: &super::overview::OverviewInstance) {
+    let Some(surface) = gpu.dash.as_ref() else { return };
+
+    let dpi = reference_dpi();
+    let dock_radius = scaled(super::dock::DOCK_CORNER_RADIUS, dpi) as f32;
+    let thumb_radius = scaled(8, dpi) as f32;
+    gpu::redraw(surface, |ctx: &ID2D1DeviceContext| {
+        gpu::clear_transparent(ctx);
+        let (dock_bar_rect, dock_slots, dock_divider) = super::dock::dock_layout(
+            monitor,
+            super::dock::pinned_count(&ov.dock_apps),
+            ov.dock_apps.len(),
+        );
+        if !ov.dock_apps.is_empty() {
+            let bar = rect_to_d2d(dock_bar_rect, 0, 0);
+            gpu::fill_rounded_rect(ctx, bar, dock_radius, super::design::color::surface_raised());
+
+            // GNOME/macOS-dash-style divider between the pinned section
+            // (left) and the running-but-unpinned section (right), if
+            // there's one to draw.
+            if let Some(divider) = dock_divider {
+                gpu::fill_rounded_rect(ctx, rect_to_d2d(divider, 0, 0), 0.0, super::design::color::stroke());
+            }
+
+            let running_dot_radius = super::dock::dock_running_dot_radius();
+            let running_dot_gap = scaled(super::dock::DOCK_RUNNING_DOT_GAP, dpi);
+            // Wave magnification: each icon grows with its nearness to the
+            // pointer, bottom-anchored so it rises out of the bar. The base
+            // slots are still what got hit-tested (see `on_overview_hover`);
+            // these are the drawn rects only.
+            let draw_slots = super::dock::wave_slots(&dock_slots, ov.dock_cursor_x, 1.0);
+            for (i, app) in ov.dock_apps.iter().enumerate() {
+                let (Some(slot), Some(base)) = (draw_slots.get(i), dock_slots.get(i)) else {
+                    continue;
+                };
+                if let Some(icon) = app.icon {
+                    let size = (slot.right - slot.left).max(1);
+                    if let Some(icon_bitmap) = icon_to_hbitmap(icon, size) {
+                        if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, icon_bitmap) {
+                            gpu::draw_rounded_bitmap(ctx, rect_to_d2d(*slot, 0, 0), 0.0, &bitmap);
+                        }
+                        // SAFETY: created locally above, owned exclusively here.
+                        unsafe {
+                            let _ = DeleteObject(icon_bitmap);
+                        }
+                    }
+                }
+                // One small dot per open window (capped — see
+                // `running_dot_rects`), GNOME/macOS-dash-style — anchored
+                // to the *base* slot so the row of dots stays put while the
+                // icons ride the wave above it.
+                for dot in super::dock::running_dot_rects(*base, app.windows.len(), running_dot_radius, running_dot_gap) {
+                    gpu::fill_rounded_rect(ctx, rect_to_d2d(dot, 0, 0), running_dot_radius as f32, super::design::color::text());
+                }
+            }
+            // The dock's own hover glow — whichever slot the pointer
+            // currently sits on, if any, easing in the same way as the
+            // card/thumbnail glows. Drawn on the magnified rect so it hugs
+            // the icon as it grows.
+            if let Some((index, started)) = ov.dock_hover {
+                if let Some(slot) = draw_slots.get(index) {
+                    let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)) as f32;
+                    if intensity > 0.001 {
+                        gpu::stroke_rounded_rect(
+                            ctx,
+                            rect_to_d2d(*slot, 0, 0),
+                            thumb_radius,
+                            super::design::color::accent(),
+                            intensity,
+                            2.0,
+                        );
+                    }
+                }
+            }
         }
     });
 }
@@ -477,11 +582,18 @@ pub(crate) fn update_transforms(
     // Dash and strip slide on the same number. Both are `None` until
     // their own tasks create them.
     if let Some(dash) = &gpu_state.dash {
+        // The surface was painted with the dash at its window-picker
+        // position, so the slide is the offset from there to wherever the
+        // adjustment currently puts it — a pure translation.
+        let picker = super::overview_layout::layout_for_state(
+            super::overview_layout::ControlsState::WindowPicker,
+            &input,
+        );
+        let dy = layout.dash.top - picker.dash.top;
+        let target = offset_rect(gpu_state.dash_natural, 0.0, dy);
         // SAFETY: as above.
         unsafe {
-            let _ = dash
-                .visual()
-                .SetTransform2(&surface_transform(gpu_state.dash_natural, layout.dash));
+            let _ = dash.visual().SetTransform2(&surface_transform(gpu_state.dash_natural, target));
         }
     }
     if let Some(strip) = &gpu_state.strip {
@@ -695,74 +807,12 @@ pub(crate) fn paint_backdrop(gpu: &OverviewGpuState) {
 pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::overview::OverviewInstance) {
     paint_backdrop(gpu);
     let dpi = reference_dpi();
-    let dock_radius = scaled(super::dock::DOCK_CORNER_RADIUS, dpi) as f32;
+    // Shared corner radius for the search panel and the drag ghost.
     let thumb_radius = scaled(8, dpi) as f32;
 
     gpu::redraw(&gpu.chrome, |ctx: &ID2D1DeviceContext| {
-        let (dock_bar_rect, dock_slots, dock_divider) =
-            super::dock::dock_layout(monitor, super::dock::pinned_count(&ov.dock_apps), ov.dock_apps.len());
-        if !ov.dock_apps.is_empty() {
-            let bar = rect_to_d2d(dock_bar_rect, 0, 0);
-            gpu::fill_rounded_rect(ctx, bar, dock_radius, super::design::color::surface_raised());
-
-            // GNOME/macOS-dash-style divider between the pinned section
-            // (left) and the running-but-unpinned section (right), if
-            // there's one to draw.
-            if let Some(divider) = dock_divider {
-                gpu::fill_rounded_rect(ctx, rect_to_d2d(divider, 0, 0), 0.0, super::design::color::stroke());
-            }
-
-            let running_dot_radius = super::dock::dock_running_dot_radius();
-            let running_dot_gap = scaled(super::dock::DOCK_RUNNING_DOT_GAP, dpi);
-            // Wave magnification: each icon grows with its nearness to the
-            // pointer, bottom-anchored so it rises out of the bar. The base
-            // slots are still what got hit-tested (see `on_overview_hover`);
-            // these are the drawn rects only.
-            let draw_slots = super::dock::wave_slots(&dock_slots, ov.dock_cursor_x, 1.0);
-            for (i, app) in ov.dock_apps.iter().enumerate() {
-                let (Some(slot), Some(base)) = (draw_slots.get(i), dock_slots.get(i)) else {
-                    continue;
-                };
-                if let Some(icon) = app.icon {
-                    let size = (slot.right - slot.left).max(1);
-                    if let Some(icon_bitmap) = icon_to_hbitmap(icon, size) {
-                        if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, icon_bitmap) {
-                            gpu::draw_rounded_bitmap(ctx, rect_to_d2d(*slot, 0, 0), 0.0, &bitmap);
-                        }
-                        // SAFETY: created locally above, owned exclusively here.
-                        unsafe {
-                            let _ = DeleteObject(icon_bitmap);
-                        }
-                    }
-                }
-                // One small dot per open window (capped — see
-                // `running_dot_rects`), GNOME/macOS-dash-style — anchored
-                // to the *base* slot so the row of dots stays put while the
-                // icons ride the wave above it.
-                for dot in super::dock::running_dot_rects(*base, app.windows.len(), running_dot_radius, running_dot_gap) {
-                    gpu::fill_rounded_rect(ctx, rect_to_d2d(dot, 0, 0), running_dot_radius as f32, super::design::color::text());
-                }
-            }
-            // The dock's own hover glow — whichever slot the pointer
-            // currently sits on, if any, easing in the same way as the
-            // card/thumbnail glows. Drawn on the magnified rect so it hugs
-            // the icon as it grows.
-            if let Some((index, started)) = ov.dock_hover {
-                if let Some(slot) = draw_slots.get(index) {
-                    let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)) as f32;
-                    if intensity > 0.001 {
-                        gpu::stroke_rounded_rect(
-                            ctx,
-                            rect_to_d2d(*slot, 0, 0),
-                            thumb_radius,
-                            super::design::color::accent(),
-                            intensity,
-                            2.0,
-                        );
-                    }
-                }
-            }
-        }
+        // The dash lives on its own visual now (see `paint_dash`) so it
+        // can slide on the adjustment without repainting this surface.
 
         let results = if ov.search_query.is_empty() {
             Vec::new()

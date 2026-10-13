@@ -70,8 +70,6 @@ const CAROUSEL_DRAG_PAGE_DISTANCE_PX: f64 = 480.0;
 /// in at the edges.
 const CARD_WIDTH_FRACTION: f64 = 0.62;
 
-/// Gap below a card — room for the future dock (not implemented yet).
-pub(crate) const CARD_MARGIN_BOTTOM: i32 = 120;
 
 /// Inset from a card's edges to where its window grid starts.
 const CARD_CONTENT_PADDING: i32 = 28;
@@ -915,6 +913,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
         super::overview_gpu::paint_root(gpu, monitor, ov);
+        super::overview_gpu::paint_dash(gpu, monitor, ov);
         Some(())
     });
 
@@ -1141,6 +1140,7 @@ pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
                         let ov = state.as_ref()?.overviews.get(monitor)?;
                         let gpu = ov.gpu.as_ref()?;
                         super::overview_gpu::paint_root(gpu, monitor, ov);
+                        super::overview_gpu::paint_dash(gpu, monitor, ov);
                         Some(())
                     });
                     if gpu_repainted.is_none() {
@@ -1501,6 +1501,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 // newly-hovered card (at most two, usually the same one)
                 // are repainted, not every card visual.
                 super::overview_gpu::paint_root(gpu, monitor, ov);
+                super::overview_gpu::paint_dash(gpu, monitor, ov);
                 if let Some(drag) = ov.window_drag.as_ref() {
                     if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
                         if let OverviewMode::Live { .. } = &ov.mode {
@@ -1517,6 +1518,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 // drag, so `update_transforms` above is the only other
                 // thing this tick needs.
                 super::overview_gpu::paint_root(gpu, monitor, ov);
+                super::overview_gpu::paint_dash(gpu, monitor, ov);
             }
             MoveKind::Carousel => {}
         }
@@ -1609,6 +1611,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
         super::overview_gpu::update_transforms(gpu, monitor, ov.carousel.value(), 1.0, thumbs);
         // Dock hover is root content — repaint the chrome surface.
         super::overview_gpu::paint_root(gpu, monitor, ov);
+        super::overview_gpu::paint_dash(gpu, monitor, ov);
         // Thumbnail hover is card content (see `HoverTarget`) — only
         // the previously- and newly-hovered card (at most two, usually
         // the same one) are repainted.
@@ -1818,6 +1821,7 @@ fn on_window_drop(monitor: &str, drag: WindowDrag, x: i32, y: i32) {
                 let ov = state.as_ref()?.overviews.get(monitor)?;
                 let gpu = ov.gpu.as_ref()?;
                 super::overview_gpu::paint_root(gpu, monitor, ov);
+                super::overview_gpu::paint_dash(gpu, monitor, ov);
                 Some(())
             });
             if gpu_repainted.is_none() {
@@ -2143,6 +2147,7 @@ pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
                     let ov = state.as_ref()?.overviews.get(monitor)?;
                     let gpu = ov.gpu.as_ref()?;
                     super::overview_gpu::paint_root(gpu, monitor, ov);
+                    super::overview_gpu::paint_dash(gpu, monitor, ov);
                     Some(())
                 });
                 if gpu_repainted.is_none() {
@@ -2157,6 +2162,7 @@ pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
                     let ov = state.as_ref()?.overviews.get(monitor)?;
                     let gpu = ov.gpu.as_ref()?;
                     super::overview_gpu::paint_root(gpu, monitor, ov);
+                    super::overview_gpu::paint_dash(gpu, monitor, ov);
                     Some(())
                 });
                 if gpu_repainted.is_none() {
@@ -3384,6 +3390,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         // never for plain carousel motion.
         if pop_active || dock_hover_easing {
             super::overview_gpu::paint_root(gpu, monitor, ov);
+            super::overview_gpu::paint_dash(gpu, monitor, ov);
         }
         if card_hover_easing || thumb_hover_easing {
             if let OverviewMode::Live { thumbs, .. } = &ov.mode {

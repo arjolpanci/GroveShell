@@ -152,8 +152,19 @@ pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize
     let bar_h = icon_size + pad_y * 2;
 
     let bar_left = anchor_x(card_rect.left, card_rect.right, bar_w, &alignment);
-    let bar_bottom = card_rect.bottom + scaled(super::overview::CARD_MARGIN_BOTTOM, dpi)
-        - scaled(DOCK_MARGIN_BOTTOM, dpi);
+    // The dash sits where `overview_layout` puts it, not "below the card
+    // plus a margin". The card is sized by that same layout, which
+    // already reserves the dash's band underneath it — deriving the dash
+    // from the card's bottom as well pushed it off the screen edge.
+    let bar_bottom = super::overview::layout_input(monitor)
+        .map(|input| {
+            let l = super::overview_layout::layout_for_state(
+                super::overview_layout::ControlsState::WindowPicker,
+                &input,
+            );
+            l.dash.bottom.round() as i32 - scaled(DOCK_MARGIN_BOTTOM, dpi)
+        })
+        .unwrap_or(card_rect.bottom);
     let bar_top = bar_bottom - bar_h;
 
     let bar_rect = RECT {
