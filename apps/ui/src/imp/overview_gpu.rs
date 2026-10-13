@@ -31,6 +31,28 @@ use super::overview_layout::{layout_for_progress, thumb_alpha, thumb_rect};
 use super::state::{reference_dpi, scaled};
 use super::util::{ease_out, progress_dur};
 
+/// Takes the entry matching `key` out of `pool`, but **only** if it also
+/// satisfies `still_usable`.
+///
+/// The obvious spelling — `position(..).map(|i| pool.remove(i)).filter(..)`
+/// — removes the entry *before* the filter rejects it, so a stale-sized
+/// visual is dropped on the floor instead of being left for the caller to
+/// `RemoveVisual`. `GpuSurface` has no `Drop`, and the root still holds
+/// its own reference from the earlier `AddVisual`, so that orphan stays
+/// in the composition tree compositing frozen content for the rest of
+/// the session while nothing ever transforms it again.
+fn take_reusable<T>(
+    pool: &mut Vec<T>,
+    key: impl Fn(&T) -> bool,
+    still_usable: impl Fn(&T) -> bool,
+) -> Option<T> {
+    let i = pool.iter().position(&key)?;
+    if !still_usable(&pool[i]) {
+        return None;
+    }
+    Some(pool.remove(i))
+}
+
 /// The transform that maps a surface drawn at `natural` onto `target`.
 ///
 /// Every visual in this module is painted once at its natural size and
@@ -238,11 +260,11 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     let mut rebuilt = Vec::with_capacity(cards.len());
     for card in cards {
         let (w, h) = (card.rect.right - card.rect.left, card.rect.bottom - card.rect.top);
-        let reused = old_cards
-            .iter()
-            .position(|cv| cv.page == card.page)
-            .map(|i| old_cards.remove(i))
-            .filter(|cv| cv.surface.width() == w && cv.surface.height() == h);
+        let reused = take_reusable(
+            &mut old_cards,
+            |cv| cv.page == card.page,
+            |cv| cv.surface.width() == w && cv.surface.height() == h,
+        );
         let card_visual = match reused {
             Some(cv) => cv,
             None => match gpu::create_child_surface(w.max(1), h.max(1)) {
@@ -311,28 +333,33 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
 /// sits on screen — because that is the larger end of the flight, so the
 /// snapshot is scaled down rather than up. A preview with no `home`
 /// (parked or minimized) has no such rect and takes its slot size.
-pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim], slots: &[(isize, RectF)]) {
+pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim]) {
     let mut old = std::mem::take(&mut state.thumbs);
     let mut rebuilt = Vec::with_capacity(thumbs.len());
 
     for th in thumbs {
         let hwnd = th.hwnd.0 as isize;
-        let slot = slots.iter().find(|(h, _)| *h == hwnd).map(|(_, r)| *r);
-        let natural = match (th.home, slot) {
-            (Some(home), _) => to_rect_f(home),
-            (None, Some(slot)) => slot,
-            (None, None) => continue,
+        // `th.rect` is the preview's own grid slot — the same rect
+        // hit-testing, the GDI painter and `update_transforms` all use.
+        // A second geometry (`grid_slots`) used to size this fallback,
+        // and because that one reserves no icon band and does not
+        // aspect-fit, a parked preview was painted at cell aspect and
+        // then non-uniformly scaled onto a window-aspect slot — visibly
+        // stretched.
+        let natural = match th.home {
+            Some(home) => to_rect_f(home),
+            None => to_rect_f(th.rect),
         };
         let (w, h) = (natural.width().round() as i32, natural.height().round() as i32);
         if w <= 0 || h <= 0 {
             continue;
         }
 
-        let reused = old
-            .iter()
-            .position(|tv| tv.hwnd == hwnd && tv.page == th.page)
-            .map(|i| old.remove(i))
-            .filter(|tv| tv.surface.width() == w && tv.surface.height() == h);
+        let reused = take_reusable(
+            &mut old,
+            |tv| tv.hwnd == hwnd && tv.page == th.page,
+            |tv| tv.surface.width() == w && tv.surface.height() == h,
+        );
 
         let visual = match reused {
             Some(tv) => tv,
@@ -869,7 +896,7 @@ pub(crate) fn paint_backdrop(gpu: &OverviewGpuState) {
             // workspace cards and the "Type to search" chrome readable
             // over any wallpaper, and gives the overview its focused,
             // recessed feel.
-            gpu::fill_rect_alpha(ctx, full, 0x0000_0000, 0.42);
+            gpu::fill_rect_alpha(ctx, full, 0x0000_0000, super::overview_layout::BACKDROP_DIM_MAX);
         } else {
             // Blur off: a clean, solid dark backdrop.
             gpu::fill_rect(ctx, full, 0x0014_1418);
@@ -992,6 +1019,40 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             }
         }
     });
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    #[test]
+    fn a_matching_entry_is_taken_out_of_the_pool() {
+        let mut pool = vec![(1usize, 100, 50), (2, 200, 60)];
+        let got = take_reusable(&mut pool, |e| e.0 == 2, |e| (e.1, e.2) == (200, 60));
+        assert_eq!(got, Some((2, 200, 60)));
+        assert_eq!(pool, vec![(1, 100, 50)], "the taken entry is gone");
+    }
+
+    /// The bug this exists to prevent: an entry whose key matches but
+    /// whose size does not must stay in the pool, so the caller still
+    /// detaches it. Removing it first and then rejecting it dropped it
+    /// on the floor — the composition visual was never detached, so it
+    /// kept compositing frozen content for the rest of the session.
+    #[test]
+    fn a_key_match_with_a_stale_size_is_left_in_the_pool_to_be_detached() {
+        let mut pool = vec![(1usize, 100, 50)];
+        let got = take_reusable(&mut pool, |e| e.0 == 1, |e| (e.1, e.2) == (999, 999));
+        assert_eq!(got, None);
+        assert_eq!(pool, vec![(1, 100, 50)], "must remain for the caller to detach");
+    }
+
+    #[test]
+    fn no_key_match_leaves_the_pool_untouched() {
+        let mut pool = vec![(1usize, 100, 50)];
+        let got = take_reusable(&mut pool, |e| e.0 == 7, |_| true);
+        assert_eq!(got, None);
+        assert_eq!(pool, vec![(1, 100, 50)]);
+    }
 }
 
 #[cfg(test)]

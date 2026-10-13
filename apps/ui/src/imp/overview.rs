@@ -80,9 +80,16 @@ const THUMB_ICON_SIZE: i32 = 28;
 /// How much a card (and everything on it) shrinks as it moves away
 /// from the carousel focus, as a fraction of full size — the focused
 /// workspace reads slightly larger than its neighbors, GNOME-style.
-/// Driven continuously by `carousel_offset`, so the size change eases
-/// in and out with the drag/slide instead of snapping.
-const CARD_UNFOCUS_SHRINK: f64 = 0.10;
+/// Driven continuously by the carousel's value, so the size change
+/// eases in and out with the drag/slide instead of snapping.
+///
+/// Derived from `WORKSPACE_INACTIVE_SCALE` rather than being its own
+/// number: this one drives hit-testing (`displayed_rect`) and the GDI
+/// painter, that one drives the GPU transform. When they disagreed
+/// (0.10 against GNOME's 0.06) a neighbour card was drawn 6% shrunk and
+/// clicked as 10% shrunk, so a click near a visible preview's edge
+/// missed it and fell through to the empty-page handler.
+const CARD_UNFOCUS_SHRINK: f64 = 1.0 - super::overview_layout::WORKSPACE_INACTIVE_SCALE;
 /// Corner radius of a workspace card (96-DPI, see [`scaled`]).
 const CARD_CORNER_RADIUS: i32 = 20;
 /// Corner radius of a window preview within a card (96-DPI).
@@ -559,28 +566,6 @@ pub(crate) fn zoom_rect(r: RECT, anchor_x: f64, anchor_y: f64, s: f64) -> RECT {
     }
 }
 
-/// The `(hwnd, slot)` pairs `rebuild_thumbs` needs to size a preview
-/// that has no real on-screen rect to fly from.
-fn thumb_slot_pairs(monitor: &str, thumbs: &[ThumbAnim]) -> Vec<(isize, groveshell_motion::RectF)> {
-    let Some(input) = layout_input(monitor) else {
-        return Vec::new();
-    };
-    let layout = super::overview_layout::layout_for_state(
-        super::overview_layout::ControlsState::WindowPicker,
-        &input,
-    );
-    let mut pairs = Vec::new();
-    let pages: std::collections::BTreeSet<usize> = thumbs.iter().map(|t| t.page).collect();
-    for page in pages {
-        let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == page).collect();
-        let slots = super::overview_layout::grid_slots(layout.card, page_thumbs.len(), input.dpi);
-        for (t, slot) in page_thumbs.iter().zip(slots) {
-            pairs.push((t.hwnd.0 as isize, slot));
-        }
-    }
-    pairs
-}
-
 /// One snap point per workspace page. Never empty: a monitor always has
 /// at least the workspace it is currently showing, and an empty
 /// snap-point list would make every projection and clamp a no-op.
@@ -836,7 +821,6 @@ fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
     // Paint each card's GPU surface (frame/wallpaper) and build one
     // visual per preview now, while `cards`/`thumbs` are still
     // borrowable locals — they're moved into `OverviewMode::Live` below.
-    let slot_pairs = thumb_slot_pairs(monitor, &thumbs);
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
             if let Some(ov) = state.overviews.get_mut(monitor) {
@@ -847,7 +831,7 @@ fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
                             super::overview_gpu::paint_card(card_visual, card.rect, monitor, None);
                         }
                     }
-                    super::overview_gpu::rebuild_thumbs(gpu, &thumbs, &slot_pairs);
+                    super::overview_gpu::rebuild_thumbs(gpu, &thumbs);
                 }
             }
         }
@@ -939,7 +923,6 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
     // Paint each card's GPU surface (frame/wallpaper) and rebuild the
     // preview visuals now, while `cards`/`thumbs` are still borrowable
     // locals — they're moved into `OverviewMode::Live` below.
-    let slot_pairs = thumb_slot_pairs(monitor, &thumbs);
     let gpu_updated = STATE.with(|s| {
         let mut state = s.borrow_mut();
         let ov = state.as_mut()?.overviews.get_mut(monitor)?;
@@ -951,7 +934,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
                 super::overview_gpu::paint_card(card_visual, card.rect, monitor, None);
             }
         }
-        super::overview_gpu::rebuild_thumbs(gpu, &thumbs, &slot_pairs);
+        super::overview_gpu::rebuild_thumbs(gpu, &thumbs);
         // Newly created/repositioned card visuals sit at their default
         // identity transform (top-left of the window) until something
         // calls `update_transforms` — this function can run while the
@@ -1010,6 +993,11 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
 /// smoothly from its current alpha — no-op only if already `Closed` or
 /// already `Closing`).
 pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
+    // Before the borrow below (`interrupt` takes its own): a live scroll
+    // gesture must be dropped, or its idle timer fires ~50ms from now
+    // and eases the adjustment back to wherever the tracker had reached,
+    // re-opening the overview the user just dismissed.
+    super::gestures::interrupt(monitor);
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
@@ -1059,6 +1047,11 @@ pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
         // Any in-progress drag/slide/search is moot once we're easing
         // back out.
         ov.carousel_drag = None;
+        // The scroll gesture is moot too, and leaving it live is worse
+        // than untidy: its idle timer would fire ~50ms later and ease
+        // the adjustment back to wherever the tracker had got to,
+        // re-opening the overview the user just dismissed.
+        ov.adjustment.set_gesture_in_progress(false);
         ov.carousel.clear_transition();
         ov.carousel_close_after = None;
         ov.window_drag = None;
@@ -3674,6 +3667,34 @@ pub(crate) fn on_animation_tick(monitor: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clicks are hit-tested against `displayed_rect`, previews are
+    /// drawn by `update_transforms`. If those two disagree about how
+    /// much a neighbouring card shrinks, a click near a visible
+    /// neighbour preview's edge misses it and falls through to the
+    /// empty-page handler, switching page instead of focusing a window.
+    #[test]
+    fn hit_testing_and_rendering_shrink_a_neighbour_card_identically() {
+        let card = RECT { left: 0, top: 0, right: 1000, bottom: 500 };
+        // One full page away: fully unfocused.
+        let displayed = displayed_rect(card, 1, 0.0, 1000, card);
+        let drawn_scale = super::super::overview_layout::WORKSPACE_INACTIVE_SCALE;
+        let hit_scale = (displayed.right - displayed.left) as f64 / 1000.0;
+        assert!(
+            (hit_scale - drawn_scale).abs() < 0.001,
+            "hit-test scale {hit_scale} must match the drawn scale {drawn_scale}"
+        );
+    }
+
+    /// Review Focus 1, against the grid that is actually used. The
+    /// coverage used to sit on `overview_layout::grid_slots`, a second
+    /// grid implementation that nothing rendered from; that duplicate is
+    /// gone, so the assertion moves onto `layout_grid`.
+    #[test]
+    fn an_empty_workspace_grids_no_previews_without_dividing_by_zero() {
+        let card = RECT { left: 0, top: 0, right: 1000, bottom: 600 };
+        assert!(layout_grid(card, Vec::new()).is_empty());
+    }
 
     #[test]
     fn snap_points_are_one_per_page_in_ascending_order() {

@@ -197,8 +197,6 @@ mod tests {
         assert_eq!(monitor_containing(&[], (0, 0)), None);
     }
 
-    use super::*;
-
     fn fake(device_name: &str, left: i32) -> MonitorInfo {
         MonitorInfo {
             rect: RECT { left, top: 0, right: left + 1920, bottom: 1080 },

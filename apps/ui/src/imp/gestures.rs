@@ -85,6 +85,66 @@ pub(crate) fn unpack_scroll(packed: usize) -> (i16, bool) {
     ((packed & 0xFFFF) as u16 as i16, (packed >> 16) & 1 == 1)
 }
 
+/// Whether a scroll event should be allowed to start or continue a
+/// shell gesture, given whether this monitor's overview is already up
+/// and the root window class **under the pointer**.
+///
+/// The low-level hook sees **every** wheel event in the system, so
+/// without this gate scrolling a web page pulls Activities open and
+/// steals focus, and a horizontal scroll through a wide spreadsheet
+/// switches workspace with nothing on screen to explain it.
+///
+/// Keyed on the pointer rather than on focus, deliberately. "Scrolling
+/// on the desktop" means the pointer is over the desktop, whatever holds
+/// focus — and scrolling over an application is exactly the case where
+/// the scroll belongs to that application. A focus-keyed gate read the
+/// same situation backwards often enough to make the gesture unreachable
+/// in ordinary use, because the desktop rarely holds focus.
+///
+/// Once the overview is live it owns the screen and takes the scroll
+/// regardless, which is what lets a scroll reverse an open.
+pub(crate) fn gesture_allowed(overview_live: bool, pointer_class: &str) -> bool {
+    if overview_live {
+        return true;
+    }
+    matches!(
+        pointer_class,
+        // The desktop: `Progman` normally, `WorkerW` when a wallpaper
+        // host has been slid underneath it.
+        "Progman" | "WorkerW"
+    ) || pointer_class.starts_with("GroveShell")
+}
+
+/// The class of the **root** window under the pointer, for
+/// [`gesture_allowed`].
+///
+/// `GA_ROOT` matters: the desktop's icon list is a `SysListView32`
+/// inside a `SHELLDLL_DefView` inside `Progman`, and hit-testing returns
+/// the deepest child. Without walking to the root, a pointer over the
+/// desktop reads as a list view and the gesture is refused.
+fn pointer_class() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetAncestor, GetClassNameW, GetCursorPos, WindowFromPoint, GA_ROOT,
+    };
+    // SAFETY: plain queries; an empty name is returned rather than
+    // misbehaving if the pointer is over nothing.
+    unsafe {
+        let mut pt = windows::Win32::Foundation::POINT::default();
+        if GetCursorPos(&mut pt).is_err() {
+            return String::new();
+        }
+        let hwnd = WindowFromPoint(pt);
+        if hwnd.0.is_null() {
+            return String::new();
+        }
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let target = if root.0.is_null() { hwnd } else { root };
+        let mut buf = [0u16; 256];
+        let n = GetClassNameW(target, &mut buf);
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+}
+
 /// Handles one scroll event on the UI thread.
 ///
 /// Everything here — deciding the target, arming the tracker, driving
@@ -111,6 +171,12 @@ pub(crate) fn on_scroll(wheel_delta: i16, horizontal: bool, time_ms: u64, monito
     }) else {
         return;
     };
+
+    // C1/C3: the hook sees every wheel event in the system. Nothing may
+    // start from a scroll aimed at an ordinary application.
+    if !gesture_allowed(open, &pointer_class()) {
+        return;
+    }
 
     let (pages, _current) = super::overview::strip_pages(monitor);
     // Vertical drives the overview transition, horizontal the carousel —
@@ -139,6 +205,24 @@ pub(crate) fn on_scroll(wheel_delta: i16, horizontal: bool, time_ms: u64, monito
     // swallowed a frame.
     if !open && target == Target::Overview {
         super::overview::open_overview_at(monitor, 0.0);
+    }
+
+    // A live gesture on a different monitor or axis is *ended*, never
+    // silently replaced: abandoning it strands `gesture_in_progress` on
+    // the overview's adjustment, and nothing else ever clears it — the
+    // overview can then neither open nor close, and sits as a
+    // full-screen topmost window swallowing every click.
+    let stale = GESTURE.with(|g| {
+        let slot = g.borrow();
+        match slot.as_ref() {
+            Some((m, t, tracker)) if m != monitor || *t != target || !tracker.is_scrolling() => {
+                Some(m.clone())
+            }
+            _ => None,
+        }
+    });
+    if let Some(stale_monitor) = stale {
+        release_gesture(&stale_monitor);
     }
 
     GESTURE.with(|g| {
@@ -198,6 +282,41 @@ pub(crate) fn on_scroll(wheel_delta: i16, horizontal: bool, time_ms: u64, monito
     }
 }
 
+/// Drops any gesture state for `monitor` without committing it: clears
+/// the adjustment's gesture flag and kills the idle timer.
+///
+/// Every exit path goes through here. `gesture_in_progress` left set is
+/// not a cosmetic leak — `on_animation_tick` gates its completion check
+/// on it, so the overview can never finish opening or closing.
+fn release_gesture(monitor: &str) {
+    GESTURE.with(|g| {
+        let mut slot = g.borrow_mut();
+        if slot.as_ref().is_some_and(|(m, _, _)| m == monitor) {
+            *slot = None;
+        }
+    });
+    let hwnd = STATE.with(|s| {
+        let mut state_ref = s.borrow_mut();
+        let state = state_ref.as_mut()?;
+        let ov = state.overviews.get_mut(monitor)?;
+        ov.adjustment.set_gesture_in_progress(false);
+        Some(ov.hwnd)
+    });
+    if let Some(hwnd) = hwnd {
+        // SAFETY: a valid, process-lifetime window; killing a timer that
+        // is not set is a documented no-op.
+        unsafe {
+            let _ = KillTimer(hwnd, GESTURE_IDLE_TIMER_ID);
+        }
+    }
+}
+
+/// Cancels any live gesture on `monitor` — the overview being torn down
+/// under it, or the monitor going away mid-swipe.
+pub(crate) fn interrupt(monitor: &str) {
+    release_gesture(monitor);
+}
+
 /// No scroll event for `GESTURE_END_IDLE_MS`: the gesture is over.
 /// Releases it at the velocity its recent history implies, which is what
 /// turns a flick into a fling.
@@ -207,8 +326,12 @@ pub(crate) fn on_idle_timeout(monitor: &str) {
 
     let finished = GESTURE.with(|g| {
         let mut slot = g.borrow_mut();
-        let Some((m, target, tracker)) = slot.as_mut() else { return None };
+        let (m, target, tracker) = slot.as_mut()?;
         if m != monitor {
+            // The timer belongs to a monitor the gesture has since left.
+            // Falling through without killing it leaves a 20 Hz timer
+            // running on that overview window for the life of the
+            // process.
             return None;
         }
         let target = *target;
@@ -218,7 +341,20 @@ pub(crate) fn on_idle_timeout(monitor: &str) {
         Some((target, end))
     });
 
-    let Some((target, end)) = finished else { return };
+    let Some((target, end)) = finished else {
+        // No gesture of ours to finish: make sure the timer that woke us
+        // does not fire again.
+        let hwnd = STATE.with(|s| {
+            s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).map(|ov| ov.hwnd)
+        });
+        if let Some(hwnd) = hwnd {
+            // SAFETY: as above.
+            unsafe {
+                let _ = KillTimer(hwnd, GESTURE_IDLE_TIMER_ID);
+            }
+        }
+        return;
+    };
 
     let overview_hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
@@ -266,18 +402,6 @@ fn tick_ms() -> u64 {
     unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
 }
 
-/// Cancels any live gesture — a monitor going away mid-swipe, or the
-/// overview being torn down under it.
-#[allow(dead_code, reason = "hotplug teardown will call this once multi-monitor gesture handoff lands")]
-pub(crate) fn interrupt(monitor: &str) {
-    GESTURE.with(|g| {
-        let mut slot = g.borrow_mut();
-        if slot.as_ref().is_some_and(|(m, _, _)| m == monitor) {
-            *slot = None;
-        }
-    });
-}
-
 thread_local! {
     /// The window scroll events are posted to, set when the hooks are
     /// installed. A thread-local is the right channel: a low-level mouse
@@ -292,13 +416,42 @@ pub(crate) fn set_gesture_target(hwnd: HWND) {
 pub(crate) fn gesture_target() -> Option<HWND> {
     GESTURE_TARGET.with(|t| {
         let h = t.get();
-        (h != 0).then(|| HWND(h as *mut std::ffi::c_void))
+        (h != 0).then_some(HWND(h as *mut std::ffi::c_void))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scroll_with_the_pointer_over_an_application_never_starts_a_gesture() {
+        // The hook sees every wheel event in the system. Without a gate,
+        // scrolling a web page opens Activities and steals focus.
+        assert!(!gesture_allowed(false, "Chrome_WidgetWin_1"));
+        assert!(!gesture_allowed(false, "CabinetWClass"));
+        assert!(!gesture_allowed(false, "XLMAIN"));
+    }
+
+    #[test]
+    fn a_scroll_over_the_desktop_starts_a_gesture() {
+        assert!(gesture_allowed(false, "Progman"));
+        assert!(gesture_allowed(false, "WorkerW"));
+    }
+
+    #[test]
+    fn a_scroll_starts_a_gesture_over_our_own_surfaces() {
+        assert!(gesture_allowed(false, "GroveShellBar"));
+        assert!(gesture_allowed(false, "GroveShellOverview"));
+    }
+
+    #[test]
+    fn an_open_overview_accepts_a_scroll_wherever_the_pointer_is() {
+        // Once it is up it owns the screen, so what is under the pointer
+        // is irrelevant — and this is what lets a scroll reverse an open.
+        assert!(gesture_allowed(true, "Chrome_WidgetWin_1"));
+        assert!(gesture_allowed(true, ""));
+    }
 
     #[test]
     fn a_full_notch_becomes_one_scroll_unit_of_pixels() {

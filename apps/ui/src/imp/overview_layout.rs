@@ -8,10 +8,6 @@
 //! dash's measured height — and rounds to integers at the Win32/D2D
 //! boundary.
 
-// Wired into the renderer in the next task; until then the constants and
-// helpers below are reachable only from their own tests.
-#![allow(dead_code)]
-
 use groveshell_motion::{lerp, lerp_rect, RectF};
 
 /// Vertical spacing as a fraction of the work area's height
@@ -29,15 +25,14 @@ const STRIP_SPACING_BOTTOM: f64 = 0.4;
 /// Gap between neighbouring cards, as a fraction of a card's width. The
 /// neighbours peek in at the screen edges rather than being hidden.
 const CARD_GAP_RATIO: f64 = 0.06;
-/// How dark the backdrop goes behind the cards at full overview.
-const BACKDROP_DIM_MAX: f64 = 0.35;
+/// How dark the backdrop goes behind the cards at full overview. Read by
+/// `overview_gpu::paint_backdrop`, which paints it once; the *animation*
+/// of the dim comes from the root visual's opacity following progress,
+/// not from repainting this.
+pub(crate) const BACKDROP_DIM_MAX: f32 = 0.42;
 /// A card's corner radius at full overview, at 96 DPI
 /// (`BACKGROUND_CORNER_RADIUS_PIXELS`).
 const CARD_RADIUS_DP: f64 = 20.0;
-/// Inset from a card's edge to its window grid.
-const CARD_PADDING_DP: f64 = 28.0;
-/// Gap between grid cells.
-const GRID_GAP_DP: f64 = 20.0;
 /// How much an off-centre workspace shrinks, so the focused one reads as
 /// the subject (`WORKSPACE_INACTIVE_SCALE`, `workspacesView.js:25`).
 /// Read by `overview_gpu::update_transforms`.
@@ -171,7 +166,7 @@ pub(crate) fn layout_for_state(state: ControlsState, input: &LayoutInput) -> Ove
                 ),
                 search_entry: RectF::from_size(work.left, work.top, work.width(), search_height),
                 search_alpha: 1.0,
-                backdrop_dim: BACKDROP_DIM_MAX,
+                backdrop_dim: BACKDROP_DIM_MAX as f64,
                 card_radius: input.scaled(CARD_RADIUS_DP),
             }
         }
@@ -196,42 +191,6 @@ pub(crate) fn layout_for_progress(p: f64, input: &LayoutInput) -> OverviewLayout
         backdrop_dim: lerp(a.backdrop_dim, b.backdrop_dim, p),
         card_radius: lerp(a.card_radius, b.card_radius, p),
     }
-}
-
-/// `count` window slots gridded inside `card`, each aspect-fit in its
-/// cell. Returns an empty vector for an empty workspace rather than
-/// dividing by a zero count.
-pub(crate) fn grid_slots(card: RectF, count: usize, dpi: u32) -> Vec<RectF> {
-    if count == 0 {
-        return Vec::new();
-    }
-    let scale = dpi as f64 / 96.0;
-    let padding = CARD_PADDING_DP * scale;
-    let gap = GRID_GAP_DP * scale;
-    let content = RectF::new(
-        card.left + padding,
-        card.top + padding,
-        (card.right - padding).max(card.left + padding),
-        (card.bottom - padding).max(card.top + padding),
-    );
-
-    let cols = (count as f64).sqrt().ceil().max(1.0);
-    let rows = (count as f64 / cols).ceil().max(1.0);
-    let cell_w = ((content.width() - gap * (cols - 1.0)) / cols).max(0.0);
-    let cell_h = ((content.height() - gap * (rows - 1.0)) / rows).max(0.0);
-
-    (0..count)
-        .map(|i| {
-            let col = (i as f64) % cols;
-            let row = ((i as f64) / cols).floor();
-            RectF::from_size(
-                content.left + col * (cell_w + gap),
-                content.top + row * (cell_h + gap),
-                cell_w,
-                cell_h,
-            )
-        })
-        .collect()
 }
 
 /// Gap between strip thumbnails, as a fraction of one thumbnail's width.
@@ -418,17 +377,6 @@ mod tests {
         assert!(l.pitch > 0.0, "a zero pitch would stack every page");
     }
 
-    /// Review Focus 1: an empty workspace has no previews, and asking
-    /// for the layout must not divide by a zero window count.
-    #[test]
-    fn an_empty_workspace_lays_out_a_card_with_no_previews() {
-        let i = input();
-        let l = layout_for_state(ControlsState::WindowPicker, &i);
-        let slots = grid_slots(l.card, 0, i.dpi);
-        assert!(slots.is_empty());
-        assert!(l.card.width() > 0.0, "the card itself still has a size");
-    }
-
     #[test]
     fn the_strip_lays_out_one_slot_per_page_centred_in_its_band() {
         let strip = RectF::new(0.0, 30.0, 1920.0, 84.0);
@@ -517,18 +465,4 @@ mod tests {
         assert_eq!(thumb_alpha(None, 7.0), 1.0);
     }
 
-    #[test]
-    fn grid_slots_stay_inside_the_card_and_never_overlap() {
-        let i = input();
-        let l = layout_for_state(ControlsState::WindowPicker, &i);
-        for count in 1..=9 {
-            let slots = grid_slots(l.card, count, i.dpi);
-            assert_eq!(slots.len(), count);
-            for s in &slots {
-                assert!(s.left >= l.card.left - 0.01 && s.right <= l.card.right + 0.01);
-                assert!(s.top >= l.card.top - 0.01 && s.bottom <= l.card.bottom + 0.01);
-                assert!(s.width() > 0.0 && s.height() > 0.0);
-            }
-        }
-    }
 }
