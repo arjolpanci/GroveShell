@@ -16,7 +16,10 @@ use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC, ReleaseDC,
     SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DrawIconEx, DI_NORMAL, HICON};
+use windows::Win32::UI::WindowsAndMessaging::{
+    DrawIconEx, DI_NORMAL, HICON, WINDOW_EX_STYLE, WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+};
 
 use super::gpu::{self, GpuSurface};
 use super::overview::{
@@ -55,22 +58,41 @@ pub(crate) struct OverviewGpuState {
 /// using GDI for this monitor's overview, unchanged.
 /// Whether the overview's Direct2D renderer is used.
 ///
-/// **Currently false, deliberately.** Until 2026-10-08 this renderer had
-/// never executed: `create` asked for a second `IDCompositionTarget` on a
+/// False from 2026-07-30 to 2026-10-13, for two stacked reasons. The
+/// first was `create` asking for a second `IDCompositionTarget` on a
 /// window that already had one, which always failed with
-/// `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`, so every overview
-/// silently fell back to GDI. That bug is fixed (the extra surfaces are
-/// children now, see `gpu::create_child_surface`), but enabling the
-/// renderer revealed a second defect underneath it: the composition tree
-/// builds, `BeginDraw` succeeds, `paint_backdrop` fills the root surface
-/// opaque and the fade drives opacity to 1.0 — and the window still
-/// composites as fully transparent, with or without
-/// `WS_EX_NOREDIRECTIONBITMAP`.
+/// `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`; that was fixed by making
+/// the extra surfaces children (see `gpu::create_child_surface`). The
+/// second was underneath it: the tree built, `BeginDraw` succeeded,
+/// `paint_backdrop` filled the root opaque and opacity reached 1.0, and
+/// the window still composited fully transparent.
 ///
-/// Rather than ship a blank Activities view, the renderer stays off and
-/// the overview keeps its working GDI path. Turning this on is the whole
-/// of the fix once that defect is found; everything else is in place.
-const OVERVIEW_GPU_ENABLED: bool = false;
+/// The cause was the window keeping its GDI redirection bitmap so that
+/// the per-frame GDI fallback could still paint it, while
+/// DirectComposition composed the same HWND — an opaque redirection
+/// bitmap in front of composed content renders that content invisible.
+/// The four surfaces that always worked (bar, desktop dock, calendar,
+/// quick settings) all set `WS_EX_NOREDIRECTIONBITMAP` and paint only
+/// through D2D. The overview does the same now, and GDI is what it falls
+/// back to when the process has no GPU at all (see `overview_ex_style`),
+/// not a per-frame alternative on a composed window.
+const OVERVIEW_GPU_ENABLED: bool = true;
+
+/// The overview window's extended style.
+///
+/// `translucent` must be exactly `gpu::is_enabled()` at creation time,
+/// and the result must be re-checked against the per-window surface — see
+/// `desktop_dock`'s `create` for the established pattern. With no
+/// redirection bitmap there is nothing for GDI to paint into, so a
+/// per-window DirectComposition failure after a successful global check
+/// would leave an invisible overview rather than a merely slow one.
+pub(crate) fn overview_ex_style(translucent: bool) -> WINDOW_EX_STYLE {
+    if translucent {
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOREDIRECTIONBITMAP
+    } else {
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+    }
+}
 
 /// Whether the overview will actually render through DirectComposition.
 ///
@@ -428,6 +450,12 @@ pub(crate) fn paint_backdrop(gpu: &OverviewGpuState) {
     let blur = super::state::overview_blur();
 
     gpu::redraw(&gpu.root, |ctx: &ID2D1DeviceContext| {
+        // Without a redirection bitmap there is no opaque GDI surface
+        // underneath, so anything not drawn here keeps whatever this
+        // surface last held. Clearing first is what makes every
+        // subsequent alpha fill composite against the desktop rather
+        // than against the previous frame.
+        gpu::clear_transparent(ctx);
         if blur {
             // Downscale target: small enough for a heavy, even blur, but
             // not so small the wallpaper loses all sense of place. ~1/22
@@ -634,6 +662,30 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             }
         }
     });
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        WS_EX_LAYERED, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    };
+
+    #[test]
+    fn translucent_style_drops_the_redirection_bitmap_and_layering() {
+        let style = overview_ex_style(true);
+        assert_eq!(style & WS_EX_NOREDIRECTIONBITMAP, WS_EX_NOREDIRECTIONBITMAP);
+        assert_eq!(style & WS_EX_LAYERED, Default::default());
+        assert_eq!(style & WS_EX_TOPMOST, WS_EX_TOPMOST);
+        assert_eq!(style & WS_EX_TOOLWINDOW, WS_EX_TOOLWINDOW);
+    }
+
+    #[test]
+    fn opaque_style_keeps_layering_for_the_gdi_fade() {
+        let style = overview_ex_style(false);
+        assert_eq!(style & WS_EX_LAYERED, WS_EX_LAYERED);
+        assert_eq!(style & WS_EX_NOREDIRECTIONBITMAP, Default::default());
+    }
 }
 
 #[cfg(test)]

@@ -312,42 +312,30 @@ pub fn main() -> Result<()> {
         for monitor in &monitors {
             let width = monitor.rect.right - monitor.rect.left;
             let height = monitor.rect.bottom - monitor.rect.top;
-            // DirectComposition's `CreateTargetForHwnd` unconditionally
-            // refuses a window that has `WS_EX_LAYERED` set
-            // (`DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED`) — the overview
-            // only needs that style for the GDI-fallback fade
-            // (`SetLayeredWindowAttributes`); the GPU path fades via
-            // `SetOpacity2` on the compositor visual instead, so it must
-            // omit the style entirely to let `overview_gpu::create` succeed.
-            // DirectComposition's `CreateTargetForHwnd` unconditionally
-            // refuses a window that has `WS_EX_LAYERED` set, so the style
-            // is omitted whenever the GPU path is available at all. Note
-            // this is `gpu::is_enabled()`, the process-wide check — not
-            // whether the overview's own renderer is on. The window must
-            // be left composable either way, and it keeps its redirection
-            // bitmap so the GDI painter still works: a window without one
-            // cannot be GDI-painted at all, which is what made Activities
-            // open to nothing when this briefly said otherwise.
-            let overview_ex_style = if gpu::is_enabled() {
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW
-            } else {
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED
+            // Which style the overview takes, and why, lives in
+            // `overview_gpu::overview_ex_style`'s doc comment. The short
+            // version: composed means no redirection bitmap, and a
+            // per-window DirectComposition failure after the process-wide
+            // check has to rebuild the window opaque or the overview is
+            // invisible rather than merely slow.
+            let translucent = gpu::is_enabled();
+            let create_overview = |translucent: bool| {
+                CreateWindowExW(
+                    overview_gpu::overview_ex_style(translucent),
+                    w!("GroveShellOverview"),
+                    w!("GroveShell Activities"),
+                    WS_POPUP,
+                    monitor.rect.left,
+                    monitor.rect.top,
+                    width,
+                    height,
+                    None,
+                    None,
+                    hinstance,
+                    None,
+                )
             };
-            let overview_hwnd = CreateWindowExW(
-                overview_ex_style,
-                w!("GroveShellOverview"),
-                w!("GroveShell Activities"),
-                WS_POPUP,
-                monitor.rect.left,
-                monitor.rect.top,
-                width,
-                height,
-                None,
-                None,
-                hinstance,
-                None,
-            )
-            .map_err(Error::Windows)?;
+            let overview_hwnd = create_overview(translucent).map_err(Error::Windows)?;
             // `DwmEnableBlurBehindWindow` must run *after* `OverviewInstance::new`
             // (which creates the DirectComposition target via
             // `overview_gpu::create`), and only when blur is actually
@@ -363,10 +351,26 @@ pub fn main() -> Result<()> {
             // no need to call this at all when blur starts off; the live
             // `WM_APP_CONFIG_RELOADED` path still needs to handle both
             // enabling and disabling blur on an already-running window.
-            overviews.insert(
-                monitor.device_name.clone(),
-                overview::OverviewInstance::new(overview_hwnd, width, height),
-            );
+            let mut overview_hwnd = overview_hwnd;
+            let mut instance = overview::OverviewInstance::new(overview_hwnd, width, height);
+            if translucent && instance.gpu.is_none() {
+                // A per-window DirectComposition failure after the global
+                // check is real — this window hit
+                // `DCOMPOSITION_ERROR_WINDOW_ALREADY_COMPOSED` for months.
+                // Rebuild it with a redirection bitmap so the GDI painter
+                // has something to paint into, rather than leaving an
+                // invisible overview. Same recovery as `desktop_dock`.
+                tracing::warn!(
+                    monitor = %monitor.device_name,
+                    "overview DirectComposition surface failed; rebuilding the window opaque"
+                );
+                // SAFETY (inherited from the enclosing block): `overview_hwnd`
+                // was created just above and has no outstanding references yet.
+                let _ = DestroyWindow(overview_hwnd);
+                overview_hwnd = create_overview(false).map_err(Error::Windows)?;
+                instance = overview::OverviewInstance::new(overview_hwnd, width, height);
+            }
+            overviews.insert(monitor.device_name.clone(), instance);
             // The overview backdrop blur is rendered by us now (a blurred,
             // dimmed wallpaper drawn onto the GPU root surface — see
             // `overview_gpu::paint_backdrop`), driven by the
