@@ -455,6 +455,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "groveshell-motion"
+version = "0.1.0"
+
+[[package]]
 name = "groveshell-settings"
 version = "0.1.0"
 dependencies = [
