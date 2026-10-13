@@ -8,6 +8,8 @@
 //! a pure function or a plain state machine, so the feel of the shell is
 //! unit-testable without a monitor.
 
+pub mod adjustment;
 pub mod lerp;
 
+pub use adjustment::{Adjustment, TransitionParams};
 pub use lerp::{lerp, lerp_rect, Easing, RectF};
