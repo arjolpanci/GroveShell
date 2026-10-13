@@ -118,6 +118,15 @@ pub(crate) fn anchor_x(work_area_left: i32, work_area_right: i32, content_w: i32
 /// `pinned_count` slots (by index) that are pinned entries — the rest
 /// are running-unpinned, matching `pinned_count()`'s own contract.
 
+/// The dash bar's height in physical pixels at the current icon size —
+/// the one measurement `overview_layout` needs from the dock, kept here
+/// so the two cannot drift apart. Same arithmetic as `dock_layout`'s
+/// `bar_h`, which is the authority.
+pub(crate) fn dash_height(dpi: u32) -> i32 {
+    let (icon_size_cfg, _) = super::state::dock_config();
+    scaled(icon_size_cfg, dpi) + scaled(DOCK_PADDING_Y, dpi) * 2
+}
+
 pub(crate) fn dock_layout(monitor: &str, pinned_count: usize, total_count: usize) -> (RECT, Vec<RECT>, Option<RECT>) {
     let (card_rect, _) = super::overview::card_layout(monitor);
     let dpi = super::state::reference_dpi();

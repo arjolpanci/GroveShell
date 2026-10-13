@@ -69,13 +69,10 @@ const CAROUSEL_DRAG_PAGE_DISTANCE_PX: f64 = 480.0;
 /// comfortably, small enough that the previous/next cards visibly peek
 /// in at the edges.
 const CARD_WIDTH_FRACTION: f64 = 0.62;
-/// Gap above a card, below the top bar — room for a future search box.
-const CARD_MARGIN_TOP: i32 = 70;
+
 /// Gap below a card — room for the future dock (not implemented yet).
 pub(crate) const CARD_MARGIN_BOTTOM: i32 = 120;
-/// Horizontal gap between adjacent cards; together with the card width
-/// this sets the carousel's page-to-page pitch.
-const CARD_GAP: i32 = 56;
+
 /// Inset from a card's edges to where its window grid starts.
 const CARD_CONTENT_PADDING: i32 = 28;
 /// Gap between grid cells.
@@ -331,46 +328,34 @@ enum OverviewHit {
 /// consistent with the rest of this module not handling live
 /// display-topology changes.
 pub(crate) fn card_layout(monitor: &str) -> (RECT, i32) {
-    let monitors = monitors_sorted_by_x();
-    let Some(this_monitor) = super::monitors::monitor_by_device_name(&monitors, monitor) else {
+    // One geometry, not two. This used to compute its own card rect from
+    // CARD_WIDTH_FRACTION/CARD_MARGIN_*; `overview_layout` now owns the
+    // overview's proportions (GNOME's ratios), and everything that needs
+    // "where is the focused card and how far apart are pages" —
+    // hit-testing, the GDI painter, the card surfaces, the grid — reads
+    // it through here. Two layout systems coexisting is what made the
+    // previews render at their real positions instead of their slots:
+    // the card surface was stretched from one system's rect to the
+    // other's, and every child inherited that stretch.
+    let Some(input) = layout_input(monitor) else {
         // Monitor vanished mid-frame (hotplug race) — degrade to a
-        // primary-anchored guess rather than panicking; the overview
-        // is about to be torn down for this monitor anyway (Task 10).
-        return card_layout_fallback(&monitors);
+        // primary-anchored guess rather than panicking; this monitor's
+        // overview is about to be torn down anyway.
+        return card_layout_fallback(&monitors_sorted_by_x());
     };
-
-    // The overview window is now sized to exactly this monitor's rect
-    // (Task 4), so the window's own top-left *is* this monitor's
-    // top-left — `origin_x`/`client_h` come straight from the monitor's
-    // rect, no `GetSystemMetrics(SM_*VIRTUALSCREEN)` needed.
-    let origin_x = this_monitor.rect.left;
-    let client_h = this_monitor.rect.bottom - this_monitor.rect.top;
-    let dpi = this_monitor.dpi;
-    let w = (this_monitor.rect.right - this_monitor.rect.left) as f64;
-    let h = (this_monitor.rect.bottom - this_monitor.rect.top).max(1) as f64;
-    let ref_aspect = w / h;
-    let ref_center_x_abs = (this_monitor.rect.left + this_monitor.rect.right) / 2;
-
-    // The bar's *configured* current height (see `state::bar_height_config`'s
-    // doc comment) — not the `BAR_HEIGHT` constant, which is only the
-    // original tuned default and goes stale the moment the user changes
-    // the Top Bar settings page's height slider, leaving the overview's
-    // card grid starting under a since-resized bar.
-    let bar_height = super::state::bar_height_config();
-    let card_w = (w * CARD_WIDTH_FRACTION).round() as i32;
-    let max_card_h =
-        (client_h - scaled(bar_height + CARD_MARGIN_TOP + CARD_MARGIN_BOTTOM, dpi)).max(1);
-    let card_h = ((card_w as f64 / ref_aspect).round() as i32).min(max_card_h).max(1);
-
-    let card_top = scaled(bar_height + CARD_MARGIN_TOP, dpi) + (max_card_h - card_h) / 2;
-    let card_left = (ref_center_x_abs - origin_x) - card_w / 2;
-    let rect = RECT {
-        left: card_left,
-        top: card_top,
-        right: card_left + card_w,
-        bottom: card_top + card_h,
-    };
-    (rect, card_w + scaled(CARD_GAP, dpi))
+    let layout = super::overview_layout::layout_for_state(
+        super::overview_layout::ControlsState::WindowPicker,
+        &input,
+    );
+    (
+        RECT {
+            left: layout.card.left.round() as i32,
+            top: layout.card.top.round() as i32,
+            right: layout.card.right.round() as i32,
+            bottom: layout.card.bottom.round() as i32,
+        },
+        layout.pitch.round().max(1.0) as i32,
+    )
 }
 
 /// Fallback for `card_layout` when the requested monitor has already
@@ -380,11 +365,14 @@ pub(crate) fn card_layout(monitor: &str) -> (RECT, i32) {
 fn card_layout_fallback(monitors: &[super::monitors::MonitorInfo]) -> (RECT, i32) {
     let reference = monitors.iter().find(|m| m.is_primary).or_else(|| monitors.first());
     match reference {
-        Some(m) => {
+        // Guarded against recursing back into the vanished monitor: this
+        // re-enters `card_layout` only for a monitor that is still in the
+        // enumerated list, so its `layout_input` resolves.
+        Some(m) if monitors.iter().any(|o| o.device_name == m.device_name) => {
             let device_name = m.device_name.clone();
             card_layout(&device_name)
         }
-        None => (RECT { left: 0, top: 0, right: 1920, bottom: 1080 }, 1920),
+        _ => (RECT { left: 0, top: 0, right: 1920, bottom: 1080 }, 1920),
     }
 }
 
@@ -564,6 +552,67 @@ pub(crate) fn zoom_rect(r: RECT, anchor_x: f64, anchor_y: f64, s: f64) -> RECT {
     }
 }
 
+/// The `(hwnd, slot)` pairs `rebuild_thumbs` needs to size a preview
+/// that has no real on-screen rect to fly from.
+fn thumb_slot_pairs(monitor: &str, thumbs: &[ThumbAnim]) -> Vec<(isize, groveshell_motion::RectF)> {
+    let Some(input) = layout_input(monitor) else {
+        return Vec::new();
+    };
+    let layout = super::overview_layout::layout_for_state(
+        super::overview_layout::ControlsState::WindowPicker,
+        &input,
+    );
+    let mut pairs = Vec::new();
+    let pages: std::collections::BTreeSet<usize> = thumbs.iter().map(|t| t.page).collect();
+    for page in pages {
+        let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == page).collect();
+        let slots = super::overview_layout::grid_slots(layout.card, page_thumbs.len(), input.dpi);
+        for (t, slot) in page_thumbs.iter().zip(slots) {
+            pairs.push((t.hwnd.0 as isize, slot));
+        }
+    }
+    pairs
+}
+
+/// How open this monitor's overview is, 0.0 when closed or absent.
+///
+/// Consumed by the desktop dock in the next task.
+///
+/// Reads and releases the `STATE` borrow before returning, so a caller
+/// may use the result while taking its own borrow — the desktop dock's
+/// tick does exactly that.
+#[allow(dead_code, reason = "the desktop dock reads this in the next task")]
+pub(crate) fn progress(monitor: &str) -> f64 {
+    STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .and_then(|st| st.overviews.get(monitor))
+            .map(|ov| ov.adjustment.value())
+            .unwrap_or(0.0)
+    })
+}
+
+/// Everything `overview_layout` needs, measured for `monitor`. `None`
+/// when the monitor has vanished mid-frame (hotplug race) — the caller
+/// skips the frame, the same race `card_layout`'s fallback exists for.
+pub(crate) fn layout_input(monitor: &str) -> Option<super::overview_layout::LayoutInput> {
+    let monitors = monitors_sorted_by_x();
+    let m = super::monitors::monitor_by_device_name(&monitors, monitor)?;
+    let dpi = m.dpi;
+    let bar = scaled(super::state::bar_height_config(), dpi) as f64;
+    let width = (m.rect.right - m.rect.left) as f64;
+    let height = (m.rect.bottom - m.rect.top) as f64;
+    Some(super::overview_layout::LayoutInput {
+        // Client coordinates: the overview window covers its monitor
+        // exactly, so the monitor's top-left is the client origin.
+        work_area: groveshell_motion::RectF::new(0.0, bar, width, height),
+        dpi,
+        search_height: scaled(SEARCH_ROW_HEIGHT, dpi) as f64,
+        dash_height: super::dock::dash_height(dpi) as f64,
+        monitor_aspect: if height > 0.0 { width / height } else { 1.0 },
+    })
+}
+
 /// Re-syncs the workspace tracker (see `workspaces::sync_workspaces`)
 /// and builds a fresh `(cards, thumbs)` pair covering *every* current
 /// workspace's page — one wallpaper-filled card each (see
@@ -717,22 +766,21 @@ pub(crate) fn open_overview(monitor: &str) {
 
     let (cards, thumbs, current_pos, dock_apps) = build_carousel_pages(monitor);
 
-    // Paint each card's GPU surface (frame/wallpaper/thumbnails/icons)
-    // now, while `cards`/`thumbs` are still borrowable locals — they're
-    // moved into `OverviewMode::Opening` below.
+    // Paint each card's GPU surface (frame/wallpaper) and build one
+    // visual per preview now, while `cards`/`thumbs` are still
+    // borrowable locals — they're moved into `OverviewMode::Live` below.
+    let slot_pairs = thumb_slot_pairs(monitor, &thumbs);
     STATE.with(|s| {
         if let Some(state) = s.borrow_mut().as_mut() {
             if let Some(ov) = state.overviews.get_mut(monitor) {
                 if let Some(gpu) = ov.gpu.as_mut() {
                     super::overview_gpu::rebuild_cards(gpu, &cards);
                     for card_visual in &gpu.cards {
-                        let card = cards.iter().find(|c| c.page == card_visual.page);
-                        if let Some(card) = card {
-                            let page_thumbs: Vec<&ThumbAnim> =
-                                thumbs.iter().filter(|t| t.page == card.page).collect();
-                            super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor, None);
+                        if let Some(card) = cards.iter().find(|c| c.page == card_visual.page) {
+                            super::overview_gpu::paint_card(card_visual, card.rect, monitor, None);
                         }
                     }
+                    super::overview_gpu::rebuild_thumbs(gpu, &thumbs, &slot_pairs);
                 }
             }
         }
@@ -813,9 +861,10 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
 
     let (cards, thumbs, _current_pos, dock_apps) = build_carousel_pages(monitor);
 
-    // Paint each card's GPU surface (frame/wallpaper/thumbnails/icons)
-    // now, while `cards`/`thumbs` are still borrowable locals — they're
-    // moved into `OverviewMode::Open` below.
+    // Paint each card's GPU surface (frame/wallpaper) and rebuild the
+    // preview visuals now, while `cards`/`thumbs` are still borrowable
+    // locals — they're moved into `OverviewMode::Live` below.
+    let slot_pairs = thumb_slot_pairs(monitor, &thumbs);
     let gpu_updated = STATE.with(|s| {
         let mut state = s.borrow_mut();
         let ov = state.as_mut()?.overviews.get_mut(monitor)?;
@@ -823,12 +872,11 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         let gpu = ov.gpu.as_mut()?;
         super::overview_gpu::rebuild_cards(gpu, &cards);
         for card_visual in &gpu.cards {
-            let card = cards.iter().find(|c| c.page == card_visual.page);
-            if let Some(card) = card {
-                let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == card.page).collect();
-                super::overview_gpu::paint_card(card_visual, card.rect, &page_thumbs, monitor, None);
+            if let Some(card) = cards.iter().find(|c| c.page == card_visual.page) {
+                super::overview_gpu::paint_card(card_visual, card.rect, monitor, None);
             }
         }
+        super::overview_gpu::rebuild_thumbs(gpu, &thumbs, &slot_pairs);
         // Newly created/repositioned card visuals sit at their default
         // identity transform (top-left of the window) until something
         // calls `update_transforms` — this function can run while the
@@ -836,11 +884,13 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         // (workspace add/remove, window dragged to another card), so it
         // must apply the current carousel position itself rather than
         // waiting for the next tick/mouse-move. Zoom is always `1.0`
-        // here since this only ever runs while `Open` (never
-        // `Opening`/`Closing`); the anchor is inert at zoom 1.0 (the
-        // zoom transform is the identity there), so its value doesn't
-        // matter.
-        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, 1.0, (0.0, 0.0));
+        // here since this only ever runs while fully open, so progress
+        // is 1.0 and every preview sits in its grid slot.
+        let thumbs: &[ThumbAnim] = match &ov.mode {
+            OverviewMode::Live { thumbs, .. } => thumbs,
+            OverviewMode::Closed => &[],
+        };
+        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, 1.0, thumbs);
         Some(())
     });
 
@@ -1313,7 +1363,6 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
 fn repaint_card_hover_diff(
     gpu: &super::overview_gpu::OverviewGpuState,
     monitor: &str,
-    thumbs: &[ThumbAnim],
     card_rect: RECT,
     old_page: Option<usize>,
     new_page: Option<usize>,
@@ -1330,10 +1379,9 @@ fn repaint_card_hover_diff(
     }
     for page in pages {
         let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) else { continue };
-        let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == page).collect();
         let hover = (Some(page) == new_page)
             .then_some((super::overview_gpu::HoverTarget::Card(page), intensity));
-        super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
+        super::overview_gpu::paint_card(card_visual, card_rect, monitor, hover);
     }
 }
 
@@ -1343,50 +1391,25 @@ fn repaint_card_hover_diff(
 /// one, deduplicated (usually the same card, meaning one repaint).
 fn repaint_thumb_hover_diff(
     gpu: &super::overview_gpu::OverviewGpuState,
-    monitor: &str,
     thumbs: &[ThumbAnim],
-    card_rect: RECT,
     old_hwnd: Option<isize>,
     new_hwnd: Option<isize>,
     intensity: f64,
 ) {
-    let page_of = |hwnd: isize| thumbs.iter().find(|t| t.hwnd.0 as isize == hwnd).map(|t| t.page);
-    let old_page = old_hwnd.and_then(page_of);
-    let new_page = new_hwnd.and_then(page_of);
-    let mut pages = Vec::with_capacity(2);
-    if let Some(p) = old_page {
-        pages.push(p);
-    }
-    if let Some(p) = new_page {
-        if !pages.contains(&p) {
-            pages.push(p);
-        }
-    }
-    for page in pages {
-        let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) else { continue };
-        let page_thumbs: Vec<&ThumbAnim> = thumbs.iter().filter(|t| t.page == page).collect();
-        // `new_hwnd` is only read once this card is confirmed to be the
-        // newly-hovered one (`Some(page) == new_page` implies
-        // `new_hwnd.is_some()`, since `new_page` came from
-        // `new_hwnd.and_then(page_of)` above) — never unwrapped
-        // unconditionally, since `bool::then_some`'s argument is
-        // evaluated eagerly regardless of which branch "wins".
-        let hover = if Some(page) == new_page {
-            new_hwnd.map(|hwnd| (super::overview_gpu::HoverTarget::Thumb(hwnd), intensity))
-        } else {
-            None
-        };
-        super::overview_gpu::paint_card(card_visual, card_rect, &page_thumbs, monitor, hover);
+    // Each preview owns its surface, so the glow repaints exactly the
+    // two small surfaces that changed — not the card they sit on.
+    for (hwnd, intensity) in [(old_hwnd, 0.0), (new_hwnd, intensity)] {
+        let Some(hwnd) = hwnd else { continue };
+        let Some(visual) = gpu.thumbs.iter().find(|tv| tv.hwnd == hwnd) else { continue };
+        let title = thumbs
+            .iter()
+            .find(|t| t.hwnd.0 as isize == hwnd)
+            .map(|t| t.title.as_str())
+            .unwrap_or("");
+        super::overview_gpu::paint_thumb(visual, title, intensity);
     }
 }
 
-/// Follows the pointer while a drag is active. A window drag just
-/// tracks the cursor (the ghost is painted at the current position); a
-/// carousel drag scrolls the content with the cursor (dragging right
-/// reveals the *previous*, lower-index workspace), at a fixed
-/// `CAROUSEL_DRAG_PAGE_DISTANCE_PX`-per-page rate rather than the
-/// overview's actual (screen-spanning) pixel width — see that
-/// constant's docs.
 pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
     enum MoveKind {
         Window { old_page: Option<usize> },
@@ -1464,7 +1487,11 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
         let state = s.borrow();
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
-        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel.value(), 1.0, (0.0, 0.0));
+        let thumbs: &[ThumbAnim] = match &ov.mode {
+            OverviewMode::Live { thumbs, .. } => thumbs,
+            OverviewMode::Closed => &[],
+        };
+        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel.value(), 1.0, thumbs);
         match kind {
             MoveKind::Window { old_page } => {
                 // A real window drag: the ghost follows the cursor (root
@@ -1476,10 +1503,10 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 super::overview_gpu::paint_root(gpu, monitor, ov);
                 if let Some(drag) = ov.window_drag.as_ref() {
                     if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
-                        if let OverviewMode::Live { thumbs, .. } = &ov.mode {
+                        if let OverviewMode::Live { .. } = &ov.mode {
                             let (card_rect, _) = card_layout(monitor);
                             let intensity = ease_out(progress_dur(drag.hover_started, WINDOW_HOVER_GLOW_DURATION));
-                            repaint_card_hover_diff(gpu, monitor, thumbs, card_rect, old_page, drag.hover_page, intensity);
+                            repaint_card_hover_diff(gpu, monitor, card_rect, old_page, drag.hover_page, intensity);
                         }
                     }
                 }
@@ -1575,19 +1602,22 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
         let state = s.borrow();
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
-        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel.value(), 1.0, (0.0, 0.0));
+        let thumbs: &[ThumbAnim] = match &ov.mode {
+            OverviewMode::Live { thumbs, .. } => thumbs,
+            OverviewMode::Closed => &[],
+        };
+        super::overview_gpu::update_transforms(gpu, monitor, ov.carousel.value(), 1.0, thumbs);
         // Dock hover is root content — repaint the chrome surface.
         super::overview_gpu::paint_root(gpu, monitor, ov);
         // Thumbnail hover is card content (see `HoverTarget`) — only
         // the previously- and newly-hovered card (at most two, usually
         // the same one) are repainted.
         if let OverviewMode::Live { thumbs, .. } = &ov.mode {
-            let (card_rect, _) = card_layout(monitor);
             let intensity = ov
                 .hover_thumb
                 .map(|(_, started)| ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)))
                 .unwrap_or(0.0);
-            repaint_thumb_hover_diff(gpu, monitor, thumbs, card_rect, old_hover, new_hover, intensity);
+            repaint_thumb_hover_diff(gpu, thumbs, old_hover, new_hover, intensity);
         }
         Some(())
     });
@@ -3341,16 +3371,11 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         let state = s.borrow();
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
-        // Task 9 replaces this with a layout-driven transform pass; for
-        // now the GPU path keeps the same whole-surface zoom the GDI
-        // fallback uses, so this task lands behaviour-identical.
-        let (card_rect, _) = card_layout(monitor);
-        let zoom = OVERVIEW_ZOOM_MAX + (1.0 - OVERVIEW_ZOOM_MAX) * progress;
-        let anchor = (
-            (card_rect.left + card_rect.right) as f64 / 2.0,
-            (card_rect.top + card_rect.bottom) as f64 / 2.0,
-        );
-        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, zoom, anchor);
+        let thumbs: &[ThumbAnim] = match &ov.mode {
+            OverviewMode::Live { thumbs, .. } => thumbs,
+            OverviewMode::Closed => &[],
+        };
+        super::overview_gpu::update_transforms(gpu, monitor, carousel_offset, progress, thumbs);
         // The drag-pop ghost's scale and the dock's hover-glow both
         // ease continuously while active, so — unlike every other
         // root/card repaint in this module — this one *does* need to
@@ -3371,13 +3396,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
                             .map(|d| ease_out(progress_dur(d.hover_started, WINDOW_HOVER_GLOW_DURATION)))
                             .unwrap_or(0.0);
                         if let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) {
-                            let page_thumbs: Vec<&ThumbAnim> =
-                                thumbs.iter().filter(|t| t.page == page).collect();
-                            super::overview_gpu::paint_card(
-                                card_visual,
-                                card_rect,
-                                &page_thumbs,
-                                monitor,
+                            super::overview_gpu::paint_card(card_visual, card_rect, monitor,
                                 Some((super::overview_gpu::HoverTarget::Card(page), intensity)),
                             );
                         }
@@ -3385,20 +3404,8 @@ pub(crate) fn on_animation_tick(monitor: &str) {
                 }
                 if thumb_hover_easing {
                     if let Some((hwnd, started)) = ov.hover_thumb {
-                        if let Some(page) = thumbs.iter().find(|t| t.hwnd.0 as isize == hwnd).map(|t| t.page) {
-                            let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
-                            if let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) {
-                                let page_thumbs: Vec<&ThumbAnim> =
-                                    thumbs.iter().filter(|t| t.page == page).collect();
-                                super::overview_gpu::paint_card(
-                                    card_visual,
-                                    card_rect,
-                                    &page_thumbs,
-                                    monitor,
-                                    Some((super::overview_gpu::HoverTarget::Thumb(hwnd), intensity)),
-                                );
-                            }
-                        }
+                        let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
+                        repaint_thumb_hover_diff(gpu, thumbs, None, Some(hwnd), intensity);
                     }
                 }
             }
