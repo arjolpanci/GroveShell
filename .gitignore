@@ -22,3 +22,7 @@ desktop.ini
 # Backup files left by rustfmt or merge conflicts
 *.rs.bk
 *.orig
+
+# Reference checkout of gnome-shell, kept locally for porting its
+# animation/gesture model. Has its own .git; never part of this repo.
+/gnome-shell/
