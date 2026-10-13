@@ -14,4 +14,4 @@ pub mod swipe;
 
 pub use adjustment::{Adjustment, TransitionParams};
 pub use lerp::{lerp, lerp_rect, Easing, RectF};
-pub use swipe::EventHistory;
+pub use swipe::{EventHistory, InputKind, SwipeEnd, SwipeTracker};
