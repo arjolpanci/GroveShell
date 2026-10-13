@@ -10,6 +10,8 @@
 
 pub mod adjustment;
 pub mod lerp;
+pub mod swipe;
 
 pub use adjustment::{Adjustment, TransitionParams};
 pub use lerp::{lerp, lerp_rect, Easing, RectF};
+pub use swipe::EventHistory;
