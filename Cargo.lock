@@ -481,6 +481,7 @@ dependencies = [
  "groveshell-common",
  "groveshell-config",
  "groveshell-ipc",
+ "groveshell-motion",
  "groveshell-ui-kit",
  "groveshell-window-model",
  "serde",

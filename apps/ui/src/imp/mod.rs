@@ -22,6 +22,7 @@ mod monitors;
 mod monitor_workspaces;
 mod movesize;
 mod overview;
+mod overview_layout;
 mod overview_gpu;
 mod pending_launch;
 mod quick_settings;
