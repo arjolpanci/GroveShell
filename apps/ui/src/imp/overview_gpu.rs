@@ -195,6 +195,11 @@ pub(crate) struct OverviewGpuState {
     /// The slot the ring is currently painted for, so it is only
     /// repainted when the hovered preview actually changes.
     pub(crate) glow_slot: Option<(isize, RectF)>,
+    /// `(page_count, current)` the strip was last painted for. A `Cell`
+    /// so the gate works from the shared borrows the paint paths hold.
+    pub(crate) strip_state: std::cell::Cell<Option<(usize, usize)>>,
+    /// Whether the backdrop has been painted for this window yet.
+    pub(crate) backdrop_painted: std::cell::Cell<bool>,
 }
 
 /// Creates the root/chrome surfaces for `hwnd` (both sized to the
@@ -303,6 +308,8 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
         strip_natural: RectF::new(0.0, 0.0, width as f64, height as f64),
         glow: None,
         glow_slot: None,
+        strip_state: std::cell::Cell::new(None),
+        backdrop_painted: std::cell::Cell::new(false),
     })
 }
 
@@ -663,6 +670,54 @@ pub(crate) fn paint_dash(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
     });
 }
 
+
+/// Paints the workspace strip, but only when what it shows has changed.
+///
+/// Each miniature scales its own wallpaper, so a full repaint costs
+/// ~52ms — and it used to run on every hover change, where neither the
+/// page count nor the current page can possibly have moved.
+pub(crate) fn paint_strip_if_changed(
+    gpu: &OverviewGpuState,
+    monitor: &str,
+    page_count: usize,
+    current: usize,
+) {
+    if gpu.strip_state.get() == Some((page_count, current)) {
+        return;
+    }
+    gpu.strip_state.set(Some((page_count, current)));
+    paint_strip(gpu, monitor, page_count, current);
+}
+
+/// Paints the backdrop once per overview window.
+///
+/// It is a full-window blurred wallpaper plus a scrim — 62ms a call,
+/// measured — and the wallpaper does not change while the shell runs, so
+/// repainting it on every rebuild of the pages was pure cost. Rebuilds
+/// happen while the overview is open (a window appearing, a workspace
+/// re-sync), which is what made it stutter under the pointer.
+pub(crate) fn paint_backdrop_once(gpu: &OverviewGpuState) {
+    if gpu.backdrop_painted.get() {
+        return;
+    }
+    gpu.backdrop_painted.set(true);
+    paint_backdrop(gpu);
+}
+
+/// Forgets what the cached-once surfaces were painted for, so the next
+/// paint call actually redraws them.
+///
+/// Both gates above assume their input is fixed for the life of the
+/// window, which holds for the wallpaper but not for settings the user
+/// can change while the shell runs: `overview_blur` decides whether the
+/// backdrop is a blurred wallpaper or a flat fill, and the accent colour
+/// outlines the strip's current workspace. A live config reload or an
+/// accent change has to call this, or the overview keeps showing the old
+/// one until it is next recreated.
+pub(crate) fn invalidate_cached_paints(gpu: &OverviewGpuState) {
+    gpu.backdrop_painted.set(false);
+    gpu.strip_state.set(None);
+}
 
 /// Paints the workspace thumbnail strip: one wallpaper-filled miniature
 /// per workspace, with the current one outlined in the accent colour.
@@ -1063,8 +1118,14 @@ pub(crate) fn paint_backdrop(gpu: &OverviewGpuState) {
     });
 }
 
+/// Paints the chrome: the search panel and the drag ghost.
+///
+/// It deliberately does **not** repaint the backdrop any more. The
+/// backdrop is a full-window blurred wallpaper plus a scrim — 57ms a
+/// call, measured — and it does not change while the overview is up, yet
+/// this ran on every hover change. Call `paint_backdrop` when the
+/// overview is built instead.
 pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::overview::OverviewInstance) {
-    paint_backdrop(gpu);
     let dpi = reference_dpi();
     // Shared corner radius for the search panel and the drag ghost.
     let thumb_radius = scaled(8, dpi) as f32;

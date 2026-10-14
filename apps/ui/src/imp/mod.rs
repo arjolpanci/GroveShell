@@ -372,6 +372,18 @@ pub fn main() -> Result<()> {
                 overview_hwnd = create_overview(false).map_err(Error::Windows)?;
                 instance = overview::OverviewInstance::new(overview_hwnd, width, height);
             }
+            // Warm the backdrop now, while nothing is waiting on it. It
+            // is a full-window blurred wallpaper and costs ~62ms, which
+            // was otherwise paid on the first Activities press and made
+            // the first open feel slow in a way later ones did not.
+            if let Some(gpu) = instance.gpu.as_ref() {
+                overview_gpu::paint_backdrop_once(gpu);
+            }
+            // Warm the card-sized wallpaper too. It is scaled on demand
+            // and cached by size, so paying for it here keeps it off the
+            // first Activities press.
+            let (card_rect, _) = overview::card_layout(&monitor.device_name);
+            let _ = overview::wallpaper_hbitmap_for(&monitor.device_name, card_rect);
             overviews.insert(monitor.device_name.clone(), instance);
             // The overview backdrop blur is rendered by us now (a blurred,
             // dimmed wallpaper drawn onto the GPU root surface — see
@@ -1368,7 +1380,11 @@ unsafe extern "system" fn wndproc(
                 // The overview backdrop blur is rendered by us now (see the
                 // note at overview-window creation), driven by the
                 // `overview_blur` mirror updated above — so a live reload
-                // only needs to repaint, not toggle DWM blur-behind.
+                // only needs to repaint, not toggle DWM blur-behind. The
+                // backdrop is painted once per window and cached, so the
+                // gate has to be cleared or the toggle would not show up
+                // until the overview window was recreated.
+                overview::invalidate_cached_overview_paints();
                 for overview_hwnd in &overviews_snapshot {
                     let _ = InvalidateRect(*overview_hwnd, None, true);
                 }
@@ -1384,6 +1400,10 @@ unsafe extern "system" fn wndproc(
             // repaint every shell surface so active dots, focus rings, and
             // toggles pick up the new color live (spec §4.1).
             design::color::refresh_accent();
+            // The workspace strip only repaints when the page count or
+            // current page changes, neither of which an accent change
+            // touches — so clear that gate explicitly.
+            overview::invalidate_cached_overview_paints();
             invalidate_all_shell_windows();
             LRESULT(0)
         }

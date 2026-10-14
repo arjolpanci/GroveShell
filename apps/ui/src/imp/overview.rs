@@ -831,6 +831,9 @@ fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
         if let Some(state) = s.borrow_mut().as_mut() {
             if let Some(ov) = state.overviews.get_mut(monitor) {
                 if let Some(gpu) = ov.gpu.as_mut() {
+                    // Static for the life of the window: painting it per
+                    // rebuild cost 62ms each time, under the pointer.
+                    super::overview_gpu::paint_backdrop_once(gpu);
                     super::overview_gpu::rebuild_cards(gpu, &cards);
                     for card_visual in &gpu.cards {
                         if let Some(card) = cards.iter().find(|c| c.page == card_visual.page) {
@@ -912,6 +915,29 @@ fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
 /// windows live where, all at once. Re-registers live thumbnails from
 /// scratch rather than patching three kinds of drift piecemeal.
 /// No-op if the overview isn't `Open`.
+/// Drops the cached-once backdrop and strip paints on every monitor's
+/// overview, then repaints the ones that are open.
+///
+/// Call it when something those two surfaces depend on changes under
+/// them — a live config reload (`overview_blur`) or an accent change
+/// (the strip's current-workspace outline). Closed overviews need only
+/// the gates cleared: opening one paints both anyway.
+pub(crate) fn invalidate_cached_overview_paints() {
+    let monitors: Vec<String> = STATE.with(|s| {
+        let state = s.borrow();
+        let Some(st) = state.as_ref() else { return Vec::new() };
+        for ov in st.overviews.values() {
+            if let Some(gpu) = ov.gpu.as_ref() {
+                super::overview_gpu::invalidate_cached_paints(gpu);
+            }
+        }
+        st.overviews.keys().cloned().collect()
+    });
+    for monitor in &monitors {
+        rebuild_open_overview_pages(monitor);
+    }
+}
+
 pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
     let overview_hwnd = STATE.with(|s| {
         s.borrow()
@@ -934,6 +960,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         let ov = state.as_mut()?.overviews.get_mut(monitor)?;
         let carousel_offset = ov.carousel.value();
         let gpu = ov.gpu.as_mut()?;
+        super::overview_gpu::paint_backdrop_once(gpu);
         super::overview_gpu::rebuild_cards(gpu, &cards);
         for card_visual in &gpu.cards {
             if let Some(card) = cards.iter().find(|c| c.page == card_visual.page) {
@@ -982,7 +1009,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         super::overview_gpu::paint_dash(gpu, monitor, ov);
         {
             let (pages, current) = strip_pages(monitor);
-            super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+            super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
         }
         Some(())
     });
@@ -1223,7 +1250,7 @@ pub(crate) fn on_overview_click(monitor: &str, x: i32, y: i32) {
                         super::overview_gpu::paint_dash(gpu, monitor, ov);
                         {
                             let (pages, current) = strip_pages(monitor);
-                            super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                            super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
                         }
                         Some(())
                     });
@@ -1594,7 +1621,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 super::overview_gpu::paint_dash(gpu, monitor, ov);
                 {
                     let (pages, current) = strip_pages(monitor);
-                    super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                    super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
                 }
                 if let Some(drag) = ov.window_drag.as_ref() {
                     if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
@@ -1615,7 +1642,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 super::overview_gpu::paint_dash(gpu, monitor, ov);
                 {
                     let (pages, current) = strip_pages(monitor);
-                    super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                    super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
                 }
             }
             MoveKind::Carousel => {}
@@ -1712,7 +1739,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
         super::overview_gpu::paint_dash(gpu, monitor, ov);
         {
             let (pages, current) = strip_pages(monitor);
-            super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+            super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
         }
         Some(())
     });
@@ -1961,7 +1988,7 @@ fn on_window_drop(monitor: &str, drag: WindowDrag, x: i32, y: i32) {
                 super::overview_gpu::paint_dash(gpu, monitor, ov);
                 {
                     let (pages, current) = strip_pages(monitor);
-                    super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                    super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
                 }
                 Some(())
             });
@@ -2291,7 +2318,7 @@ pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
                     super::overview_gpu::paint_dash(gpu, monitor, ov);
                     {
                         let (pages, current) = strip_pages(monitor);
-                        super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                        super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
                     }
                     Some(())
                 });
@@ -2310,7 +2337,7 @@ pub(crate) fn on_overview_char(monitor: &str, ch: u32) {
                     super::overview_gpu::paint_dash(gpu, monitor, ov);
                     {
                         let (pages, current) = strip_pages(monitor);
-                        super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                        super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
                     }
                     Some(())
                 });
@@ -3130,10 +3157,14 @@ thread_local! {
     /// `overview_gpu::paint_backdrop`) is what turns it into a soft,
     /// even, GNOME-style blur — far cheaper and more reliable than a
     /// real Gaussian-blur effect, and it only re-renders when the target
-    /// size changes (once per session in practice). Separate from
-    /// `WALLPAPER_SCALED` so the two caches (card-size vs. tiny-backdrop)
-    /// never evict each other.
-    static WALLPAPER_BACKDROP: RefCell<Option<(i32, i32, isize)>> = const { RefCell::new(None) };
+    /// size changes. Separate from `WALLPAPER_SCALED` so the two caches
+    /// (card-size vs. tiny-backdrop) never evict each other.
+    ///
+    /// It holds several sizes, not one. The workspace strip asks for a
+    /// miniature-sized copy and the backdrop for a tinier one, so a
+    /// single slot made them evict each other and re-render the
+    /// wallpaper on every paint — ~50ms for the strip alone.
+    static WALLPAPER_BACKDROP: RefCell<Vec<(i32, i32, isize)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A tiny, smoothly-downscaled copy of the desktop wallpaper, sized
@@ -3143,16 +3174,10 @@ thread_local! {
 /// a solid dim fill.
 pub(crate) fn backdrop_small_wallpaper(width: i32, height: i32) -> Option<HBITMAP> {
     let (width, height) = (width.max(1), height.max(1));
-    if let Some((w, h, handle)) = WALLPAPER_BACKDROP.with(|c| *c.borrow()) {
-        if w == width && h == height {
-            return Some(HBITMAP(handle as *mut c_void));
-        }
-        // SAFETY: `handle` is an HBITMAP created below on this same
-        // thread and owned exclusively by this cache.
-        unsafe {
-            let _ = DeleteObject(HBITMAP(handle as *mut c_void));
-        }
-        WALLPAPER_BACKDROP.with(|c| *c.borrow_mut() = None);
+    if let Some(handle) = WALLPAPER_BACKDROP.with(|c| {
+        c.borrow().iter().find(|(w, h, _)| *w == width && *h == height).map(|(_, _, hb)| *hb)
+    }) {
+        return Some(HBITMAP(handle as *mut c_void));
     }
 
     let source = wallpaper_bitmap()?;
@@ -3182,7 +3207,19 @@ pub(crate) fn backdrop_small_wallpaper(width: i32, height: i32) -> Option<HBITMA
             return None;
         }
         let handle = bitmap.0 as isize;
-        WALLPAPER_BACKDROP.with(|c| *c.borrow_mut() = Some((width, height, handle)));
+        WALLPAPER_BACKDROP.with(|c| {
+            let mut cache = c.borrow_mut();
+            // A handful of distinct sizes is all this ever sees (the
+            // backdrop's, and one per strip-miniature size). Evict the
+            // oldest beyond that rather than grow without bound.
+            if cache.len() >= 4 {
+                let (_, _, old) = cache.remove(0);
+                // SAFETY: an HBITMAP created by this function and owned
+                // exclusively by this cache.
+                let _ = DeleteObject(HBITMAP(old as *mut c_void));
+            }
+            cache.push((width, height, handle));
+        });
         Some(HBITMAP(handle as *mut c_void))
     }
 }
@@ -3542,7 +3579,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
             super::overview_gpu::paint_dash(gpu, monitor, ov);
             {
                 let (pages, current) = strip_pages(monitor);
-                super::overview_gpu::paint_strip(gpu, monitor, pages, current);
+                super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
             }
         }
         if card_hover_easing || thumb_hover_easing {
