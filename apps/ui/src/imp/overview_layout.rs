@@ -258,6 +258,28 @@ pub(crate) fn thumb_alpha(home: Option<RectF>, p: f64) -> f64 {
     }
 }
 
+/// How much of its slot size a dragged window's ghost is drawn at.
+///
+/// Smaller than the slot so the ghost reads as "picked up and held"
+/// rather than as the preview still sitting in the grid.
+pub(crate) const GHOST_SCALE: f64 = 3.0 / 5.0;
+
+/// Where a dragged window's ghost sits: centred on the cursor at
+/// [`GHOST_SCALE`] of its slot size, shrunk further by `pop` (the
+/// pickup/drop-out animation, 0.0..=1.0).
+///
+/// Shared so the live preview that follows the cursor and the still that
+/// stands in for it land in exactly the same place — they used to be
+/// computed separately, and a ghost drawn in one place while DWM
+/// composited the live window in another is not a thing the user can
+/// make sense of.
+pub(crate) fn ghost_rect(cx: f64, cy: f64, base_w: f64, base_h: f64, pop: f64) -> RectF {
+    let pop = pop.clamp(0.0, 1.0);
+    let w = base_w * GHOST_SCALE * pop;
+    let h = base_h * GHOST_SCALE * pop;
+    RectF::new(cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,4 +487,42 @@ mod tests {
         assert_eq!(thumb_alpha(None, 7.0), 1.0);
     }
 
+    #[test]
+    fn a_ghost_is_centred_on_the_cursor() {
+        let g = ghost_rect(500.0, 400.0, 400.0, 300.0, 1.0);
+        let (cx, cy) = g.center();
+        assert!((cx - 500.0).abs() < 1e-9, "centred horizontally, got {cx}");
+        assert!((cy - 400.0).abs() < 1e-9, "centred vertically, got {cy}");
+    }
+
+    #[test]
+    fn a_ghost_is_drawn_smaller_than_its_slot() {
+        let g = ghost_rect(0.0, 0.0, 400.0, 300.0, 1.0);
+        assert_eq!(g.width(), 400.0 * GHOST_SCALE);
+        assert_eq!(g.height(), 300.0 * GHOST_SCALE);
+        assert!(g.width() < 400.0);
+    }
+
+    /// The pickup pop grows the ghost from nothing, and the drop-out pop
+    /// shrinks it back — both run through `pop`.
+    #[test]
+    fn the_pop_scales_the_ghost_about_the_cursor() {
+        let half = ghost_rect(100.0, 100.0, 400.0, 300.0, 0.5);
+        assert_eq!(half.width(), 400.0 * GHOST_SCALE * 0.5);
+        let (cx, cy) = half.center();
+        assert!((cx - 100.0).abs() < 1e-9, "still centred while popping");
+        assert!((cy - 100.0).abs() < 1e-9);
+
+        let none = ghost_rect(100.0, 100.0, 400.0, 300.0, 0.0);
+        assert_eq!(none.width(), 0.0, "a fully popped-out ghost has no area");
+        assert_eq!(none.height(), 0.0);
+    }
+
+    #[test]
+    fn a_ghost_pop_outside_zero_to_one_is_clamped() {
+        let over = ghost_rect(0.0, 0.0, 400.0, 300.0, 4.0);
+        assert_eq!(over.width(), 400.0 * GHOST_SCALE, "never larger than full");
+        let under = ghost_rect(0.0, 0.0, 400.0, 300.0, -2.0);
+        assert_eq!(under.width(), 0.0, "never inverted");
+    }
 }

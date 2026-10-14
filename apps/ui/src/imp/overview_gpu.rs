@@ -24,9 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use groveshell_motion::{lerp, RectF};
 
 use super::gpu::{self, GpuSurface};
-use super::overview::{
-    CardAnim, ThumbAnim, WINDOW_HOVER_GLOW_DURATION, WINDOW_POP_DURATION,
-};
+use super::overview::{CardAnim, ThumbAnim, WINDOW_HOVER_GLOW_DURATION};
 use super::overview_layout::{layout_for_progress, thumb_alpha, thumb_rect};
 use super::state::{reference_dpi, scaled};
 use super::util::{ease_out, progress_dur};
@@ -783,6 +781,11 @@ pub(crate) fn update_transforms(
     carousel_offset: f64,
     progress: f64,
     thumbs: &[ThumbAnim],
+    // The dragged window and where its ghost is right now, from
+    // `OverviewInstance::ghost`. The live preview of that window is
+    // moved to this rect instead of its grid slot, so what follows the
+    // cursor is the actual window rather than a still of it.
+    ghost: Option<(isize, RectF)>,
 ) {
     let Some(input) = super::overview::layout_input(monitor) else {
         // Monitor vanished mid-frame (hotplug race). Skip the frame
@@ -846,7 +849,15 @@ pub(crate) fn update_transforms(
             // rendering cannot disagree.
             let home = th.home.map(to_rect_f);
             let flown = thumb_rect(home, to_rect_f(th.rect), progress);
-            let tgt = apply(flown);
+            // A dragged window is held by the cursor, not laid out in
+            // the grid, so it skips the carousel/zoom mapping that puts
+            // previews on their card — the ghost rect is already in
+            // screen coordinates.
+            let dragged = ghost.filter(|(h, _)| *h == hwnd).map(|(_, r)| r);
+            let tgt = match dragged {
+                Some(ghost_rect) => ghost_rect,
+                None => apply(flown),
+            };
             // SAFETY: as above.
             unsafe {
                 let _ = visual
@@ -921,6 +932,15 @@ pub(crate) fn update_transforms(
     // still — the renderer fix and this call belong together.
     super::thumbnails::sync(overview_hwnd, &live);
     gpu::commit();
+}
+
+fn rect_f_to_d2d(r: RectF) -> D2D_RECT_F {
+    D2D_RECT_F {
+        left: r.left as f32,
+        top: r.top as f32,
+        right: r.right as f32,
+        bottom: r.bottom as f32,
+    }
 }
 
 fn rect_to_d2d(r: RECT, origin_x: i32, origin_y: i32) -> D2D_RECT_F {
@@ -1131,6 +1151,12 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
     let thumb_radius = scaled(8, dpi) as f32;
 
     gpu::redraw(&gpu.chrome, |ctx: &ID2D1DeviceContext| {
+        // Nothing else clears this surface, and it is drawn on every
+        // frame of a drag at a rect that moves with the cursor. Without
+        // this, each frame's ghost stayed where it was painted and the
+        // drag left a trail of them across the overview.
+        gpu::clear_transparent(ctx);
+
         // The dash lives on its own visual now (see `paint_dash`) so it
         // can slide on the adjustment without repainting this surface.
 
@@ -1178,41 +1204,26 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
             gpu::draw_text(ctx, rect_to_d2d(row, 0, 0), &label, super::design::color::text(), 14.0, false);
         }
 
-        // The ghost itself: a live drag follows the cursor at full size
-        // unless a pickup pop is still growing in (then it scales up
-        // from nothing); once the drag ends, a drop-out pop shrinks it
-        // back to nothing at the frozen release point — mirrors
-        // `overview::paint_overview`'s `ghost` computation exactly.
-        let ghost = if let Some(drag) = ov.window_drag.as_ref() {
-            let scale = match &ov.window_pop_anim {
-                Some(p) if p.growing && p.hwnd == drag.hwnd => {
-                    ease_out(progress_dur(p.started, WINDOW_POP_DURATION))
-                }
-                _ => 1.0,
-            };
-            Some((drag.cur_x, drag.cur_y, drag.base_w, drag.base_h, drag.hwnd, scale))
-        } else {
-            ov.window_pop_anim.as_ref().filter(|p| !p.growing).and_then(|p| {
-                let (x, y) = p.at?;
-                let scale = 1.0 - ease_out(progress_dur(p.started, WINDOW_POP_DURATION));
-                Some((x, y, p.base_w, p.base_h, p.hwnd, scale))
-            })
-        };
-        if let Some((cx, cy, base_w, base_h, ghost_hwnd, scale)) = ghost {
-            if scale > 0.001 {
-                if let Some(scaled_handle) = super::overview::slot_scaled_snapshot(ghost_hwnd, base_w, base_h) {
-                    let gw = ((base_w * 3 / 5) as f64 * scale).round() as i32;
-                    let gh = ((base_h * 3 / 5) as f64 * scale).round() as i32;
-                    let rect = D2D_RECT_F {
-                        left: (cx - gw / 2) as f32,
-                        top: (cy - gh / 2) as f32,
-                        right: (cx + gw / 2) as f32,
-                        bottom: (cy + gh / 2) as f32,
-                    };
+        // The ghost: the window the user is holding. Where DWM can
+        // preview the source live, the ghost *is* that live preview,
+        // positioned by `update_transforms` — it composites above this
+        // surface, so drawing a still here too would only sit behind it.
+        //
+        // This still is the fallback for the windows DWM will not
+        // preview: parked on another workspace, or minimized. Those are
+        // exactly the ones that have a park-time capture to draw.
+        if let Some((ghost_hwnd, rect)) = ov.ghost() {
+            let previewable =
+                super::thumbnails::can_preview(HWND(ghost_hwnd as *mut c_void));
+            if !previewable {
+                let (gw, gh) = (rect.width().round() as i32, rect.height().round() as i32);
+                if let Some(scaled_handle) =
+                    super::overview::slot_scaled_snapshot(ghost_hwnd, gw, gh)
+                {
                     if let Some(bitmap) =
                         gpu::bitmap_from_hbitmap(ctx, HBITMAP(scaled_handle as *mut c_void))
                     {
-                        gpu::draw_rounded_bitmap(ctx, rect, thumb_radius, &bitmap);
+                        gpu::draw_rounded_bitmap(ctx, rect_f_to_d2d(rect), thumb_radius, &bitmap);
                     }
                 }
             }

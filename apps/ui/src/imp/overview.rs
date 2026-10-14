@@ -29,10 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, Se
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     DrawIconEx, FindWindowW, GetClassLongPtrW, GetClientRect, GetForegroundWindow,
-    IsIconic, KillTimer, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
+    KillTimer, SendMessageW, SetForegroundWindow, SetLayeredWindowAttributes, SetTimer,
     ShowWindow, DI_NORMAL, GCLP_HICON, GCLP_HICONSM, HICON, ICON_BIG, ICON_SMALL, LWA_ALPHA,
     SPI_GETDESKWALLPAPER,
-    SW_HIDE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SystemParametersInfoW, WM_GETICON,
+    SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SystemParametersInfoW, WM_GETICON,
 };
 
 use super::bar::{raise_bars_topmost, refresh_bar_indicator};
@@ -43,7 +43,7 @@ use super::gpu;
 use super::monitors::monitors_sorted_by_x;
 use super::quick_settings::hide_quick_settings;
 use super::state::{reference_dpi, scaled, STATE, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS};
-use super::util::{bar_font, draw_text_in, ease_out, force_foreground, progress_dur};
+use super::util::{bar_font, draw_text_in, ease_out, force_foreground, progress_dur, raise_and_activate};
 use super::workspaces::commit_workspace_switch;
 
 /// Below this many pixels of horizontal movement, a press-and-release
@@ -243,6 +243,50 @@ impl OverviewInstance {
             search_query: String::new(),
             gpu: super::overview_gpu::create(hwnd, width, height),
         }
+    }
+
+    /// The dragged window's ghost: which window, and where it is right
+    /// now. `None` when nothing is being dragged and no drop-out pop is
+    /// still shrinking.
+    ///
+    /// A live drag follows the cursor at full size unless a pickup pop is
+    /// still growing in; once the drag ends, the drop-out pop shrinks the
+    /// ghost back to nothing at the frozen release point.
+    ///
+    /// One place computes this because two things consume it — the live
+    /// DWM preview that follows the cursor, and the still that stands in
+    /// for windows DWM cannot preview.
+    pub(crate) fn ghost(&self) -> Option<(isize, groveshell_motion::RectF)> {
+        let (cx, cy, base_w, base_h, hwnd, pop) = match self.window_drag.as_ref() {
+            Some(drag) => {
+                let pop = match &self.window_pop_anim {
+                    Some(p) if p.growing && p.hwnd == drag.hwnd => {
+                        ease_out(progress_dur(p.started, WINDOW_POP_DURATION))
+                    }
+                    _ => 1.0,
+                };
+                (drag.cur_x, drag.cur_y, drag.base_w, drag.base_h, drag.hwnd, pop)
+            }
+            None => {
+                let p = self.window_pop_anim.as_ref().filter(|p| !p.growing)?;
+                let (x, y) = p.at?;
+                let pop = 1.0 - ease_out(progress_dur(p.started, WINDOW_POP_DURATION));
+                (x, y, p.base_w, p.base_h, p.hwnd, pop)
+            }
+        };
+        if pop <= 0.001 {
+            return None;
+        }
+        Some((
+            hwnd,
+            super::overview_layout::ghost_rect(
+                cx as f64,
+                cy as f64,
+                base_w as f64,
+                base_h as f64,
+                pop,
+            ),
+        ))
     }
 }
 
@@ -959,6 +1003,8 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         let mut state = s.borrow_mut();
         let ov = state.as_mut()?.overviews.get_mut(monitor)?;
         let carousel_offset = ov.carousel.value();
+        // Read before `ov.gpu` is borrowed mutably below.
+        let ghost = ov.ghost();
         let gpu = ov.gpu.as_mut()?;
         super::overview_gpu::paint_backdrop_once(gpu);
         super::overview_gpu::rebuild_cards(gpu, &cards);
@@ -981,7 +1027,7 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, 1.0, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, 1.0, thumbs, ghost);
         Some(())
     });
 
@@ -1061,7 +1107,6 @@ pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
         let anchor_target =
             focus_after.or_else(|| previous_still_here.then_some(previous_foreground)).or(any_window_here);
 
-        let _ = anchor_target;
         let ov = state.overviews.get_mut(monitor)?;
 
         if matches!(ov.mode, OverviewMode::Closed) {
@@ -1093,12 +1138,34 @@ pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
         ov.dock_hover = None;
         ov.dock_cursor_x = None;
         ov.search_query.clear();
-        Some(ov.hwnd)
+        Some((ov.hwnd, anchor_target))
     });
 
-    let Some(overview_hwnd) = overview_hwnd else {
+    let Some((overview_hwnd, anchor_target)) = overview_hwnd else {
         return;
     };
+
+    // Bring the window we are closing onto to the front *now*, before
+    // the fade, so the overview eases off a desktop that already looks
+    // the way it will when the animation ends. Doing it only at the end
+    // was what made a window that had not been on top "plop" into place
+    // after the animation instead of rising during it.
+    //
+    // This activates the window, which hands it the foreground while the
+    // overview is still animating. That is safe here — the overview does
+    // not dismiss on deactivation (`WM_ACTIVATE` only auto-hides the
+    // calendar and quick-settings flyouts), and the close is already
+    // committed, so it no longer needs key input. A z-order-only raise
+    // would be gentler but is not available; see `raise_and_activate`.
+    //
+    // `anchor_target`, not `focus_after`: the same fallback chain the
+    // completion handler activates through, so closing onto the
+    // pre-Activities window (clicking empty card space, or tapping Win
+    // again) rises during the animation too, not just an explicitly
+    // clicked preview.
+    if let Some(target) = anchor_target {
+        raise_and_activate(target);
+    }
 
     // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
     unsafe {
@@ -1608,7 +1675,7 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs, ov.ghost());
         match kind {
             MoveKind::Window { old_page } => {
                 // A real window drag: the ghost follows the cursor (root
@@ -1733,7 +1800,7 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs, ov.ghost());
         // Dock hover is root content — repaint the chrome surface.
         super::overview_gpu::paint_root(gpu, monitor, ov);
         super::overview_gpu::paint_dash(gpu, monitor, ov);
@@ -3567,7 +3634,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, progress, thumbs);
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, progress, thumbs, ov.ghost());
         // The drag-pop ghost's scale and the dock's hover-glow both
         // ease continuously while active, so — unlike every other
         // root/card repaint in this module — this one *does* need to
@@ -3697,16 +3764,14 @@ pub(crate) fn on_animation_tick(monitor: &str) {
                     })
                 });
                 if let Some(target) = target {
-                    // SAFETY: `target` was either just clicked (still
-                    // alive) or captured moments ago by `GetForegroundWindow`;
-                    // if it has since been destroyed these calls are
-                    // documented no-ops/failures, not undefined behavior.
-                    unsafe {
-                        if IsIconic(target).as_bool() {
-                            let _ = ShowWindow(target, SW_RESTORE);
-                        }
-                    }
-                    force_foreground(target);
+                    // `close_overview` already did this when the
+                    // animation started, so in the common case this is a
+                    // no-op that just confirms the result. It still has
+                    // to run: a close can reach here without having gone
+                    // through that path (a carousel slide that lands on
+                    // another workspace), and the window may have been
+                    // activated away from in between.
+                    raise_and_activate(target);
                 } else {
                     // Nothing on the workspace we're closing onto to
                     // focus — hand focus to the desktop itself rather

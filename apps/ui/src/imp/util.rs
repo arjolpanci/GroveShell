@@ -5,7 +5,10 @@ use windows::Win32::Graphics::Gdi::HFONT;
 use windows::Win32::Foundation::{COLORREF, HWND};
 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, SetForegroundWindow, ShowWindow,
+    SW_RESTORE,
+};
 
 /// The UI font sized for the bar at `dpi` (caller owns the handle and
 /// must `DeleteObject` it after deselecting).
@@ -80,6 +83,33 @@ pub(crate) fn force_foreground(target: HWND) {
             let _ = AttachThreadInput(this_thread, current_thread, false);
         }
     }
+}
+
+/// Brings `target` to the front for real: un-minimizes it if needed,
+/// then activates it.
+///
+/// Used both when a close *starts* and when it completes, so the window
+/// the overview is closing onto is already frontmost while the overview
+/// fades off it rather than appearing once the animation ends.
+///
+/// Activation is not optional here, and that is worth recording. The
+/// obvious gentler move — `SetWindowPos(HWND_TOP, SWP_NOACTIVATE)`, to
+/// reorder without stealing focus — **does not work** across processes
+/// on Windows 11: the call returns success and sets no error, and the
+/// z-order simply does not change. Measured against two other processes'
+/// windows, both while the target was below the foreground window and
+/// while it was the lowest window on screen. So a window owned by
+/// another process can only be brought to the front by activating it.
+pub(crate) fn raise_and_activate(target: HWND) {
+    // SAFETY: `target`'s validity is the caller's precondition, as for
+    // `force_foreground`; if it has since been destroyed these calls are
+    // documented no-ops/failures rather than undefined behavior.
+    unsafe {
+        if IsIconic(target).as_bool() {
+            let _ = ShowWindow(target, SW_RESTORE);
+        }
+    }
+    force_foreground(target);
 }
 
 /// Simulates "50%-opacity white" over a *known, flat* background color
