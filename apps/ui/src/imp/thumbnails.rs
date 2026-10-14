@@ -173,3 +173,40 @@ pub(crate) fn clear(dest: HWND) {
         }
     });
 }
+
+/// Whether a still capture is worth taking for `source` when the
+/// overview is built.
+///
+/// A window DWM will preview live needs no still: the live thumbnail is
+/// laid over the same rect from the first frame, so the capture is never
+/// seen. Taking one anyway cost ~31ms *per window* on the open path, all
+/// of it blocking the animation's first frame — which is what made
+/// Activities freeze before it appeared.
+///
+/// Everything else does need one: a window parked on another workspace
+/// is hidden and has no live contents, and that still is the only thing
+/// that can represent it.
+pub(crate) fn needs_still_capture(previewable: bool, has_capture: bool) -> bool {
+    !has_capture && !previewable
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn an_on_screen_window_needs_no_still_because_it_gets_a_live_one() {
+        assert!(!needs_still_capture(true, false));
+    }
+
+    #[test]
+    fn a_parked_or_minimized_window_still_needs_one() {
+        assert!(needs_still_capture(false, false));
+    }
+
+    #[test]
+    fn nothing_is_recaptured_when_a_capture_already_exists() {
+        assert!(!needs_still_capture(false, true));
+        assert!(!needs_still_capture(true, true));
+    }
+}

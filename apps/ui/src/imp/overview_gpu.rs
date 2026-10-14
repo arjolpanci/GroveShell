@@ -182,6 +182,19 @@ pub(crate) struct OverviewGpuState {
     /// The workspace thumbnail strip. Same arrangement as `dash`.
     pub(crate) strip: Option<GpuSurface>,
     pub(crate) strip_natural: RectF,
+    /// The hover ring, drawn once at full strength and then *faded* by
+    /// opacity rather than repainted.
+    ///
+    /// It used to be stroked onto the hovered preview's own surface,
+    /// which meant re-stretching that window's capture on every frame of
+    /// the 220ms ease — 5 to 20ms a tick against a 15ms budget, which is
+    /// what made the overview feel heavy. Worse, a preview's surface is
+    /// covered by its live DWM thumbnail, so the ring was invisible for
+    /// every window that was not minimized.
+    pub(crate) glow: Option<GpuSurface>,
+    /// The slot the ring is currently painted for, so it is only
+    /// repainted when the hovered preview actually changes.
+    pub(crate) glow_slot: Option<(isize, RectF)>,
 }
 
 /// Creates the root/chrome surfaces for `hwnd` (both sized to the
@@ -288,6 +301,8 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
         dash_natural: RectF::new(0.0, 0.0, width as f64, height as f64),
         strip,
         strip_natural: RectF::new(0.0, 0.0, width as f64, height as f64),
+        glow: None,
+        glow_slot: None,
     })
 }
 
@@ -344,6 +359,84 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     restack(state);
 }
 
+/// Width of the hover ring, in 96-DPI units.
+pub(crate) const HOVER_RING_DP: i32 = 3;
+
+/// Points the hover ring at `slot` for `hwnd`, painting it only when the
+/// hovered preview has actually changed, and fading it with `intensity`.
+///
+/// `None` fades it out. The ring is drawn into a surface the size of the
+/// slot, so the per-frame cost is one `SetOpacity` — no bitmap work at
+/// all.
+pub(crate) fn set_hover_ring(
+    state: &mut OverviewGpuState,
+    hovered: Option<(isize, RectF)>,
+    intensity: f64,
+) {
+    let Some((hwnd, slot)) = hovered else {
+        if let Some(glow) = state.glow.as_ref() {
+            gpu::set_opacity(glow, 0.0);
+        }
+        state.glow_slot = None;
+        return;
+    };
+
+    let (w, h) = (slot.width().round() as i32, slot.height().round() as i32);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+
+    let changed = state.glow_slot != Some((hwnd, slot));
+    if changed {
+        let reusable = state
+            .glow
+            .as_ref()
+            .is_some_and(|g| g.width() == w && g.height() == h);
+        if !reusable {
+            if let Some(old) = state.glow.as_ref() {
+                // SAFETY: attached by an earlier call; `RemoveVisual` on
+                // a detached visual is a documented no-op.
+                unsafe {
+                    let _ = state.root.visual().RemoveVisual(old.visual());
+                }
+            }
+            state.glow = gpu::create_child_surface(w, h);
+        }
+
+        let Some(glow) = state.glow.as_ref() else { return };
+        let dpi = reference_dpi();
+        let radius = scaled(8, dpi) as f32; // THUMB_CORNER_RADIUS
+        let stroke = scaled(HOVER_RING_DP, dpi) as f32;
+        let full = D2D_RECT_F {
+            left: stroke / 2.0,
+            top: stroke / 2.0,
+            right: w as f32 - stroke / 2.0,
+            bottom: h as f32 - stroke / 2.0,
+        };
+        gpu::redraw(glow, |ctx: &ID2D1DeviceContext| {
+            gpu::clear_transparent(ctx);
+            // Full strength: the ease is carried by the visual's opacity.
+            gpu::stroke_rounded_rect(ctx, full, radius, super::design::color::accent(), 1.0, stroke);
+        });
+        state.glow_slot = Some((hwnd, slot));
+    }
+
+    let Some(glow) = state.glow.as_ref() else { return };
+    // SAFETY: same device and lifetime as `root`.
+    unsafe {
+        let _ = glow
+            .visual()
+            .SetTransform2(&surface_transform(RectF::new(0.0, 0.0, w as f64, h as f64), slot));
+    }
+    gpu::set_opacity(glow, intensity.clamp(0.0, 1.0) as f32);
+    if changed {
+        // SAFETY: as above.
+        unsafe {
+            raise_child(state.root.visual(), glow.visual());
+        }
+    }
+}
+
 /// Re-establishes the composition order, bottom to top: cards, then the
 /// previews sitting on them, then the dash, the strip, and the chrome.
 ///
@@ -364,6 +457,9 @@ fn restack(state: &OverviewGpuState) {
         }
         for thumb in &state.thumbs {
             raise_child(state.root.visual(), thumb.surface.visual());
+        }
+        if let Some(glow) = state.glow.as_ref() {
+            raise_child(state.root.visual(), glow.visual());
         }
         if let Some(dash) = state.dash.as_ref() {
             raise_child(state.root.visual(), dash.visual());
@@ -416,7 +512,7 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim])
             None => match gpu::create_child_surface(w, h) {
                 Some(surface) => {
                     let visual = ThumbVisual { hwnd, page: th.page, natural, surface };
-                    paint_thumb(&visual, &th.title, 0.0);
+                    paint_thumb(&visual, &th.title);
                     visual
                 }
                 None => continue,
@@ -444,7 +540,7 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim])
 /// Paints one preview's surface, once. Mirrors what `paint_card`'s
 /// thumbnail loop used to draw into the card: the window's snapshot
 /// rounded off, or a title chip when no pixels are available.
-pub(crate) fn paint_thumb(thumb: &ThumbVisual, title: &str, hover_intensity: f64) {
+pub(crate) fn paint_thumb(thumb: &ThumbVisual, title: &str) {
     let dpi = reference_dpi();
     let radius = scaled(8, dpi) as f32; // THUMB_CORNER_RADIUS
     let full = D2D_RECT_F {
@@ -478,19 +574,6 @@ pub(crate) fn paint_thumb(thumb: &ThumbVisual, title: &str, hover_intensity: f64
                 gpu::fill_rounded_rect(ctx, full, radius, super::design::color::surface_overlay());
                 gpu::draw_text(ctx, full, title, super::design::color::text(), 13.0, true);
             }
-        }
-        // The hover glow lives on the preview's own surface now. It used
-        // to be drawn into the card, which meant repainting a
-        // screen-sized surface every time the pointer crossed a preview.
-        if hover_intensity > 0.001 {
-            gpu::stroke_rounded_rect(
-                ctx,
-                full,
-                radius,
-                super::design::color::accent(),
-                hover_intensity as f32,
-                2.0,
-            );
         }
     });
 }
@@ -719,13 +802,20 @@ pub(crate) fn update_transforms(
             gpu::set_opacity(&visual.surface, thumb_alpha(home, progress) as f32);
 
             if super::thumbnails::can_preview(th.hwnd) {
+                // Inset by the hover ring's width. DWM composites a live
+                // thumbnail above *all* of this window's own content, so
+                // anything we draw inside the preview's bounds is hidden
+                // by it — which is why the hover ring never appeared on
+                // any window that was not minimized. Leaving this margin
+                // is what gives the ring somewhere to show.
+                let inset = scaled(HOVER_RING_DP, input.dpi) as f64;
                 live.push((
                     th.hwnd,
                     RECT {
-                        left: tgt.left.round() as i32,
-                        top: tgt.top.round() as i32,
-                        right: tgt.right.round() as i32,
-                        bottom: tgt.bottom.round() as i32,
+                        left: (tgt.left + inset).round() as i32,
+                        top: (tgt.top + inset).round() as i32,
+                        right: (tgt.right - inset).round() as i32,
+                        bottom: (tgt.bottom - inset).round() as i32,
                     },
                 ));
             }
@@ -775,7 +865,6 @@ pub(crate) fn update_transforms(
     // the frame path, which silently turned every preview into a frozen
     // still — the renderer fix and this call belong together.
     super::thumbnails::sync(overview_hwnd, &live);
-
     gpu::commit();
 }
 

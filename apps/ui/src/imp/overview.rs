@@ -729,7 +729,13 @@ pub(crate) fn build_carousel_pages(monitor: &str) -> (Vec<CardAnim>, Vec<ThumbAn
             // page) are captured now, while their pixels are still
             // renderable. Failure just means this slot paints as a
             // title chip.
-            if window_snapshot(window.hwnd).is_none() {
+            // Only windows DWM will not preview live need a still; see
+            // `thumbnails::needs_still_capture`. Capturing one for every
+            // window blocked the open path for ~31ms each.
+            if super::thumbnails::needs_still_capture(
+                super::thumbnails::can_preview(source),
+                window_snapshot(window.hwnd).is_some(),
+            ) {
                 capture_window_snapshot(source);
             }
 
@@ -1493,27 +1499,6 @@ fn repaint_card_hover_diff(
 /// change (plain browsing, not dragging) — at most the card holding the
 /// previously-hovered thumbnail and the card holding the newly-hovered
 /// one, deduplicated (usually the same card, meaning one repaint).
-fn repaint_thumb_hover_diff(
-    gpu: &super::overview_gpu::OverviewGpuState,
-    thumbs: &[ThumbAnim],
-    old_hwnd: Option<isize>,
-    new_hwnd: Option<isize>,
-    intensity: f64,
-) {
-    // Each preview owns its surface, so the glow repaints exactly the
-    // two small surfaces that changed — not the card they sit on.
-    for (hwnd, intensity) in [(old_hwnd, 0.0), (new_hwnd, intensity)] {
-        let Some(hwnd) = hwnd else { continue };
-        let Some(visual) = gpu.thumbs.iter().find(|tv| tv.hwnd == hwnd) else { continue };
-        let title = thumbs
-            .iter()
-            .find(|t| t.hwnd.0 as isize == hwnd)
-            .map(|t| t.title.as_str())
-            .unwrap_or("");
-        super::overview_gpu::paint_thumb(visual, title, intensity);
-    }
-}
-
 pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
     enum MoveKind {
         Window { old_page: Option<usize> },
@@ -1729,16 +1714,34 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
             let (pages, current) = strip_pages(monitor);
             super::overview_gpu::paint_strip(gpu, monitor, pages, current);
         }
-        // Thumbnail hover is card content (see `HoverTarget`) — only
-        // the previously- and newly-hovered card (at most two, usually
-        // the same one) are repainted.
-        if let OverviewMode::Live { thumbs, .. } = &ov.mode {
-            let intensity = ov
-                .hover_thumb
-                .map(|(_, started)| ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)))
-                .unwrap_or(0.0);
-            repaint_thumb_hover_diff(gpu, thumbs, old_hover, new_hover, intensity);
-        }
+        Some(())
+    });
+    // The ring is driven separately: it needs the gpu state mutably, and
+    // holding a mutable borrow across the painting above would mean no
+    // other read could run inside it.
+    let _ = old_hover;
+    STATE.with(|s| {
+        let mut state = s.borrow_mut();
+        let ov = state.as_mut()?.overviews.get_mut(monitor)?;
+        let intensity = ov
+            .hover_thumb
+            .map(|(_, started)| ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION)))
+            .unwrap_or(0.0);
+        let hovered = new_hover;
+        let slot = match &ov.mode {
+            OverviewMode::Live { thumbs, .. } => hovered.and_then(|hwnd| {
+                thumbs.iter().find(|t| t.hwnd.0 as isize == hwnd).map(|t| (hwnd, t.rect))
+            }),
+            OverviewMode::Closed => None,
+        };
+        let gpu = ov.gpu.as_mut()?;
+        super::overview_gpu::set_hover_ring(
+            gpu,
+            slot.map(|(hwnd, r)| {
+                (hwnd, groveshell_motion::RectF::new(r.left as f64, r.top as f64, r.right as f64, r.bottom as f64))
+            }),
+            intensity,
+        );
         Some(())
     });
     if gpu_updated.is_none() {
@@ -3543,7 +3546,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
             }
         }
         if card_hover_easing || thumb_hover_easing {
-            if let OverviewMode::Live { thumbs, .. } = &ov.mode {
+            if let OverviewMode::Live { .. } = &ov.mode {
                 let (card_rect, _) = card_layout(monitor);
                 if card_hover_easing {
                     if let Some(page) = ov.window_drag.as_ref().and_then(|d| d.hover_page) {
@@ -3559,18 +3562,45 @@ pub(crate) fn on_animation_tick(monitor: &str) {
                         }
                     }
                 }
-                if thumb_hover_easing {
-                    if let Some((hwnd, started)) = ov.hover_thumb {
-                        let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
-                        repaint_thumb_hover_diff(gpu, thumbs, None, Some(hwnd), intensity);
-                    }
-                }
             }
         }
         Some(())
     });
     if gpu_updated.is_none() {
         repaint_overview(overview_hwnd);
+    }
+
+    // Ease the hover ring. Its surface is already painted, so this is a
+    // single `SetOpacity` per frame — the reason the ring stopped being
+    // a per-tick repaint of the hovered window's capture.
+    if thumb_hover_easing {
+        STATE.with(|s| {
+            let mut state = s.borrow_mut();
+            let ov = state.as_mut()?.overviews.get_mut(monitor)?;
+            let (hwnd, started) = ov.hover_thumb?;
+            let intensity = ease_out(progress_dur(started, WINDOW_HOVER_GLOW_DURATION));
+            let slot = match &ov.mode {
+                OverviewMode::Live { thumbs, .. } => {
+                    thumbs.iter().find(|t| t.hwnd.0 as isize == hwnd).map(|t| t.rect)
+                }
+                OverviewMode::Closed => None,
+            }?;
+            let gpu = ov.gpu.as_mut()?;
+            super::overview_gpu::set_hover_ring(
+                gpu,
+                Some((
+                    hwnd,
+                    groveshell_motion::RectF::new(
+                        slot.left as f64,
+                        slot.top as f64,
+                        slot.right as f64,
+                        slot.bottom as f64,
+                    ),
+                )),
+                intensity,
+            );
+            Some(())
+        });
     }
 
     if !keep_timer {
