@@ -43,7 +43,11 @@ use super::util::{ease_out, progress_dur};
 /// the first attach and every re-raise.
 unsafe fn raise_child(parent: &windows::Win32::Graphics::DirectComposition::IDCompositionVisual2, child: &windows::Win32::Graphics::DirectComposition::IDCompositionVisual2) {
     let _ = parent.RemoveVisual(child);
-    let _ = parent.AddVisual(child, true, None);
+    // `insertAbove = false` with a null reference appends to the end of
+    // the child list, which is what composites on top. Passing `true`
+    // puts it at the *beginning*, i.e. the bottom — which is what hid
+    // every window preview behind its card.
+    let _ = parent.AddVisual(child, false, None);
 }
 
 /// What a preview's surface should actually show.
@@ -337,23 +341,30 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
         }
     }
     state.cards = rebuilt;
-    for card_visual in &state.cards {
-        // SAFETY: both visuals belong to the same `IDCompositionDesktopDevice`;
-        // `root.visual()`/`card_visual.surface.visual()` are alive for as
-        // long as `state` is. `AddVisual` on an already-attached visual is
-        // a harmless no-op.
-        unsafe {
-            raise_child(state.root.visual(), card_visual.surface.visual());
-        }
-    }
-    // Re-insert `chrome` above every card just attached above — each
-    // `AddVisual(_, true, None)` call inserts its visual at the very top
-    // of `root`'s children, so whichever visual is added last ends up on
-    // top; this keeps the dock/search/drag-ghost chrome above every card,
-    // regardless of card add/remove order this call.
-    // SAFETY: both were created alongside `state.root` in `create` and
-    // are alive for as long as `state` is.
+    restack(state);
+}
+
+/// Re-establishes the composition order, bottom to top: cards, then the
+/// previews sitting on them, then the dash, the strip, and the chrome.
+///
+/// One function rather than a re-raise at the end of each rebuild,
+/// because the order is a property of the whole tree and every partial
+/// version of it has been wrong. `rebuild_cards` used to re-raise only
+/// the cards, which lifted them above the previews and hid every one of
+/// them behind an opaque card — visible only for windows that happened
+/// to have a live DWM thumbnail painted over the top, so minimized
+/// windows simply disappeared.
+fn restack(state: &OverviewGpuState) {
+    // SAFETY: every visual here belongs to the same device as `root` and
+    // lives as long as `state`; `raise_child` detaches before attaching,
+    // which is a no-op for a visual with no parent.
     unsafe {
+        for card in &state.cards {
+            raise_child(state.root.visual(), card.surface.visual());
+        }
+        for thumb in &state.thumbs {
+            raise_child(state.root.visual(), thumb.surface.visual());
+        }
         if let Some(dash) = state.dash.as_ref() {
             raise_child(state.root.visual(), dash.visual());
         }
@@ -426,28 +437,8 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim])
         }
     }
 
-    for visual in &rebuilt {
-        // SAFETY: both visuals belong to the same device and outlive this
-        // call; `AddVisual` on an already-attached visual is a no-op.
-        unsafe {
-            raise_child(state.root.visual(), visual.surface.visual());
-        }
-    }
-    // Each `AddVisual(_, true, None)` inserts at the top, so the dash and
-    // then the chrome have to be re-raised above the previews just added
-    // — same reasoning as `rebuild_cards`.
-    // SAFETY: both were created alongside `state.root` and are alive for
-    // as long as `state` is.
-    unsafe {
-        if let Some(dash) = state.dash.as_ref() {
-            raise_child(state.root.visual(), dash.visual());
-        }
-        if let Some(strip) = state.strip.as_ref() {
-            raise_child(state.root.visual(), strip.visual());
-        }
-        raise_child(state.root.visual(), state.chrome.visual());
-    }
     state.thumbs = rebuilt;
+    restack(state);
 }
 
 /// Paints one preview's surface, once. Mirrors what `paint_card`'s
