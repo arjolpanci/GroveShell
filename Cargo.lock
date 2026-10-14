@@ -404,6 +404,7 @@ dependencies = [
  "groveshell-window-model",
  "serde_json",
  "tracing",
+ "windows",
 ]
 
 [[package]]

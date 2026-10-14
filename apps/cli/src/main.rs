@@ -23,6 +23,9 @@ mod imp {
         Ping,
         /// Gracefully stops groveshell-host and groveshell-watchdog, in that order.
         Shutdown,
+        /// Puts the Windows taskbar back the way it was, for when the shell
+        /// was killed rather than shut down and left it auto-hiding.
+        RestoreTaskbar,
         /// Lists eligible top-level windows (the same set the shell manages).
         ListWindows,
         /// Lists connected monitors with their bounds, work areas, and DPI.
@@ -47,6 +50,7 @@ mod imp {
         match cli.command {
             Command::Ping => ping(),
             Command::Shutdown => shutdown(),
+            Command::RestoreTaskbar => restore_taskbar(),
             Command::ListWindows => list_windows(),
             Command::ListMonitors => list_monitors(),
             Command::DumpState => dump_state(),
@@ -237,6 +241,42 @@ mod imp {
             response.sender,
             start.elapsed(),
             response.request_id
+        );
+        Ok(())
+    }
+
+    /// Puts the taskbar back to the state the shell saved before it took
+    /// the screen over.
+    ///
+    /// The shell does this itself at a clean shutdown. This exists for
+    /// when it was killed instead — the saved state outlives the process
+    /// precisely so the taskbar can still be recovered, without having to
+    /// start the shell again just to stop it properly.
+    fn restore_taskbar() -> Result<()> {
+        use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_SETSTATE, APPBARDATA};
+
+        let path = groveshell_common::taskbar_state::path()?;
+        let Some(state) = groveshell_common::taskbar_state::read(&path) else {
+            println!("Nothing to restore: no saved taskbar state at {}.", path.display());
+            println!("Either the shell shut down cleanly, or it never took the taskbar over.");
+            return Ok(());
+        };
+
+        let mut abd = APPBARDATA {
+            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+            lParam: windows::Win32::Foundation::LPARAM(state as isize),
+            ..Default::default()
+        };
+        // SAFETY: plain AppBar state set; `abd` outlives the call.
+        unsafe {
+            SHAppBarMessage(ABM_SETSTATE, &mut abd);
+        }
+        groveshell_common::taskbar_state::clear(&path);
+
+        let auto_hide = state & 0x1 != 0;
+        println!(
+            "Taskbar restored to state {state}{}.",
+            if auto_hide { " (auto-hide, which is what you had)" } else { " (auto-hide off)" }
         );
         Ok(())
     }

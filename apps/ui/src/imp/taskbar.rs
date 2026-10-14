@@ -51,6 +51,9 @@ pub(crate) fn set_taskbar_appbar_state(state: u32) {
     }
 }
 
+
+use groveshell_common::taskbar_state;
+
 /// Takes the screen over from the Windows taskbar, or gives it back.
 ///
 /// Hiding the taskbar window alone isn't enough: its AppBar work-area
@@ -64,17 +67,29 @@ pub(crate) fn set_taskbar_appbar_state(state: u32) {
 /// clean shutdown, and a 1-second watchdog re-hides it if Explorer
 /// re-shows it (see the `CLOCK_TIMER_ID` handler).
 pub(crate) fn set_windows_taskbar_visible(visible: bool) {
+    let path = taskbar_state::path().ok();
     if visible {
-        if let Some(previous) = PREVIOUS_TASKBAR_STATE.with(|s| s.borrow_mut().take()) {
+        // Prefer the persisted value: it is the one that survives a
+        // crash, and it is what a run that inherited someone else's
+        // mess has to go back to.
+        let previous = path
+            .as_deref()
+            .and_then(taskbar_state::read)
+            .or_else(|| PREVIOUS_TASKBAR_STATE.with(|s| s.borrow_mut().take()));
+        if let Some(previous) = previous {
             set_taskbar_appbar_state(previous);
         }
+        PREVIOUS_TASKBAR_STATE.with(|s| *s.borrow_mut() = None);
+        if let Some(path) = path.as_deref() {
+            taskbar_state::clear(path);
+        }
     } else {
-        PREVIOUS_TASKBAR_STATE.with(|s| {
-            let mut slot = s.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(taskbar_appbar_state());
-            }
-        });
+        let saved = path.as_deref().and_then(taskbar_state::read);
+        let remember = taskbar_state::state_to_remember(saved, taskbar_appbar_state());
+        PREVIOUS_TASKBAR_STATE.with(|s| *s.borrow_mut() = Some(remember));
+        if let Some(path) = path.as_deref() {
+            taskbar_state::write(path, remember);
+        }
         set_taskbar_appbar_state(ABS_AUTOHIDE);
     }
     set_taskbar_windows_visible(visible);
