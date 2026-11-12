@@ -3729,7 +3729,24 @@ pub(crate) fn on_animation_tick(monitor: &str) {
 
     if let Some(completion) = completion {
         match completion {
-            Completion::Opened => {}
+            Completion::Opened => {
+                // An overview opened by a gesture was built from a
+                // background message, where the plain
+                // `SetForegroundWindow` in `open_overview_inner` is
+                // refused. It then sat fully open without the keyboard:
+                // typing went to the application underneath instead of
+                // the search field, and Escape did nothing.
+                // SAFETY: a plain query.
+                if unsafe { GetForegroundWindow() } != overview_hwnd {
+                    tracing::debug!("overview.opened: taking the foreground");
+                    super::util::force_foreground(overview_hwnd);
+                    // SAFETY: `overview_hwnd` is a valid, process-lifetime
+                    // window on this thread.
+                    unsafe {
+                        let _ = SetFocus(overview_hwnd);
+                    }
+                }
+            }
             Completion::Closed { focus_after } => {
                 // Drop the live previews before hiding: a registration
                 // left alive keeps DWM compositing a thumbnail over a

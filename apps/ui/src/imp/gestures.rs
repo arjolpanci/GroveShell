@@ -7,6 +7,13 @@
 //! swipe tracker wants — so the same code path serves a real touchpad
 //! gesture and a mouse wheel, with the physics smoothing the wheel's
 //! coarse notches.
+//!
+//! Three- and four-finger swipes come in separately, from `touchpad`,
+//! as real finger travel with a real lift. They drive the same tracker
+//! and the same adjustments, with two differences that follow from
+//! having a finger to watch: nothing times out while the fingers rest,
+//! and the gesture is not gated on what is under the pointer, because a
+//! three-finger swipe is never meant for the application.
 
 use std::cell::RefCell;
 use std::time::Instant;
@@ -16,6 +23,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
 use super::state::{ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, STATE};
+use super::touchpad::{Axis, SwipeEvent};
 
 /// Timer that ends a gesture when scroll events stop arriving. A wheel
 /// has no finger-lift, so idleness is the only available release signal;
@@ -38,6 +46,183 @@ thread_local! {
     /// is folded into the one already running rather than starting a
     /// rival that would fight it for the same adjustment.
     static GESTURE: RefCell<Option<(String, Target, SwipeTracker)>> = const { RefCell::new(None) };
+
+    /// The live finger swipe, if there is one. While it is `Tracked`,
+    /// `GESTURE` holds its tracker and belongs to it: scroll events are
+    /// ignored and the idle timer does not end it.
+    static TOUCH: RefCell<Option<Touch>> = const { RefCell::new(None) };
+}
+
+/// Finger travel for a full overview transition, and for one workspace
+/// page. GNOME's ratio (`TOUCHPAD_BASE_HEIGHT` 300 to
+/// `TOUCHPAD_BASE_WIDTH` 400), at a length that is a comfortable stroke
+/// on a laptop pad rather than its whole height.
+const SWIPE_MM_PER_STATE: f64 = 25.0;
+const SWIPE_MM_PER_PAGE: f64 = 33.0;
+/// Sideways travel that switches workspace when the overview is closed.
+const SWIPE_MM_DESKTOP_SWITCH: f64 = 12.0;
+
+enum Touch {
+    /// Driving the overview or the carousel through `GESTURE`'s tracker.
+    /// `px_per_mm` turns finger travel into tracker pixels, sign
+    /// included.
+    Tracked { monitor: String, px_per_mm: f64 },
+    /// Sideways on the desktop. There is no carousel to slide there, so
+    /// the swipe switches workspace once, when it has gone far enough.
+    DesktopSwitch { travelled_mm: f64, fired: bool },
+    /// A swipe with nothing to do, such as down on the desktop.
+    Ignored,
+}
+
+fn touch_is_tracking() -> bool {
+    TOUCH.with(|t| matches!(t.borrow().as_ref(), Some(Touch::Tracked { .. })))
+}
+
+/// A monitor's size in 96-DPI units. The tracker's velocity thresholds
+/// are GNOME's, which are in logical pixels of travel across the
+/// screen; feeding physical pixels would make a 200% display twice as
+/// eager to fling.
+fn monitor_size_dp(monitor: &str) -> Option<(f64, f64)> {
+    let info = super::monitors::enumerate_monitors().into_iter().find(|m| m.device_name == monitor)?;
+    let scale = 96.0 / info.dpi.max(1) as f64;
+    Some((
+        (info.rect.right - info.rect.left) as f64 * scale,
+        (info.rect.bottom - info.rect.top) as f64 * scale,
+    ))
+}
+
+/// Handles one event from the touchpad recognizer.
+pub(crate) fn on_swipe(event: SwipeEvent) {
+    match event {
+        SwipeEvent::Begin { axis, delta_mm } => {
+            begin_swipe(axis, delta_mm);
+            // The travel that revealed the direction is part of the
+            // gesture, not a dead zone before it.
+            update_swipe(delta_mm);
+        }
+        SwipeEvent::Update { delta_mm } => update_swipe(delta_mm),
+        SwipeEvent::End => end_swipe(),
+    }
+}
+
+fn begin_swipe(axis: Axis, delta_mm: f64) {
+    let Some(monitor) = super::monitors::monitor_under_cursor() else { return };
+    let Some((open, progress, carousel, transition_target)) = STATE.with(|s| {
+        let state = s.borrow();
+        let ov = state.as_ref()?.overviews.get(&monitor)?;
+        Some((
+            !matches!(ov.mode, super::overview::OverviewMode::Closed),
+            ov.adjustment.value(),
+            ov.carousel.value(),
+            ov.adjustment.transition_target(),
+        ))
+    }) else {
+        return;
+    };
+    let Some((width_dp, height_dp)) = monitor_size_dp(&monitor) else { return };
+
+    // Fingers outrank a scroll still coasting to its idle timeout. It is
+    // ended, never just replaced: see `on_scroll` for what a stranded
+    // `gesture_in_progress` does.
+    let scrolling = GESTURE.with(|g| g.borrow().as_ref().map(|(m, _, _)| m.clone()));
+    if let Some(scroll_monitor) = scrolling {
+        release_gesture(&scroll_monitor);
+    }
+
+    let touch = match axis {
+        // Down on the desktop has nowhere to go. Building the overview
+        // only to close it again would flash a full-screen window.
+        Axis::Vertical if !open && delta_mm > 0.0 => Touch::Ignored,
+        Axis::Vertical => {
+            if !open {
+                super::overview::open_overview_at(&monitor, 0.0);
+            }
+            let mut tracker = SwipeTracker::new(InputKind::Touchpad);
+            let cancel = transition_target.unwrap_or_else(|| progress.round());
+            tracker.confirm_swipe(height_dp, vec![0.0, 1.0], progress, cancel);
+            GESTURE.with(|g| *g.borrow_mut() = Some((monitor.clone(), Target::Overview, tracker)));
+            // Up opens: pad y grows downward, progress grows upward.
+            Touch::Tracked { monitor, px_per_mm: -height_dp / SWIPE_MM_PER_STATE }
+        }
+        Axis::Horizontal if open => {
+            let (pages, _) = super::overview::strip_pages(&monitor);
+            let mut tracker = SwipeTracker::new(InputKind::Touchpad);
+            tracker.confirm_swipe(
+                width_dp,
+                super::overview::carousel_snap_points(pages),
+                carousel,
+                carousel.round(),
+            );
+            GESTURE.with(|g| *g.borrow_mut() = Some((monitor.clone(), Target::Carousel, tracker)));
+            // Left brings the next page in, as dragging the cards would.
+            Touch::Tracked { monitor, px_per_mm: -width_dp / SWIPE_MM_PER_PAGE }
+        }
+        Axis::Horizontal => Touch::DesktopSwitch { travelled_mm: 0.0, fired: false },
+    };
+    TOUCH.with(|t| *t.borrow_mut() = Some(touch));
+}
+
+fn update_swipe(delta_mm: f64) {
+    enum Step {
+        Track(String, f64),
+        Switch(i32),
+        Nothing,
+    }
+    // Decide under the borrow, act after it: both actions reach into
+    // `STATE`, and the workspace switch re-enters this module.
+    let step = TOUCH.with(|t| match t.borrow_mut().as_mut() {
+        Some(Touch::Tracked { monitor, px_per_mm }) => Step::Track(monitor.clone(), delta_mm * *px_per_mm),
+        Some(Touch::DesktopSwitch { travelled_mm, fired }) => {
+            *travelled_mm += delta_mm;
+            if !*fired && travelled_mm.abs() >= SWIPE_MM_DESKTOP_SWITCH {
+                *fired = true;
+                Step::Switch(if *travelled_mm < 0.0 { 1 } else { -1 })
+            } else {
+                Step::Nothing
+            }
+        }
+        _ => Step::Nothing,
+    });
+
+    match step {
+        Step::Track(monitor, delta_px) => {
+            let moved = GESTURE.with(|g| {
+                let mut slot = g.borrow_mut();
+                let (m, target, tracker) = slot.as_mut()?;
+                (*m == monitor).then(|| (*target, tracker.append_event(tick_ms(), delta_px)))
+            });
+            let Some((target, value)) = moved else { return };
+            let overview_hwnd = STATE.with(|s| {
+                let mut state_ref = s.borrow_mut();
+                let ov = state_ref.as_mut()?.overviews.get_mut(&monitor)?;
+                match target {
+                    Target::Overview => {
+                        ov.adjustment.set_gesture_in_progress(true);
+                        ov.adjustment.set_value(value);
+                    }
+                    Target::Carousel => ov.carousel.set_value(value),
+                }
+                Some(ov.hwnd)
+            });
+            if let Some(overview_hwnd) = overview_hwnd {
+                // No idle timer: the fingers lifting ends this, however
+                // long they rest first.
+                // SAFETY: a valid, process-lifetime window.
+                unsafe {
+                    SetTimer(overview_hwnd, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS, None);
+                }
+            }
+        }
+        Step::Switch(delta) => super::workspaces::switch_workspace_relative(delta),
+        Step::Nothing => {}
+    }
+}
+
+fn end_swipe() {
+    let touch = TOUCH.with(|t| t.borrow_mut().take());
+    if let Some(Touch::Tracked { monitor, .. }) = touch {
+        finish_gesture(&monitor);
+    }
 }
 
 /// Gesture pixels for one `WM_MOUSEWHEEL` delta. Deliberately *not*
@@ -153,6 +338,11 @@ fn pointer_class() -> String {
 pub(crate) fn on_scroll(wheel_delta: i16, horizontal: bool, time_ms: u64, monitor: &str) {
     let delta = scroll_delta_px(wheel_delta);
     if delta == 0.0 {
+        return;
+    }
+    // The fingers have the gesture; a stray wheel event must not start
+    // a second tracker under them.
+    if TOUCH.with(|t| t.borrow().is_some()) {
         return;
     }
 
@@ -295,6 +485,15 @@ fn release_gesture(monitor: &str) {
             *slot = None;
         }
     });
+    // A finger swipe on this monitor has just lost its tracker. The
+    // fingers may still be down; what they do next is ignored until
+    // they lift.
+    TOUCH.with(|t| {
+        let mut touch = t.borrow_mut();
+        if matches!(touch.as_ref(), Some(Touch::Tracked { monitor: m, .. }) if m == monitor) {
+            *touch = Some(Touch::Ignored);
+        }
+    });
     let hwnd = STATE.with(|s| {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
@@ -321,6 +520,27 @@ pub(crate) fn interrupt(monitor: &str) {
 /// Releases it at the velocity its recent history implies, which is what
 /// turns a flick into a fling.
 pub(crate) fn on_idle_timeout(monitor: &str) {
+    // A timer left over from a scroll must not end a finger swipe that
+    // has since taken the tracker: resting fingers are not a release.
+    if touch_is_tracking() {
+        let hwnd = STATE.with(|s| {
+            s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).map(|ov| ov.hwnd)
+        });
+        if let Some(hwnd) = hwnd {
+            // SAFETY: a valid, process-lifetime window.
+            unsafe {
+                let _ = KillTimer(hwnd, GESTURE_IDLE_TIMER_ID);
+            }
+        }
+        return;
+    }
+    finish_gesture(monitor);
+}
+
+/// Releases the gesture on `monitor` at the velocity its recent history
+/// implies and eases to where that lands. Shared by the scroll path's
+/// idle timeout and a finger swipe's lift.
+fn finish_gesture(monitor: &str) {
     let now_ms = Instant::now();
     let _ = now_ms;
 

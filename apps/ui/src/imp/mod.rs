@@ -38,6 +38,7 @@ mod theme;
 mod tray;
 mod tray_icons;
 mod tooltips;
+mod touchpad;
 mod util;
 mod wifi;
 mod workspaces;
@@ -652,6 +653,10 @@ pub fn main() -> Result<()> {
         // the pointer, and sets the idle timer on that monitor's own
         // overview window.
         gestures::set_gesture_target(primary_bar_hwnd);
+        let touchpad_gestures = STATE
+            .with(|s| s.borrow().as_ref().map(|st| st.config.input.touchpad_gestures))
+            .unwrap_or(true);
+        apply_touchpad_gestures(primary_bar_hwnd, touchpad_gestures);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -791,6 +796,28 @@ const WM_APP_CONFIG_RELOADED: u32 = WM_APP + 1;
 /// hook (which must only enqueue) for the UI thread to turn into gesture
 /// progress. Payload packed by `gestures::pack_scroll`.
 pub(crate) const WM_APP_GESTURE_SCROLL: u32 = WM_APP + 2;
+
+/// Turns three- and four-finger swipes on or off: reading the pad, and
+/// taking those gestures from Windows, go together. Windows keeps its
+/// own swipes unless the pad can actually be read, or the user would
+/// lose them and get nothing back.
+fn apply_touchpad_gestures(target: HWND, enabled: bool) {
+    if enabled && touchpad::register(target) {
+        groveshell_common::touchpad_gestures::suppress();
+    } else {
+        touchpad::unregister();
+        groveshell_common::touchpad_gestures::restore();
+    }
+}
+
+/// Debug builds only: a finger swipe event posted by a test script.
+/// Touchpad contacts cannot be injected (`SendInput` makes mouse events,
+/// not HID reports), so without this the whole path from recognizer to
+/// overview could only be exercised by hand. `wparam` is the event (0
+/// begin vertical, 1 begin horizontal, 2 update, 3 end) and `lparam`
+/// its travel in hundredths of a millimetre.
+#[cfg(debug_assertions)]
+pub(crate) const WM_APP_DEBUG_SWIPE: u32 = WM_APP + 3;
 
 /// Sent by DWM to every top-level window when the user changes their
 /// Windows accent color. Not surfaced by the `windows` crate under a
@@ -1300,6 +1327,29 @@ unsafe extern "system" fn wndproc(
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_INPUT => {
+            for event in touchpad::on_raw_input(lparam) {
+                gestures::on_swipe(event);
+            }
+            // Raw input must still reach `DefWindowProc`, which frees it.
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        #[cfg(debug_assertions)]
+        WM_APP_DEBUG_SWIPE => {
+            use touchpad::{Axis, SwipeEvent};
+            let delta_mm = lparam.0 as f64 / 100.0;
+            let event = match wparam.0 {
+                0 => Some(SwipeEvent::Begin { axis: Axis::Vertical, delta_mm }),
+                1 => Some(SwipeEvent::Begin { axis: Axis::Horizontal, delta_mm }),
+                2 => Some(SwipeEvent::Update { delta_mm }),
+                3 => Some(SwipeEvent::End),
+                _ => None,
+            };
+            if let Some(event) = event {
+                gestures::on_swipe(event);
+            }
+            LRESULT(0)
+        }
         WM_APP_GESTURE_SCROLL => {
             let (wheel, horizontal) = gestures::unpack_scroll(wparam.0);
             let time_ms = lparam.0 as u32 as u64;
@@ -1324,11 +1374,17 @@ unsafe extern "system" fn wndproc(
                 state::set_bar_height_config(new_config.appearance.top_bar_height as i32);
                 state::set_compat_a11y_config(new_config.appearance.high_contrast, &new_config.compatibility.ignore);
                 state::set_overview_appearance(new_config.appearance.overview_blur, &new_config.appearance.dock_mode);
-                STATE.with(|s| {
-                    if let Some(state) = s.borrow_mut().as_mut() {
-                        state.config = new_config;
-                    }
+                let touchpad_gestures = new_config.input.touchpad_gestures;
+                let touchpad_was = STATE.with(|s| {
+                    let mut state = s.borrow_mut();
+                    let state = state.as_mut()?;
+                    let was = state.config.input.touchpad_gestures;
+                    state.config = new_config;
+                    Some(was)
                 });
+                if touchpad_was.is_some_and(|was| was != touchpad_gestures) {
+                    apply_touchpad_gestures(hwnd, touchpad_gestures);
+                }
                 // Re-run blur (idempotent: re-enabling an already-enabled
                 // blur, or "enabling" with fEnable now false via a second
                 // DwmEnableBlurBehindWindow call, both work correctly).
@@ -1522,6 +1578,7 @@ unsafe extern "system" fn wndproc(
                 if is_primary {
                     uninstall_win_event_hooks();
                     uninstall_move_size_hooks();
+                    apply_touchpad_gestures(hwnd, false);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_WS_PREV);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_WS_NEXT);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_MOVE_WIN_PREV);

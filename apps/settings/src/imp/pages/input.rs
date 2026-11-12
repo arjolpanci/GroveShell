@@ -12,6 +12,7 @@ const ROW_OVERVIEW_MODIFIER: u32 = 1;
 const ROW_MOVE_MODIFIER: u32 = 2;
 const ROW_MOVE_BUTTON: u32 = 3;
 const ROW_RESIZE_BUTTON: u32 = 4;
+const ROW_TOUCHPAD_GESTURES: u32 = 5;
 /// Hot-corner rows are `ROW_CORNER_BASE + index into CORNERS`.
 const ROW_CORNER_BASE: u32 = 10;
 
@@ -100,11 +101,25 @@ impl Page for InputPage {
                         selected: option_index(&BUTTON_OPTIONS, &config.input.resize_button, 1),
                     }),
             ]),
+            Card::with_caption(
+                "Touchpad",
+                vec![Row::new(ROW_TOUCHPAD_GESTURES, "Three- and four-finger swipes")
+                    .with_description(
+                        "Swipe up for Activities and sideways for workspaces. Turns off Windows' own swipes while GroveShell runs",
+                    )
+                    .with_glyph(glyph::INPUT)
+                    .with_control(Control::Toggle { on: config.input.touchpad_gestures })],
+            ),
             Card::with_caption("Hot corners", corners),
         ]
     }
 
-    fn on_activate(&mut self, _id: u32) {}
+    fn on_activate(&mut self, id: u32) {
+        if id == ROW_TOUCHPAD_GESTURES {
+            let current = config_store::current().input.touchpad_gestures;
+            config_store::update(|c| c.input.touchpad_gestures = !current);
+        }
+    }
 
     fn on_value(&mut self, id: u32, value: f32) {
         let index = value.max(0.0) as usize;

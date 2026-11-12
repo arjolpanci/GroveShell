@@ -61,6 +61,10 @@ pub struct InputConfig {
     pub move_button: String,
     pub resize_button: String,
     pub overview_modifier: String,
+    /// Three- and four-finger touchpad swipes drive Activities and
+    /// workspaces. While on, Windows' own versions of those gestures
+    /// are switched off, since both would otherwise fire together.
+    pub touchpad_gestures: bool,
 }
 
 impl Default for InputConfig {
@@ -70,6 +74,7 @@ impl Default for InputConfig {
             move_button: "Left".to_string(),
             resize_button: "Right".to_string(),
             overview_modifier: "Super".to_string(),
+            touchpad_gestures: true,
         }
     }
 }
