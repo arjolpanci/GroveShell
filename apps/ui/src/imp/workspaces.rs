@@ -220,17 +220,19 @@ pub(crate) fn switch_workspace_relative(delta: i32) {
     }
 }
 
-/// `Ctrl+Alt+Shift+Left/Right` — sends the foreground window away into
-/// the dynamic (non-monitor) tail and parks it immediately (the user
-/// stays on their current monitor; only the window leaves). `delta`'s
-/// *sign* doesn't actually matter: a focused window can only ever be on
-/// a pinned monitor workspace (it has to be visible to be focused, and
-/// only monitor workspaces are ever really visible), and there's no
-/// meaningful "direction" for leaving a monitor — it always lands on
-/// the first dynamic workspace either way. No-op if nothing eligible is
-/// focused (including any of this shell's own windows).
+/// `Ctrl+Alt+Shift+Left/Right` — sends the foreground window to the
+/// workspace `delta` positions from the one it is on and parks it (the
+/// user stays where they are; only the window leaves). No-op if nothing
+/// eligible is focused (including any of this shell's own windows), or
+/// if there is no workspace in that direction.
+///
+/// This used to ignore `delta` and always target the first dynamic
+/// workspace, on the theory that a focused window can only be on the
+/// monitor's own workspace. It cannot: switching to a dynamic workspace
+/// shows its windows, and from there the "move" targeted the workspace
+/// the window was already on and parked it anyway — off-screen, yet
+/// still assigned to the workspace on screen.
 pub(crate) fn move_focused_window_relative(delta: i32) {
-    let _ = delta;
     // SAFETY: no preconditions.
     let fg = unsafe { GetForegroundWindow() };
     if fg.0.is_null() || role_of(fg) != Role::Other {
@@ -245,8 +247,11 @@ pub(crate) fn move_focused_window_relative(delta: i32) {
         let mut state_ref = s.borrow_mut();
         let state = state_ref.as_mut()?;
         let tracker = state.workspaces.get_mut(&monitor)?;
-        let target = tracker.pinned_count();
-        tracker.move_window_to_index(hwnd, target)
+        let from = tracker.workspace_of(hwnd)?;
+        let to = tracker.move_window_relative(hwnd, delta)?;
+        // Clamped at either end: the window has not gone anywhere, so
+        // parking it would strand it.
+        (to != from).then_some(to)
     });
     if moved.is_some() {
         park_window(fg);
