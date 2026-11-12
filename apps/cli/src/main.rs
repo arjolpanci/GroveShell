@@ -255,6 +255,13 @@ mod imp {
     fn restore_taskbar() -> Result<()> {
         use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_SETSTATE, APPBARDATA};
 
+        // The same unclean exit that strands the taskbar leaves Windows'
+        // three- and four-finger swipes switched off.
+        match groveshell_common::touchpad_gestures::restore() {
+            Some(settings) => println!("Touchpad gestures restored: {settings:?}."),
+            None => println!("Touchpad gestures: nothing to restore."),
+        }
+
         let path = groveshell_common::taskbar_state::path()?;
         let Some(state) = groveshell_common::taskbar_state::read(&path) else {
             println!("Nothing to restore: no saved taskbar state at {}.", path.display());
