@@ -245,6 +245,19 @@ impl OverviewInstance {
         }
     }
 
+    /// Drops the preview hover, ring included.
+    ///
+    /// `hover_thumb` and the ring's visual are two halves of one state.
+    /// Clearing only the field left the ring painted at its last rect —
+    /// and stuck there, because the next pointer move saw "no hover
+    /// before, no hover now" and had nothing to update.
+    pub(crate) fn clear_thumb_hover(&mut self) {
+        self.hover_thumb = None;
+        if let Some(gpu) = self.gpu.as_mut() {
+            super::overview_gpu::set_hover_ring(gpu, None, 0.0);
+        }
+    }
+
     /// The dragged window's ghost: which window, and where it is right
     /// now. `None` when nothing is being dragged and no drop-out pop is
     /// still shrinking.
@@ -1134,7 +1147,7 @@ pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
         ov.carousel_close_after = None;
         ov.window_drag = None;
         ov.window_pop_anim = None;
-        ov.hover_thumb = None;
+        ov.clear_thumb_hover();
         ov.dock_hover = None;
         ov.dock_cursor_x = None;
         ov.search_query.clear();
@@ -1447,7 +1460,7 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
         if let Some(index) = dock_hit {
             let is_pinned = ov.dock_apps.get(index).is_some_and(|a| a.launch_path.is_some());
             if is_pinned {
-                ov.hover_thumb = None;
+                ov.clear_thumb_hover();
                 ov.dock_drag = Some(super::dock::DockDrag {
                     start_x: x,
                     start_y: y,
@@ -1480,7 +1493,7 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
         };
         // Either kind of drag replaces the plain-hover glow with its
         // own hover feedback (per-window ghost/pop, or per-card glow).
-        ov.hover_thumb = None;
+        ov.clear_thumb_hover();
         match thumb {
             Some((hwnd, from_page, base_w, base_h)) => {
                 ov.window_drag = Some(WindowDrag {
