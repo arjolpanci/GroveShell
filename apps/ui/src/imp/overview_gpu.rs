@@ -55,6 +55,8 @@ pub(crate) enum PreviewSource {
     Snapshot,
     /// A rounded chip with the window's title.
     TitleChip,
+    /// A plain opaque plate, for a window DWM is previewing live.
+    Backing,
 }
 
 /// Decides between them.
@@ -64,8 +66,18 @@ pub(crate) enum PreviewSource {
 /// anyway put a large grey gradient block where a preview should be —
 /// and because a minimized window also gets no *live* DWM thumbnail
 /// laid over the top, nothing ever corrected it.
-pub(crate) fn preview_source(iconic: bool, has_snapshot: bool) -> PreviewSource {
-    if has_snapshot && !iconic {
+///
+/// A window with a live thumbnail gets neither. The thumbnail covers the
+/// surface, but not opaquely: a Mica title bar comes through translucent.
+/// Whatever is drawn here shows through it, and a capture is the wrong
+/// thing to show — it is of the whole window where the live thumbnail is
+/// of the client area, so the two never line up and every label in the
+/// title bar appeared twice. The capture is also as old as the last time
+/// the window was parked.
+pub(crate) fn preview_source(live: bool, iconic: bool, has_snapshot: bool) -> PreviewSource {
+    if live {
+        PreviewSource::Backing
+    } else if has_snapshot && !iconic {
         PreviewSource::Snapshot
     } else {
         PreviewSource::TitleChip
@@ -139,6 +151,10 @@ pub(crate) struct ThumbVisual {
     pub(crate) hwnd: isize,
     pub(crate) page: usize,
     pub(crate) natural: RectF,
+    /// Whether the surface was painted for a window with a live
+    /// thumbnail. A window that has since been parked or shown needs
+    /// repainting, not reusing: the two paint different things.
+    pub(crate) live: bool,
     pub(crate) surface: GpuSurface,
 }
 
@@ -506,17 +522,18 @@ pub(crate) fn rebuild_thumbs(state: &mut OverviewGpuState, thumbs: &[ThumbAnim])
             continue;
         }
 
+        let live = super::thumbnails::can_preview(th.hwnd);
         let reused = take_reusable(
             &mut old,
             |tv| tv.hwnd == hwnd && tv.page == th.page,
-            |tv| tv.surface.width() == w && tv.surface.height() == h,
+            |tv| tv.surface.width() == w && tv.surface.height() == h && tv.live == live,
         );
 
         let visual = match reused {
             Some(tv) => tv,
             None => match gpu::create_child_surface(w, h) {
                 Some(surface) => {
-                    let visual = ThumbVisual { hwnd, page: th.page, natural, surface };
+                    let visual = ThumbVisual { hwnd, page: th.page, natural, live, surface };
                     paint_thumb(&visual, &th.title);
                     visual
                 }
@@ -560,7 +577,7 @@ pub(crate) fn paint_thumb(thumb: &ThumbVisual, title: &str) {
         windows::Win32::UI::WindowsAndMessaging::IsIconic(HWND(thumb.hwnd as *mut c_void)).as_bool()
     };
     let has_snapshot = super::overview::window_snapshot(thumb.hwnd).is_some();
-    let source = preview_source(iconic, has_snapshot);
+    let source = preview_source(thumb.live, iconic, has_snapshot);
 
     gpu::redraw(&thumb.surface, |ctx: &ID2D1DeviceContext| {
         // The surface is rounded off, so its corners must start empty.
@@ -572,12 +589,16 @@ pub(crate) fn paint_thumb(thumb: &ThumbVisual, title: &str) {
                 thumb.natural.height().round() as i32,
             ),
             PreviewSource::TitleChip => None,
+            PreviewSource::Backing => {
+                gpu::fill_rounded_rect(ctx, full, radius, super::design::color::surface_base());
+                return;
+            }
         };
         match snapshot.and_then(|h| gpu::bitmap_from_hbitmap(ctx, HBITMAP(h as *mut c_void))) {
             Some(bitmap) => gpu::draw_rounded_bitmap(ctx, full, radius, &bitmap),
             None => {
                 gpu::fill_rounded_rect(ctx, full, radius, super::design::color::surface_overlay());
-                gpu::draw_text(ctx, full, title, super::design::color::text(), 13.0, true);
+                gpu::draw_text(ctx, full, title, super::design::color::text(), scaled(13, dpi) as f32, true);
             }
         }
     });
@@ -1172,7 +1193,14 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
         } else {
             format!("Search: {}", ov.search_query)
         };
-        gpu::draw_text(ctx, rect_to_d2d(rows[0], 0, 0), &header_text, super::design::color::text_muted(), 14.0, false);
+        // Text sizes are in pixels, so they scale like every other
+        // metric here. Unscaled, the panel's text was half its intended
+        // size on a 200% display.
+        let text_px = scaled(14, dpi) as f32;
+        let pad = scaled(14, dpi);
+        let mut header = rows[0];
+        header.left += pad;
+        gpu::draw_text(ctx, rect_to_d2d(header, 0, 0), &header_text, super::design::color::text_muted(), text_px, false);
         let icon_size = scaled(super::overview::SEARCH_ICON_SIZE, dpi);
         let icon_gap = scaled(super::overview::SEARCH_ICON_TEXT_GAP, dpi);
         for (i, result) in results.iter().enumerate() {
@@ -1181,6 +1209,7 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                 super::overview::SearchResult::App { name, .. } => format!("{name}  (launch)"),
             };
             let mut row = rows[i + 1];
+            row.left += pad;
             if let Some(icon) = super::overview::search_result_icon(result) {
                 let icon_y = row.top + ((row.bottom - row.top) - icon_size) / 2;
                 let icon_rect = RECT {
@@ -1201,7 +1230,7 @@ pub(crate) fn paint_root(gpu: &OverviewGpuState, monitor: &str, ov: &super::over
                 }
                 row.left += icon_size + icon_gap;
             }
-            gpu::draw_text(ctx, rect_to_d2d(row, 0, 0), &label, super::design::color::text(), 14.0, false);
+            gpu::draw_text(ctx, rect_to_d2d(row, 0, 0), &label, super::design::color::text(), text_px, false);
         }
 
         // The ghost: the window the user is holding. Where DWM can
@@ -1258,7 +1287,7 @@ mod preview_source_tests {
 
     #[test]
     fn an_on_screen_window_with_a_capture_shows_it() {
-        assert_eq!(preview_source(false, true), PreviewSource::Snapshot);
+        assert_eq!(preview_source(false, false, true), PreviewSource::Snapshot);
     }
 
     /// A minimized window has no rendered content, so the capture taken
@@ -1266,13 +1295,22 @@ mod preview_source_tests {
     /// sitting where a preview should be.
     #[test]
     fn a_minimized_window_shows_its_title_not_its_blank_capture() {
-        assert_eq!(preview_source(true, true), PreviewSource::TitleChip);
+        assert_eq!(preview_source(false, true, true), PreviewSource::TitleChip);
     }
 
     #[test]
     fn no_capture_means_the_title_whatever_the_window_is_doing() {
-        assert_eq!(preview_source(false, false), PreviewSource::TitleChip);
-        assert_eq!(preview_source(true, false), PreviewSource::TitleChip);
+        assert_eq!(preview_source(false, false, false), PreviewSource::TitleChip);
+        assert_eq!(preview_source(false, true, false), PreviewSource::TitleChip);
+    }
+
+    /// File Explorer's title bar is Mica, so its live thumbnail is
+    /// translucent there. With a park-time capture underneath, "This PC"
+    /// read twice, a few pixels apart.
+    #[test]
+    fn a_live_window_gets_a_plain_plate_even_when_a_capture_exists() {
+        assert_eq!(preview_source(true, false, true), PreviewSource::Backing);
+        assert_eq!(preview_source(true, false, false), PreviewSource::Backing);
     }
 }
 
