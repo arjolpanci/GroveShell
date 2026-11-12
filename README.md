@@ -4,67 +4,104 @@
 
 # GroveShell
 
-A workspace-focused desktop shell for Windows 11. Organize your apps across
-independent workspaces, find anything from Activities, and keep everyday
-controls within reach in a compact top bar.
+GroveShell is an experimental desktop shell for Windows 11. It hides the
+taskbar and puts a top bar, per-monitor workspaces, and a GNOME-style
+Activities overview in its place.
 
-GroveShell is written in Rust using Win32. It runs alongside Explorer and
-restores the Windows taskbar and your windows when you quit. It is experimental
-software; keep the recovery instructions below handy when trying a new build.
+It is written in Rust against Win32 and runs alongside Explorer. Quitting
+it restores the Windows taskbar and your windows. Because it is
+experimental, keep the [recovery instructions](#recovery-and-diagnostics)
+handy when you try a new build.
 
 ![The Activities overview](media/activities-overview.png)
 
-## Your desktop, organized
+## Activities and workspaces
 
-Open **Activities** to see your workspaces, live window previews, app search,
-and a dock with your pinned and running apps. Click a preview to focus it,
-search by typing, or drag a window onto another workspace card.
+Tap the Windows key to open Activities. The overview shows the current
+workspace with a live preview of each window, a strip of workspace
+thumbnails above it, a search field, and a dock with your pinned and
+running apps. Click a preview to focus that window, type to search, or drag
+a preview onto another workspace.
 
-Each monitor has its own workspace set. Switching on one display leaves the
-others alone. An empty workspace is always waiting at the end, and connecting
-or disconnecting a monitor moves windows into a usable workspace automatically.
+![Dragging a window to another workspace](media/workspace-drag.png)
 
-![Dragging between workspaces](media/workspace-drag.png)
+Each monitor has its own set of workspaces, so switching on one display
+leaves the others alone. The last workspace in the set is always empty.
+When you connect or disconnect a monitor, GroveShell moves the affected
+windows into a workspace you can reach.
 
-## A top bar for everyday tasks
+## Motion
 
-Every monitor gets Activities and workspace indicators. The primary display
-also has a clock and calendar, system status, settings, a power menu, and
-access to the Windows notification area.
+Opening and closing Activities is one continuous motion, not a fade on a
+fixed timer. Each window travels from where it sits on screen into its slot
+in the grid, the dock slides up from below, and the thumbnail strip drops in
+from above. You can stop the motion halfway and reverse it.
 
-The **control center** provides Wi-Fi, Bluetooth, appearance, radio controls,
-mute, and a draggable volume slider. Split-button arrows open additional
-options: an in-panel Wi-Fi network list and saved connections, Bluetooth pairing,
-themes, Windows airplane mode, audio devices, and the volume mixer. Network
-selection for saved profiles happens inside GroveShell, with signal strength,
-disconnect, refresh, and scrolling. New-network setup and password entry use
-Windows' own connection UI; GroveShell does not collect or store Wi-Fi passwords.
+A two-finger touchpad scroll or the mouse wheel drives the overview
+transition and the workspace carousel, and a fling lands where its momentum
+carries it. Every animated surface is computed from one progress value per
+monitor, which is why the pieces stay in step. The
+[motion design notes](docs/design/2026-10-13-gnome-motion-port-design.md)
+explain the approach.
 
-The panel uses Segoe UI, rounded surfaces, the Windows accent color, hover
-and keyboard focus feedback, and fade transitions that respect reduced
-motion. Radio operations run in the background so they do not block painting.
-Tab moves between controls, Enter or Space activates them, and arrow keys
-adjust the focused volume slider. Escape goes back from options or dismisses
-the panel.
+## Top bar
 
-Promoted notification icons are captured before Explorer's taskbar is hidden
-and displayed in the primary bar. Left-click invokes
-the app; right-click requests its context menu. The chevron opens Windows'
-hidden icons. Windows 11 stops rendering its XAML tray while hidden, so inline
-images retain their last captured appearance. New icons and badge changes
-require another capture while Explorer's taskbar is visible, or a shell restart.
+Every monitor gets an Activities button and workspace indicators. The
+primary display also has a clock and calendar, system status, settings, a
+power menu, and access to the Windows notification area.
 
-## Make it yours
+![The calendar flyout](media/calendar.png)
 
-Open the gear in the top bar to configure bar height, dock placement and
-behavior, overview appearance, input, and accessibility. Choose an
-overview-only dock, an always-visible dock, or an auto-hiding desktop dock.
-Appearance changes apply while GroveShell is running.
+### Control center
+
+The control center has tiles for Wi-Fi, Bluetooth, appearance, and radios,
+plus mute and a draggable volume slider. The arrow on each split button
+opens more options: a Wi-Fi network list with saved connections, Bluetooth
+pairing, themes, Windows airplane mode, audio devices, and the volume mixer.
+
+![The control center](media/control-center.png)
+
+You pick a saved Wi-Fi network inside GroveShell. The list shows signal
+strength and supports disconnect, refresh, and scrolling. Setting up a new
+network and entering its password go through Windows' own connection UI.
+GroveShell does not collect or store Wi-Fi passwords.
+
+The panel uses Segoe UI, rounded surfaces, and the Windows accent color. It
+shows hover and keyboard focus, and its fade transitions respect reduced
+motion. Radio operations run in the background so they do not block
+painting.
+
+Keyboard control:
+
+- Tab moves between controls.
+- Enter or Space activates the focused control.
+- The arrow keys adjust the volume slider when it has focus.
+- Escape goes back from an options page, or closes the panel.
+
+### Notification area
+
+GroveShell captures the promoted notification icons before it hides
+Explorer's taskbar and shows them in the primary bar. Left-click invokes the
+app, right-click requests its context menu, and the chevron opens Windows'
+hidden icons.
+
+Windows 11 stops rendering its XAML tray while the taskbar is hidden, so the
+inline images keep their last captured appearance. New icons and badge
+changes need another capture while Explorer's taskbar is visible, or a shell
+restart.
+
+## Settings
+
+The gear in the top bar opens settings for bar height, dock placement and
+behavior, overview appearance, input, and accessibility. The dock can appear
+only in the overview, stay visible on the desktop, or auto-hide on the
+desktop. Appearance changes apply while GroveShell is running.
 
 The shell follows the Windows accent color and supports high contrast,
 reduced motion, and per-monitor DPI scaling. Compatibility rules can exclude
-apps from workspace management. See the [compatibility notes](docs/compatibility.md)
-for tested configurations and remaining hardware checks.
+apps from workspace management. The
+[compatibility notes](docs/compatibility.md) list the tested configurations
+and the hardware checks still to do.
 
 ## Keyboard and mouse
 
@@ -80,8 +117,8 @@ for tested configurations and remaining hardware checks.
 
 ## Build and run
 
-Requires **Windows 11 x64** and **Rust stable** with the MSVC toolchain and
-Windows SDK / Visual Studio C++ build tools.
+You need Windows 11 x64 and Rust stable with the MSVC toolchain, plus the
+Windows SDK and the Visual Studio C++ build tools.
 
 ```powershell
 cargo build --workspace
@@ -89,9 +126,10 @@ cargo test --workspace
 .\scripts\dev-start.ps1
 ```
 
-The development launcher builds the workspace and starts the watchdog, host,
-and UI in the background, with a dashboard for status and graceful shutdown.
-Use graceful shutdown to restore the taskbar, work areas, and parked windows.
+`dev-start.ps1` builds the workspace and starts the watchdog, host, and UI
+in the background. It then shows a dashboard with process status and a
+graceful shutdown command. Use graceful shutdown to restore the taskbar,
+work areas, and parked windows.
 
 ## Recovery and diagnostics
 
@@ -101,37 +139,40 @@ If the shell becomes unresponsive, run:
 .\scripts\recover.ps1
 ```
 
-Recovery stops GroveShell processes and ensures Explorer is running without
-depending on a working GroveShell binary. Starting and gracefully quitting
-GroveShell also repairs a taskbar left hidden by a hard kill.
+The script stops GroveShell processes and makes sure Explorer is running. It
+does not depend on a working GroveShell binary. Starting GroveShell, or
+quitting it gracefully, also repairs a taskbar left hidden by a hard kill.
 
-The host and watchdog monitor process health. Structured, rotating logs live
-in `%LOCALAPPDATA%\GroveShell\logs\`. The CLI provides `ping`, `shutdown`,
-`list-windows`, `list-monitors`, and `diagnostics`; diagnostics support
-window-title redaction. Telemetry is off by default.
+The host and watchdog monitor process health. Structured, rotating logs are
+written to `%LOCALAPPDATA%\GroveShell\logs\`. The CLI has `ping`,
+`shutdown`, `list-windows`, `list-monitors`, and `diagnostics` commands, and
+`diagnostics` can redact window titles. Telemetry is off by default.
 
 ## Current limitations
 
 - Workspace assignments do not persist across restarts.
-- The radio tile switches available radios together; it is not Windows'
-  airplane-mode flag. Its options open the actual Windows setting.
+- The radio tile switches the available radios together. It is not Windows'
+  airplane-mode flag; its options page opens the actual Windows setting.
 - Brightness, Night Light, and Do Not Disturb are not integrated controls.
-- Tray images are snapshots; app menu behavior varies across Explorer builds.
-- Wi-Fi enumeration can require Windows location permission. The panel keeps
-  access to Windows' network UI available when enumeration is denied.
-- Full Narrator, mixed-monitor hardware, and long-soak validation remain
-  ongoing. Painted keyboard controls do not yet expose a complete UI
+- Tray images are snapshots, and app menu behavior varies across Explorer
+  builds.
+- Wi-Fi enumeration can require Windows location permission. If it is
+  denied, the panel still gives access to Windows' network UI.
+- Three-finger touchpad swipes are not supported.
+- Testing with Narrator, on mixed-monitor hardware, and over long sessions
+  is not finished. Painted keyboard controls do not yet expose a complete UI
   Automation accessibility tree.
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidance,
-[the design document](docs/PROJECT_PLAN.md) for architecture and future work,
-and [architecture decisions](docs/adr/) for the reasoning behind the design.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers how to contribute.
+[The design document](docs/PROJECT_PLAN.md) describes the architecture and
+future work, and the [architecture decisions](docs/adr/) record the
+reasoning behind the design.
 
 GroveShell takes workflow inspiration from GNOME Shell, using no GNOME code,
 assets, or branding. It is not affiliated with or endorsed by the GNOME
 Foundation. Interface icons are from [Lucide](https://lucide.dev), with their
-license included in `apps/ui/resources/icons/NOTICE.md`.
+license included in `crates/ui-kit/resources/icons/NOTICE.md`.
 
 Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
