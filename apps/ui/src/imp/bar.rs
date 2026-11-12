@@ -119,9 +119,11 @@ pub(super) fn tray_chevron_rect(session_rect: RECT, dpi: u32, bar_h: i32) -> REC
     RECT { left: session_rect.left - gap - w, top: 0, right: session_rect.left - gap, bottom: bar_h }
 }
 
+/// Sixteen units square: the size applications draw their notification
+/// icons at, so the picture they send is shown pixel for pixel.
 pub(super) fn tray_icon_rect(chevron: RECT, dpi: u32, index: usize) -> RECT {
-    let size = scaled(20, dpi);
-    let right = chevron.left - scaled(6, dpi) - index as i32 * scaled(26, dpi);
+    let size = scaled(16, dpi);
+    let right = chevron.left - scaled(6, dpi) - index as i32 * scaled(24, dpi);
     let top = (chevron.bottom - size) / 2;
     RECT { left: right - size, top, right, bottom: top + size }
 }
@@ -685,8 +687,7 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
                     right: bar_left + chevron.right,
                     bottom: bar_bottom,
                 };
-                if super::tray::overflow_available() { super::tray::toggle_overflow(screen, bar_left, bar_right); }
-                else { super::tray_icons::invoke_overflow(); }
+                super::tray::toggle_overflow(screen, bar_left, bar_right);
             }
         }
         None => {}

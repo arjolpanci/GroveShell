@@ -225,7 +225,7 @@ pub fn main() -> Result<()> {
         // strip — *before* capturing "original" work areas below, or
         // this run would capture (and later dutifully restore) the
         // broken state.
-        if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+        if let Some(tray) = tray_icons::explorer_tray() {
             if !IsWindowVisible(tray).as_bool() {
                 set_taskbar_appbar_state(0);
                 set_taskbar_windows_visible(true);
@@ -305,6 +305,7 @@ pub fn main() -> Result<()> {
         let primary = bars.iter().find(|b| b.is_primary).unwrap_or(&bars[0]);
         let primary_bar_hwnd = primary.hwnd;
         let primary_bar_rect = primary.rect;
+        tray_icons::attach_bar(primary_bar_hwnd, primary_bar_rect);
 
         // One Activities overview per monitor now, sized to that monitor's
         // own rect (not the virtual screen) — see the design doc §D. Created
@@ -1094,9 +1095,17 @@ unsafe extern "system" fn wndproc(
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             }
         }
+        // A tray icon's menu opens on the button coming *up*, as it does
+        // on the real taskbar. Sent on the way down, the application
+        // opened its menu while the button was still held; the menu then
+        // took the release for itself and would not close on Escape or a
+        // click elsewhere.
+        WM_RBUTTONUP if matches!(role, Role::Bar { is_primary: true, .. }) => {
+            bar::on_tray_context(hwnd, lparam.0 as u16 as i16 as i32);
+            LRESULT(0)
+        }
         WM_RBUTTONDOWN => {
             if let Role::Bar { is_primary: true, .. } = &role {
-                bar::on_tray_context(hwnd, lparam.0 as u16 as i16 as i32);
                 return LRESULT(0);
             }
             tracing::info!(role = ?role, "wndproc: WM_RBUTTONDOWN");
@@ -1561,7 +1570,7 @@ unsafe extern "system" fn wndproc(
                     // Explorer re-shows an auto-hidden taskbar on edge
                     // hover or the Win key; while this shell runs it
                     // should stay gone.
-                    if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+                    if let Some(tray) = tray_icons::explorer_tray() {
                         if IsWindowVisible(tray).as_bool() {
                             set_taskbar_windows_visible(false);
                         }
@@ -1579,6 +1588,7 @@ unsafe extern "system" fn wndproc(
                     uninstall_win_event_hooks();
                     uninstall_move_size_hooks();
                     apply_touchpad_gestures(hwnd, false);
+                    tray_icons::shutdown();
                     let _ = UnregisterHotKey(hwnd, HOTKEY_WS_PREV);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_WS_NEXT);
                     let _ = UnregisterHotKey(hwnd, HOTKEY_MOVE_WIN_PREV);

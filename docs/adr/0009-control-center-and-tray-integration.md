@@ -2,7 +2,9 @@
 
 Date: 2026-09-08
 
-Status: Accepted for the experimental Phase 4 polish implementation.
+Status: Accepted for the experimental Phase 4 polish implementation. The
+tray-icon decisions (capture, retained automation elements, overflow label
+matching) are superseded by ADR-011; the control center decisions stand.
 
 ## Context
 

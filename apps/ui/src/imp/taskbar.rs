@@ -10,7 +10,7 @@ use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABM_GETSTATE, ABM_SETSTATE, ABS_AUTOHIDE, APPBARDATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowExW, FindWindowW, ShowWindow, SW_HIDE, SW_SHOW, SPIF_SENDCHANGE, SPI_SETWORKAREA,
+    FindWindowExW, ShowWindow, SW_HIDE, SW_SHOW, SPIF_SENDCHANGE, SPI_SETWORKAREA,
     SystemParametersInfoW,
 };
 
@@ -103,7 +103,8 @@ pub(crate) fn set_taskbar_windows_visible(visible: bool) {
     // process's windows; all documented-fail harmlessly if Explorer
     // isn't running.
     unsafe {
-        if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+        // Explorer's, not the notification-area host of the same class.
+        if let Some(tray) = super::tray_icons::explorer_tray() {
             let _ = ShowWindow(tray, cmd);
         }
         let mut previous = HWND(std::ptr::null_mut());

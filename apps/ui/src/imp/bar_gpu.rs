@@ -250,8 +250,18 @@ pub(crate) fn paint(hwnd: HWND, is_primary: bool, monitor: &str) {
         );
         for index in 0..super::tray_icons::count() {
             let rect = tray_icon_rect(chevron, dpi, index);
+            super::tray_icons::note_rect(index, rect);
             if snapshot.hovered == Some(BarRegion::TrayIcon(index)) {
-                hover(ctx, rect, scaled(4, dpi));
+                // The plate is the hit target, not the picture: a little
+                // room around the icon, as the other bar buttons have.
+                let pad = scaled(4, dpi);
+                let plate = windows::Win32::Foundation::RECT {
+                    left: rect.left - pad,
+                    top: rect.top - pad,
+                    right: rect.right + pad,
+                    bottom: rect.bottom + pad,
+                };
+                hover(ctx, plate, scaled(4, dpi));
             }
             super::tray_icons::with_pixels(index, |pixels, size| {
                 if let Some(bitmap) = super::gpu::bitmap_from_bgra(ctx, pixels, size) {

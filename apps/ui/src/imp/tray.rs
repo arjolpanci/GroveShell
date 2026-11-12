@@ -5,9 +5,12 @@
 //! it, so the actual app icons and their real click behavior are used.
 //!
 //! Best-effort by design: the overflow window's class name has changed
-//! across Windows 11 builds, so [`overflow_available`] tries the known ones
-//! and returns `false` when none is found — the bar then hides the chevron
-//! and only the curated indicators remain.
+//! across Windows 11 builds, so [`toggle_overflow`] tries the known ones
+//! and does nothing when none is found.
+//!
+//! The icons in the bar itself do not come from here: see `tray_icons`,
+//! which hosts the notification area directly. This is only the way to
+//! reach whatever does not fit.
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -41,12 +44,6 @@ fn find_overflow_window() -> Option<HWND> {
         }
     }
     None
-}
-
-/// Whether a tray-overflow window exists to host. The bar shows its chevron
-/// only when this is true.
-pub(crate) fn overflow_available() -> bool {
-    find_overflow_window().is_some()
 }
 
 /// Top-left position for the overflow window so its right edge sits under
