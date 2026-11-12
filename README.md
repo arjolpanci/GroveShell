@@ -37,12 +37,23 @@ fixed timer. Each window travels from where it sits on screen into its slot
 in the grid, the dock slides up from below, and the thumbnail strip drops in
 from above. You can stop the motion halfway and reverse it.
 
-A two-finger touchpad scroll or the mouse wheel drives the overview
-transition and the workspace carousel, and a fling lands where its momentum
-carries it. Every animated surface is computed from one progress value per
-monitor, which is why the pieces stay in step. The
+A three- or four-finger swipe on a precision touchpad drives it directly.
+Swipe up and the overview opens as far as your fingers have travelled; hold
+still and it waits; swipe back down and it closes again. It settles only
+when you lift, and a flick carries on under its own momentum. Swiping
+sideways slides between workspaces the same way while the overview is open,
+and switches workspace when it is closed.
+
+A two-finger scroll or the mouse wheel over the desktop does the same with
+less precision. Every animated surface is computed from one progress value
+per monitor, which is why the pieces stay in step. The
 [motion design notes](docs/design/2026-10-13-gnome-motion-port-design.md)
 explain the approach.
+
+Windows has its own three- and four-finger swipes (Task View and virtual
+desktops) and would run them at the same time, so GroveShell sets them to
+"Nothing" while it runs and puts your setting back when it quits. You can
+turn the swipes off under Settings > Input, which leaves Windows' own alone.
 
 ## Top bar
 
@@ -80,15 +91,17 @@ Keyboard control:
 
 ### Notification area
 
-GroveShell captures the promoted notification icons before it hides
-Explorer's taskbar and shows them in the primary bar. Left-click invokes the
-app, right-click requests its context menu, and the chevron opens Windows'
-hidden icons.
+GroveShell hosts the notification area itself while it runs. Applications
+hand their tray icons to it directly, so the primary bar shows each
+application's real icon and updates when the application changes it. A click
+goes to the application, a double click opens it where it expects one, and a
+right click opens its own menu.
 
-Windows 11 stops rendering its XAML tray while the taskbar is hidden, so the
-inline images keep their last captured appearance. New icons and badge
-changes need another capture while Explorer's taskbar is visible, or a shell
-restart.
+The bar shows the icons you have switched on under Windows Settings >
+Personalisation > Taskbar > Other system tray icons. The chevron opens
+Windows' hidden-icons flyout for the rest. Every icon message is also passed
+on to Explorer, so its tray is intact when GroveShell quits.
+[ADR-011](docs/adr/0011-host-the-notification-area.md) has the details.
 
 ## Settings
 
@@ -114,6 +127,8 @@ and the hardware checks still to do.
 | Resize a window | Windows key + right-drag |
 | Search apps and windows | Type in Activities; Enter opens the top result |
 | Open Activities with the mouse | Click Activities or use the top-left hot corner |
+| Open or close Activities on a touchpad | Three- or four-finger swipe up / down |
+| Switch workspace on a touchpad | Three- or four-finger swipe left / right |
 
 ## Build and run
 
@@ -154,11 +169,15 @@ written to `%LOCALAPPDATA%\GroveShell\logs\`. The CLI has `ping`,
 - The radio tile switches the available radios together. It is not Windows'
   airplane-mode flag; its options page opens the actual Windows setting.
 - Brightness, Night Light, and Do Not Disturb are not integrated controls.
-- Tray images are snapshots, and app menu behavior varies across Explorer
-  builds.
+- Network, volume and battery are GroveShell's own indicators. Windows 11
+  draws its versions inside Explorer, where they cannot be hosted.
+- Touchpad swipes need a precision touchpad. Whether Windows stops running
+  its own swipes straight away or only after the next sign-in varies by
+  build, and has not been confirmed on hardware.
+- If GroveShell is killed instead of quit, Windows' swipes stay off until
+  it next starts and quits, or until you run `scripts\recover.ps1`.
 - Wi-Fi enumeration can require Windows location permission. If it is
   denied, the panel still gives access to Windows' network UI.
-- Three-finger touchpad swipes are not supported.
 - Testing with Narrator, on mixed-monitor hardware, and over long sessions
   is not finished. Painted keyboard controls do not yet expose a complete UI
   Automation accessibility tree.
