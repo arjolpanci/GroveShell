@@ -2,6 +2,7 @@
 //! every window message to the right module. See the crate-level doc
 //! comment in `main.rs` for the overall shell design.
 
+mod app_identity;
 mod bar;
 mod bar_gpu;
 mod calendar;

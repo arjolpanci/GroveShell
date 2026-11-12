@@ -664,7 +664,14 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
 
     // Remaining (unclaimed) windows, grouped by exe — one dock entry
     // per distinct running app that isn't already pinned.
-    let mut seen_exes: Vec<String> = Vec::new();
+    //
+    // "App" is the exe for an ordinary window and the AppUserModelID for
+    // a UWP frame, which all share one host process (see `app_identity`).
+    let keys: Vec<Option<String>> = live
+        .iter()
+        .map(|w| super::app_identity::group_key(&w.class, w.exe_name.as_deref(), w.hwnd))
+        .collect();
+    let mut seen_keys: Vec<&str> = Vec::new();
     for (i, window) in live.iter().enumerate() {
         if apps.len() >= DOCK_MAX_APPS {
             break;
@@ -672,23 +679,26 @@ pub(crate) fn build_dock_apps(live: &[groveshell_window_model::WindowRecord]) ->
         if claimed[i] {
             continue;
         }
-        let Some(exe) = window.exe_name.as_deref() else {
+        let Some(key) = keys[i].as_deref() else {
             continue;
         };
-        let exe_lower = exe.to_lowercase();
-        if seen_exes.contains(&exe_lower) {
+        if seen_keys.contains(&key) {
             continue;
         }
-        seen_exes.push(exe_lower.clone());
+        seen_keys.push(key);
         let windows: Vec<isize> = live
             .iter()
             .enumerate()
-            .filter(|(j, w)| {
-                !claimed[*j] && w.exe_name.as_deref().is_some_and(|e| e.to_lowercase() == exe_lower)
-            })
+            .filter(|(j, _)| !claimed[*j] && keys[*j].as_deref() == Some(key))
             .map(|(_, w)| w.hwnd)
             .collect();
-        let icon = super::overview::window_icon_large(HWND(window.hwnd as *mut c_void));
+        let hwnd = HWND(window.hwnd as *mut c_void);
+        let icon = if window.class == super::app_identity::UWP_FRAME_CLASS {
+            super::app_identity::uwp_window_icon(hwnd)
+        } else {
+            None
+        }
+        .or_else(|| super::overview::window_icon_large(hwnd));
         apps.push(DockApp {
             icon,
             launch_path: None,
