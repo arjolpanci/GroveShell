@@ -1,6 +1,7 @@
 pub mod error;
 pub mod logging;
 pub mod paths;
+pub mod processes;
 pub mod taskbar_state;
 pub mod touchpad_gestures;
 

@@ -17,6 +17,11 @@ mod imp {
     const RECOVER_AFTER: Duration = Duration::from_secs(8); // unhealthy + 2s grace, per §13.2
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+    /// How many polls in a row the UI has to be gone, with the taskbar
+    /// still recorded as taken, before the watchdog gives it back. More
+    /// than one, so a UI that is merely being restarted is left alone.
+    const ORPHAN_POLLS: u32 = 3;
+
     /// Crash-loop guard: if recovery fires this many times within
     /// [`CRASH_LOOP_WINDOW`], automatic recovery is disabled and the human
     /// fallback (`recover.ps1`, per `docs/PROJECT_PLAN.md` §13.1: "Crash
@@ -110,9 +115,24 @@ mod imp {
         let mut already_warned_unhealthy = false;
         let mut recovery_history: Vec<Instant> = Vec::new();
         let mut crash_loop_disabled = false;
+        let mut orphan_polls = 0u32;
 
         loop {
             std::thread::sleep(POLL_INTERVAL);
+
+            // Independent of the heartbeat: the host can be perfectly
+            // healthy while the UI, which is what holds the taskbar, has
+            // been killed or has crashed.
+            if desktop_is_orphaned() {
+                orphan_polls += 1;
+                if orphan_polls >= ORPHAN_POLLS {
+                    tracing::warn!("the UI is gone and never gave the desktop back; restoring it");
+                    give_desktop_back();
+                    orphan_polls = 0;
+                }
+            } else {
+                orphan_polls = 0;
+            }
 
             let Some(elapsed) = last_heartbeat
                 .lock()
@@ -168,6 +188,8 @@ mod imp {
         if let Err(e) = ShellJob::terminate_by_name() {
             tracing::warn!(error = ?e, "failed to terminate shell job (it may not exist yet)");
         }
+        // The UI has just been killed without the chance to do this.
+        give_desktop_back();
 
         if !is_explorer_running() {
             match std::process::Command::new("explorer.exe").spawn() {
@@ -179,6 +201,29 @@ mod imp {
         }
 
         write_crash_marker();
+    }
+
+    /// Whether the shell's changes to the user's desktop are still in
+    /// place with no UI left to undo them.
+    fn desktop_is_orphaned() -> bool {
+        let taken = groveshell_common::taskbar_state::is_recorded()
+            || groveshell_common::touchpad_gestures::is_recorded();
+        taken && groveshell_common::processes::find("groveshell-ui.exe").is_none()
+    }
+
+    /// Undoes what the UI does to the user's own settings while it runs:
+    /// the taskbar's auto-hide and hidden windows, and Windows' three-
+    /// and four-finger swipes. Each is a no-op with nothing recorded.
+    ///
+    /// Left undone, a killed shell leaves the taskbar auto-hiding until
+    /// the user finds the switch in Settings and turns it off by hand.
+    fn give_desktop_back() {
+        if let Some(state) = groveshell_common::taskbar_state::restore() {
+            tracing::info!(state, "taskbar restored");
+        }
+        if let Some(settings) = groveshell_common::touchpad_gestures::restore() {
+            tracing::info!(?settings, "touchpad gestures restored");
+        }
     }
 
     /// Walks a `TH32CS_SNAPPROCESS` snapshot of all running processes looking

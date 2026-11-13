@@ -253,8 +253,6 @@ mod imp {
     /// precisely so the taskbar can still be recovered, without having to
     /// start the shell again just to stop it properly.
     fn restore_taskbar() -> Result<()> {
-        use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_SETSTATE, APPBARDATA};
-
         // The same unclean exit that strands the taskbar leaves Windows'
         // three- and four-finger swipes switched off.
         match groveshell_common::touchpad_gestures::restore() {
@@ -263,22 +261,11 @@ mod imp {
         }
 
         let path = groveshell_common::taskbar_state::path()?;
-        let Some(state) = groveshell_common::taskbar_state::read(&path) else {
+        let Some(state) = groveshell_common::taskbar_state::restore() else {
             println!("Nothing to restore: no saved taskbar state at {}.", path.display());
             println!("Either the shell shut down cleanly, or it never took the taskbar over.");
             return Ok(());
         };
-
-        let mut abd = APPBARDATA {
-            cbSize: std::mem::size_of::<APPBARDATA>() as u32,
-            lParam: windows::Win32::Foundation::LPARAM(state as isize),
-            ..Default::default()
-        };
-        // SAFETY: plain AppBar state set; `abd` outlives the call.
-        unsafe {
-            SHAppBarMessage(ABM_SETSTATE, &mut abd);
-        }
-        groveshell_common::taskbar_state::clear(&path);
 
         let auto_hide = state & 0x1 != 0;
         println!(

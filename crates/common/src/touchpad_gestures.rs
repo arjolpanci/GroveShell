@@ -81,6 +81,12 @@ pub fn clear(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Whether a record is on disk: the shell has the swipes, or had them
+/// and never gave them back.
+pub fn is_recorded() -> bool {
+    path().ok().as_deref().and_then(read).is_some()
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;

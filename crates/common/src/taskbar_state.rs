@@ -50,6 +50,54 @@ pub fn state_to_remember(saved: Option<u32>, current: u32) -> u32 {
     saved.unwrap_or(current)
 }
 
+/// Gives the taskbar back as it was recorded: its auto-hide state, and
+/// its windows, which the shell keeps hidden. Returns the state restored,
+/// or `None` if nothing was recorded.
+///
+/// For whoever finds the record with no shell left to honour it: the
+/// watchdog when the UI has died, and `groveshell-cli restore-taskbar`.
+/// The shell's own clean exit goes through the same file.
+#[cfg(windows)]
+pub fn restore() -> Option<u32> {
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_SETSTATE, APPBARDATA};
+    use windows::Win32::UI::WindowsAndMessaging::{FindWindowExW, ShowWindow, SW_SHOW};
+
+    let path = path().ok()?;
+    let state = read(&path)?;
+    let mut abd = APPBARDATA {
+        cbSize: std::mem::size_of::<APPBARDATA>() as u32,
+        lParam: LPARAM(state as isize),
+        ..Default::default()
+    };
+    // SAFETY: a plain AppBar state set, then show-state changes on
+    // Explorer's taskbar windows; all fail harmlessly if Explorer is not
+    // running.
+    unsafe {
+        SHAppBarMessage(ABM_SETSTATE, &mut abd);
+        for class in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
+            let mut previous = HWND(std::ptr::null_mut());
+            while let Ok(next) = FindWindowExW(HWND(std::ptr::null_mut()), previous, class, None) {
+                if next.0.is_null() {
+                    break;
+                }
+                let _ = ShowWindow(next, SW_SHOW);
+                previous = next;
+            }
+        }
+    }
+    clear(&path);
+    tracing::info!(state, "taskbar given back as recorded");
+    Some(state)
+}
+
+/// Whether a record is on disk: the shell has the taskbar, or had it
+/// and never gave it back.
+pub fn is_recorded() -> bool {
+    path().ok().as_deref().and_then(read).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
