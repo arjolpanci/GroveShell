@@ -43,38 +43,28 @@ impl ManagedProcesses {
         Self { watchdog: None, host: None, ui: None }
     }
 
-    /// Spawns watchdog -> host -> ui in order, same sequence
-    /// `scripts/dev-start.ps1` uses. Best-effort: a spawn failure is
-    /// logged, not fatal, so e.g. a missing `groveshell-ui.exe` (a
-    /// dev-only partial build) doesn't crash the tray app itself.
+    /// Starts whichever of watchdog, host and ui is not running, in that
+    /// order, the same sequence `scripts/dev-start.ps1` uses. Best-effort:
+    /// a spawn failure is logged, not fatal, so a missing
+    /// `groveshell-ui.exe` (a partial dev build) doesn't take the tray app
+    /// down with it.
     ///
-    /// Idempotent: if GroveShell already appears to be running (started
-    /// some other way — most commonly `scripts/dev-start.ps1` during
-    /// development, which this process didn't spawn and so wouldn't
-    /// otherwise know about), this does nothing instead of spawning a
-    /// second, duplicate watchdog/host/ui trio on top of the first. This
-    /// matters because `apps/ui`'s top-bar settings button launches this
-    /// exe unconditionally to reach the settings window, regardless of
-    /// how GroveShell was originally started.
-    ///
-    /// Known limitation: when GroveShell was already running before this
-    /// process started, its `watchdog`/`host`/`ui` children aren't
-    /// tracked by this `ManagedProcesses` (this process never spawned
-    /// them), so `pid_of`/`is_ui_running` will under-report them as "not
-    /// running" even though they are — the Home page's health display and
-    /// the tray's "Restore Explorer"/"Start GroveShell" label can be
-    /// stale in that case. Not attempted here: doing better would need
-    /// discovering and adopting pre-existing processes by pid, which is
-    /// out of scope for "don't spawn duplicates."
+    /// Each process is checked on its own rather than the shell as a
+    /// whole. The shell is usually already up when this runs, started by
+    /// a script or an earlier Settings, and must not be started twice;
+    /// but when only the UI has died, the host still answering used to
+    /// count as "already running" and Start did nothing at all.
     pub fn spawn_all(&mut self) {
-        if groveshell_already_running() {
-            tracing::info!("groveshell already running (started elsewhere); not spawning a duplicate set");
-            return;
+        if self.pid_of("watchdog").is_none() {
+            self.watchdog = spawn_hidden("groveshell-watchdog.exe");
+            std::thread::sleep(Duration::from_secs(1));
         }
-        self.watchdog = spawn_hidden("groveshell-watchdog.exe");
-        std::thread::sleep(Duration::from_secs(1));
-        self.host = spawn_hidden("groveshell-host.exe");
-        self.ui = spawn_hidden("groveshell-ui.exe");
+        if self.pid_of("host").is_none() {
+            self.host = spawn_hidden("groveshell-host.exe");
+        }
+        if self.pid_of("ui").is_none() {
+            self.ui = spawn_hidden("groveshell-ui.exe");
+        }
     }
 
     /// Alias used by the "Start GroveShell" tray/Home-page action — spawns
@@ -83,21 +73,33 @@ impl ManagedProcesses {
         self.spawn_all();
     }
 
+    /// Whether the shell's UI is up, whoever started it.
     pub fn is_ui_running(&mut self) -> bool {
-        matches!(self.ui.as_mut().map(|c| c.try_wait()), Some(Ok(None)))
+        self.pid_of("ui").is_some()
     }
 
+    /// The process id of `name` (`"watchdog"`, `"host"` or `"ui"`), if
+    /// it is running.
+    ///
+    /// A child this process spawned is asked directly. Otherwise the
+    /// process list is searched by name: the shell is often already
+    /// running when Settings starts, launched by a script or a previous
+    /// Settings, and reporting it as stopped left the Home page offering
+    /// to "Start" a shell that was plainly on screen, with no way to
+    /// stop it.
     pub fn pid_of(&mut self, name: &str) -> Option<u32> {
         let child = match name {
             "watchdog" => self.watchdog.as_mut(),
             "host" => self.host.as_mut(),
             "ui" => self.ui.as_mut(),
-            _ => None,
-        }?;
-        match child.try_wait() {
-            Ok(None) => Some(child.id()),
-            _ => None,
+            _ => return None,
+        };
+        if let Some(child) = child {
+            if let Ok(None) = child.try_wait() {
+                return Some(child.id());
+            }
         }
+        groveshell_common::processes::find(&format!("groveshell-{name}.exe"))
     }
 
     /// Stops `ui` gracefully (so it restores the real taskbar/work areas
@@ -107,66 +109,16 @@ impl ManagedProcesses {
     /// handler and `scripts/dev-start.ps1`'s `Stop-UiGracefully` for the
     /// precedent this mirrors.
     pub fn stop_all(&mut self) {
-        stop_ui_gracefully(self.ui.take());
-        stop_via_ipc_or_kill("groveshell-host", self.host.take(), groveshell_ipc::message_type::SHUTDOWN);
+        // The watchdog first. Left running, it sees the host go quiet
+        // and "recovers" a shell that was being shut down on purpose.
         stop_via_ipc_or_kill(
             "groveshell-watchdog",
             self.watchdog.take(),
             groveshell_ipc::message_type::WATCHDOG_SHUTDOWN,
         );
+        stop_ui_gracefully(self.ui.take());
+        stop_via_ipc_or_kill("groveshell-host", self.host.take(), groveshell_ipc::message_type::SHUTDOWN);
     }
-}
-
-/// Best-effort check for "is GroveShell already up, however it was
-/// started." A live `GroveShellBar` window is the most direct signal
-/// (`apps/ui` only creates one once it's fully running); a reachable
-/// `host.ping` is a fallback in case `ui` is mid-startup and hasn't
-/// created its bar yet. Either signal is enough — `watchdog`/`host`/`ui`
-/// are always started together (by this process or by
-/// `scripts/dev-start.ps1`), so there's no realistic case where exactly
-/// one of them is up on its own.
-fn groveshell_already_running() -> bool {
-    find_any_window_by_class("GroveShellBar") || super::health::host_ping_ok(Duration::from_millis(300))
-}
-
-/// `EnumWindows` pass matching only a class name, ignoring which process
-/// owns it — used to detect "is GroveShell's bar up at all," unlike
-/// `find_window_by_class_and_pid`'s more specific "is *this* pid's
-/// window up," which only works for processes this `ManagedProcesses`
-/// itself spawned.
-fn find_any_window_by_class(class_name: &str) -> bool {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, TRUE};
-    use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetClassNameW};
-
-    struct SearchState<'a> {
-        class_name: &'a str,
-        found: bool,
-    }
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        // SAFETY: `lparam` was created from a live `&mut SearchState` in
-        // the call below and this callback only runs synchronously within
-        // that call's lifetime.
-        let state = &mut *(lparam.0 as *mut SearchState);
-        let mut buf = [0u16; 256];
-        // SAFETY: `buf` outlives this call and is large enough for any
-        // real window class name.
-        let len = unsafe { GetClassNameW(hwnd, &mut buf) };
-        let name = String::from_utf16_lossy(&buf[..len as usize]);
-        if name == state.class_name {
-            state.found = true;
-            return BOOL(0); // stop enumerating
-        }
-        TRUE
-    }
-
-    let mut state = SearchState { class_name, found: false };
-    // SAFETY: `state`'s address is passed as `lparam` and only read back
-    // by `enum_proc`, synchronously, within this call's lifetime.
-    unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut state as *mut SearchState as isize));
-    }
-    state.found
 }
 
 /// `EnumWindows` pass matching only a class name, returning the window
@@ -247,8 +199,17 @@ fn stop_ui_gracefully(ui_child: Option<Child>) {
         }
     }
 
-    let Some(mut child) = ui_child else { return };
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let Some(mut child) = ui_child else {
+        // Not ours to wait on by handle, but the host must not be told
+        // to go until the UI has finished putting the taskbar back.
+        while std::time::Instant::now() < deadline
+            && groveshell_common::processes::find("groveshell-ui.exe").is_some()
+        {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        return;
+    };
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,
@@ -272,8 +233,17 @@ fn stop_via_ipc_or_kill(pipe_name: &str, child: Option<Child>, shutdown_message_
         let _ = groveshell_ipc::framing::write_envelope(&mut conn, &envelope);
     }
 
-    let Some(mut child) = child else { return };
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let Some(mut child) = child else {
+        // Not ours to wait on by handle. Wait by name instead, so the
+        // caller's next look at what is running sees the result rather
+        // than a process halfway out of the door.
+        let exe = format!("{pipe_name}.exe");
+        while std::time::Instant::now() < deadline && groveshell_common::processes::find(&exe).is_some() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        return;
+    };
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(_)) => return,

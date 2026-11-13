@@ -702,6 +702,18 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
 /// call regardless of whether GroveShell was originally started via
 /// `groveshell-settings.exe` or `scripts/dev-start.ps1`.
 fn open_settings_app() {
+    // The settings process is about to raise a window in answer to a
+    // click it did not receive. Windows only lets it take the foreground
+    // if the process that did receive the click says so; otherwise the
+    // window opens behind whatever is in front and its taskbar button
+    // flashes instead.
+    // SAFETY: no preconditions. Fails harmlessly if this process is not
+    // currently allowed to set the foreground either.
+    unsafe {
+        let _ = windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow(
+            windows::Win32::UI::WindowsAndMessaging::ASFW_ANY,
+        );
+    }
     if let Ok(mut conn) = groveshell_ipc::pipe::connect("groveshell-settings") {
         let envelope = groveshell_ipc::Envelope::new(
             "groveshell-ui",
@@ -719,7 +731,9 @@ fn open_settings_app() {
     };
     exe.pop();
     exe.push("groveshell-settings.exe");
-    if let Err(e) = std::process::Command::new(&exe).spawn() {
+    // `--show`: a fresh instance otherwise starts as a tray icon only,
+    // and the gear had to be pressed a second time to get a window.
+    if let Err(e) = std::process::Command::new(&exe).arg("--show").spawn() {
         tracing::error!(error = ?e, path = ?exe, "failed to launch groveshell-settings.exe");
     }
 }

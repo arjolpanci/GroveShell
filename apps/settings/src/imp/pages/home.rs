@@ -1,10 +1,8 @@
 //! Home: whether GroveShell is running, the per-process detail behind
 //! that, and whether it starts with Windows.
 //!
-//! This page still reports what *this* process spawned, which is why it
-//! can claim GroveShell is unhealthy while the shell is plainly running.
-//! Fixing that is the next plan's job (see the spec's §8); this one only
-//! moves the existing information onto the new rows.
+//! The shell is reported as it is, whoever started it: a process this
+//! one did not spawn is found by name (`ManagedProcesses::pid_of`).
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
@@ -100,16 +98,16 @@ impl Page for HomePage {
 
         let action = Row::new(
             ROW_TOGGLE_SHELL,
-            if running { "Restore Explorer" } else { "Start GroveShell" },
+            if running { "Quit GroveShell" } else { "Start GroveShell" },
         )
         .with_description(if running {
-            "Stop the shell and give the Windows taskbar its screen space back"
+            "Stop the shell and bring back the Windows taskbar and Start menu"
         } else {
             "Start the shell and take the screen over from the Windows taskbar"
         })
         .with_glyph(glyph::STARTUP)
         .with_control(Control::Action {
-            label: if running { "Restore" } else { "Start" },
+            label: if running { "Quit" } else { "Start" },
         });
 
         let autostart_row = Row::new(ROW_AUTOSTART, "Start with Windows")

@@ -159,8 +159,8 @@ pub(crate) fn open_settings_window() {
         // SAFETY: `hwnd` is a live, process-lifetime window.
         unsafe {
             let _ = ShowWindow(hwnd, SW_RESTORE);
-            let _ = SetForegroundWindow(hwnd);
         }
+        bring_to_front(hwnd);
         return;
     }
 
@@ -245,7 +245,51 @@ pub(crate) fn open_settings_window() {
         refresh_system_appearance();
         material::apply(hwnd, material::Surface::Window);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        bring_to_front(hwnd);
+        windows::Win32::UI::WindowsAndMessaging::SetTimer(hwnd, STATUS_TIMER, STATUS_TIMER_MS, None);
+    }
+}
+
+/// Repaints the Home page so its process status stays current.
+const STATUS_TIMER: usize = 1;
+const STATUS_TIMER_MS: u32 = 2000;
+
+/// Puts the window in front of everything and gives it the keyboard.
+///
+/// It is usually opened on someone else's say-so: the bar's gear, in
+/// another process, or a second launch handing over to this one. Windows
+/// refuses a plain `SetForegroundWindow` then, and the window would open
+/// underneath whatever the user was looking at. The bar grants this
+/// process the right before it asks; the rest is for when it could not.
+fn bring_to_front(hwnd: HWND) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_MENU};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId,
+    };
+    // SAFETY: `hwnd` is this process's own window. The synthetic Alt tap
+    // is the long-standing way to make Windows accept a foreground
+    // change it would otherwise turn into a flashing button, and the
+    // input attachment is undone straight after.
+    unsafe {
+        let _ = BringWindowToTop(hwnd);
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return;
+        }
+        keybd_event(VK_MENU.0 as u8, 0, Default::default(), 0);
+        keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return;
+        }
+        let front = GetForegroundWindow();
+        let front_thread = GetWindowThreadProcessId(front, None);
+        let this_thread = GetCurrentThreadId();
+        if front_thread != 0 && front_thread != this_thread {
+            let _ = AttachThreadInput(this_thread, front_thread, true);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = AttachThreadInput(this_thread, front_thread, false);
+        }
     }
 }
 
@@ -876,7 +920,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
+        // The Home page reports on other processes, which start, stop
+        // and die without telling this window. Its reading is cached for
+        // two seconds, so repainting at that pace is what keeps it true.
+        windows::Win32::UI::WindowsAndMessaging::WM_TIMER if wparam.0 == STATUS_TIMER => {
+            let on_home = STATE.with(|s| s.borrow().as_ref().is_some_and(|st| st.selected_nav == 0));
+            if on_home {
+                repaint(hwnd);
+            }
+            LRESULT(0)
+        }
+
         WM_DESTROY => {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(hwnd, STATUS_TIMER);
             STATE.with(|s| *s.borrow_mut() = None);
             LRESULT(0)
         }

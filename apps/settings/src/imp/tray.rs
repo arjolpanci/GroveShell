@@ -107,6 +107,12 @@ pub fn run_message_loop(processes: ManagedProcesses) -> groveshell_common::Resul
         TRAY_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
         std::thread::spawn(settings_pipe_listener);
 
+        // Started to show the window, not just to sit in the tray: the
+        // bar's gear launches it this way when it was not running yet.
+        if std::env::args().any(|arg| arg == "--show") {
+            let _ = PostMessageW(hwnd, WM_SETTINGS_SHOW, WPARAM(0), LPARAM(0));
+        }
+
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -217,9 +223,9 @@ fn show_context_menu(hwnd: HWND) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let _ = AppendMenuW(menu, MF_STRING, MENU_ID_OPEN as usize, w!("Open GroveShell Settings"));
-        let toggle_label = if is_ui_running() { w!("Restore Explorer") } else { w!("Start GroveShell") };
+        let toggle_label = if is_ui_running() { w!("Quit GroveShell") } else { w!("Start GroveShell") };
         let _ = AppendMenuW(menu, MF_STRING, MENU_ID_TOGGLE as usize, toggle_label);
-        let _ = AppendMenuW(menu, MF_STRING, MENU_ID_EXIT as usize, w!("Exit GroveShell"));
+        let _ = AppendMenuW(menu, MF_STRING, MENU_ID_EXIT as usize, w!("Quit GroveShell and close Settings"));
 
         let mut point = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut point);
