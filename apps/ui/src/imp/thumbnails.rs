@@ -31,14 +31,16 @@ use std::collections::HashMap;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmRegisterThumbnail, DwmUnregisterThumbnail, DwmUpdateThumbnailProperties,
-    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION,
+    DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE,
     DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
 
 thread_local! {
-    /// destination window -> (source window -> live registration).
-    static REGISTRY: RefCell<HashMap<isize, HashMap<isize, isize>>> =
+    /// destination window -> `(source window, live registration)`, in
+    /// the order they were registered. DWM stacks thumbnails in that
+    /// order, later ones on top, and offers no way to restack them.
+    static REGISTRY: RefCell<HashMap<isize, Vec<(isize, isize)>>> =
         RefCell::new(HashMap::new());
 }
 
@@ -89,68 +91,97 @@ mod tests {
     }
 }
 
+/// Whether the previews already registered are stacked the way `wanted`
+/// asks, bottom first. Sources in only one of the two lists do not
+/// count: one that is gone is about to be dropped, and a new one is
+/// registered last, which puts it on top.
+pub(crate) fn same_stacking(registered: &[isize], wanted: &[isize]) -> bool {
+    let kept: Vec<isize> = registered.iter().copied().filter(|r| wanted.contains(r)).collect();
+    let asked: Vec<isize> = wanted.iter().copied().filter(|w| registered.contains(w)).collect();
+    kept == asked
+}
+
 /// Points `dest`'s live previews at exactly `items`, registering what is
 /// new, moving what already existed, and dropping what is gone.
 ///
+/// `items` is bottom first: each is the source, where it goes, and which
+/// part of the source to show (`None` for all of it). The order matters
+/// on the desktop end of the transition, where previews overlap exactly
+/// as their windows do and have to be stacked the same way.
+///
 /// Called every frame the overview paints, so it is written to do nothing
 /// but a cheap property update in the common case — registration only
-/// happens the first time a given source appears.
-pub(crate) fn sync(dest: HWND, items: &[(HWND, RECT)]) {
+/// happens the first time a given source appears, or when the stacking
+/// asked for no longer matches.
+pub(crate) fn sync(dest: HWND, items: &[(HWND, RECT, Option<RECT>)]) {
     REGISTRY.with(|registry| {
         let mut registry = registry.borrow_mut();
         let entries = registry.entry(dest.0 as isize).or_default();
+        let wanted: Vec<isize> = items.iter().map(|(h, _, _)| h.0 as isize).collect();
 
-        for (source, rect) in items {
+        // Anything no longer in `items` (window closed, moved workspace,
+        // scrolled out) loses its registration, or DWM would keep
+        // compositing it at its last rect. If what is left is stacked
+        // wrongly, or a new source belongs underneath an existing one,
+        // everything goes and is registered again in order.
+        let registered: Vec<isize> = entries.iter().map(|(source, _)| *source).collect();
+        let restack = !same_stacking(&registered, &wanted)
+            || wanted
+                .iter()
+                .position(|w| !registered.contains(w))
+                .is_some_and(|first_new| wanted[first_new..].iter().any(|w| registered.contains(w)));
+        entries.retain(|(source, handle)| {
+            let keep = !restack && wanted.contains(source);
+            if !keep {
+                // SAFETY: the handle was registered by this module and
+                // leaves the registry in the same step.
+                unsafe {
+                    let _ = DwmUnregisterThumbnail(*handle);
+                }
+            }
+            keep
+        });
+
+        for (source, rect, part) in items {
             let key = source.0 as isize;
-            let handle = match entries.get(&key) {
-                Some(&existing) => existing,
+            let handle = match entries.iter().find(|(s, _)| *s == key) {
+                Some(&(_, existing)) => existing,
                 None => {
                     // SAFETY: both are live top-level windows; the
                     // returned handle is kept in the registry until
-                    // `clear` or the stale sweep unregisters it.
+                    // `clear` or the sweep above unregisters it.
                     let Ok(handle) = (unsafe { DwmRegisterThumbnail(dest, *source) }) else {
                         continue;
                     };
-                    entries.insert(key, handle);
+                    entries.push((key, handle));
                     handle
                 }
             };
 
-            let props = DWM_THUMBNAIL_PROPERTIES {
+            let mut props = DWM_THUMBNAIL_PROPERTIES {
                 dwFlags: DWM_TNP_RECTDESTINATION
                     | DWM_TNP_VISIBLE
                     | DWM_TNP_SOURCECLIENTAREAONLY
                     | DWM_TNP_OPACITY,
                 rcDestination: *rect,
                 fVisible: true.into(),
-                // Client area only: the source's own title bar and border
-                // would otherwise appear inside a preview that already
-                // sits in the overview's own card chrome.
-                fSourceClientAreaOnly: true.into(),
+                // The whole window, title bar included. A preview starts
+                // out exactly covering its window, and only the client
+                // area stretched over that rect is a visibly different
+                // picture.
+                fSourceClientAreaOnly: false.into(),
                 opacity: 255,
                 ..Default::default()
             };
+            if let Some(part) = part {
+                props.dwFlags |= DWM_TNP_RECTSOURCE;
+                props.rcSource = *part;
+            }
             // SAFETY: `handle` came from a successful registration above
             // and has not been unregistered; `props` is a local that
             // outlives the call.
             unsafe {
                 let _ = DwmUpdateThumbnailProperties(handle, &props);
-            }
-        }
-
-        // Anything no longer in `items` (window closed, moved workspace,
-        // scrolled out) loses its registration, or DWM would keep
-        // compositing it at its last rect.
-        let wanted: Vec<isize> = items.iter().map(|(h, _)| h.0 as isize).collect();
-        let stale: Vec<isize> =
-            entries.keys().copied().filter(|k| !wanted.contains(k)).collect();
-        for key in stale {
-            if let Some(handle) = entries.remove(&key) {
-                // SAFETY: the handle was registered by this module and is
-                // removed from the registry in the same step.
-                unsafe {
-                    let _ = DwmUnregisterThumbnail(handle);
-                }
             }
         }
     });
@@ -165,7 +196,7 @@ pub(crate) fn clear(dest: HWND) {
         let Some(entries) = registry.borrow_mut().remove(&(dest.0 as isize)) else {
             return;
         };
-        for handle in entries.into_values() {
+        for (_, handle) in entries {
             // SAFETY: as in `sync`'s stale path.
             unsafe {
                 let _ = DwmUnregisterThumbnail(handle);
@@ -188,6 +219,29 @@ pub(crate) fn clear(dest: HWND) {
 /// that can represent it.
 pub(crate) fn needs_still_capture(previewable: bool, has_capture: bool) -> bool {
     !has_capture && !previewable
+}
+
+#[cfg(test)]
+mod stacking_tests {
+    use super::*;
+
+    #[test]
+    fn the_same_order_needs_no_restack() {
+        assert!(same_stacking(&[1, 2, 3], &[1, 2, 3]));
+        assert!(same_stacking(&[], &[1, 2]));
+    }
+
+    #[test]
+    fn a_dropped_or_added_source_alone_is_not_a_reorder() {
+        assert!(same_stacking(&[1, 2, 3], &[1, 3]));
+        assert!(same_stacking(&[1, 3], &[1, 3, 4]));
+    }
+
+    #[test]
+    fn two_sources_swapping_is() {
+        assert!(!same_stacking(&[1, 2, 3], &[1, 3, 2]));
+        assert!(!same_stacking(&[1, 2], &[2, 1, 5]));
+    }
 }
 
 #[cfg(test)]

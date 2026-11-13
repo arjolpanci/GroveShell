@@ -1,8 +1,6 @@
-//! GPU-composited visual tree for one monitor's Activities overview —
-//! Phase 2 of the animation-fluidity work (see
-//! `docs/design/2026-07-29-overview-directcomposition-port-design.md`).
-//! One root visual (dock/search/ghost chrome) plus one child visual per
-//! current `CardAnim` (frame/wallpaper/shadow/thumbnails/icons/chips).
+//! GPU-composited visual tree for one monitor's Activities overview.
+//! A root visual holding the backdrop, one visual per workspace card,
+//! one per window preview, and the dash, strip and chrome above them.
 //! `None`/absent anywhere in this module means "fall back to this
 //! overview window's existing GDI painting, unchanged" — never a panic.
 
@@ -25,7 +23,7 @@ use groveshell_motion::{lerp, RectF};
 
 use super::gpu::{self, GpuSurface};
 use super::overview::{CardAnim, ThumbAnim, WINDOW_HOVER_GLOW_DURATION};
-use super::overview_layout::{layout_for_progress, thumb_alpha, thumb_rect};
+use super::overview_layout::{layout_for_progress, live_inset, ride_card, thumb_alpha, thumb_rect};
 use super::state::{reference_dpi, scaled};
 use super::util::{ease_out, progress_dur};
 
@@ -158,21 +156,23 @@ pub(crate) struct ThumbVisual {
     pub(crate) surface: GpuSurface,
 }
 
-/// One workspace card's own composited surface, at the card's natural
-/// (unscrolled, unzoomed) size — carousel position/zoom is applied on
-/// top via `SetTransform2`, never baked into what's drawn here.
+/// One workspace card: a visual showing the shared picture of the
+/// desktop (`OverviewGpuState::desktop`), at the monitor's own size.
+/// Position, zoom and corner rounding are applied per frame, never baked
+/// into what is drawn.
 pub(crate) struct CardVisual {
     pub(crate) page: usize,
-    /// The rect this surface was allocated and painted at. Every frame
-    /// maps it onto wherever the layout says the card goes.
+    /// The rect the picture was painted at: the whole monitor. Every
+    /// frame maps it onto wherever the layout says the card goes.
     pub(crate) natural: RectF,
     pub(crate) surface: GpuSurface,
 }
 
-/// One monitor overview's GPU state. `root`'s own surface is left
-/// blank — it exists only as the composition-tree parent that carries
-/// the open/close opacity fade (`gpu::set_opacity`) down to its
-/// children. `cards` holds one entry per current `CardAnim`, kept in
+/// One monitor overview's GPU state. `root`'s own surface holds the
+/// backdrop, and is fully opaque for as long as the window is shown:
+/// nothing in the open or close is a fade of the whole overview. The
+/// first frame is a picture of the desktop, and everything after it is
+/// that picture's parts moving. `cards` holds one entry per current `CardAnim`, kept in
 /// sync by `rebuild_cards`. `chrome` holds the dock bar, search panel,
 /// and drag ghost, and is kept re-inserted above every card visual (see
 /// `rebuild_cards`) so it always composites on top — a card is a full,
@@ -180,6 +180,21 @@ pub(crate) struct CardVisual {
 /// panel would render underneath whichever card visual they overlap.
 pub(crate) struct OverviewGpuState {
     pub(crate) root: GpuSurface,
+    /// The desktop as it looks with no windows on it, at the monitor's
+    /// size. Never attached itself: every card is an alias of it.
+    pub(crate) desktop: Option<GpuSurface>,
+    /// Which capture `desktop` was last painted from, so it is uploaded
+    /// once per capture rather than once per open.
+    pub(crate) desktop_generation: std::cell::Cell<Option<u64>>,
+    /// The accent outline on the card a dragged window is over, and the
+    /// page it is on. Its own visual, because the cards share one
+    /// picture and cannot be drawn on individually.
+    pub(crate) card_glow: std::cell::RefCell<Option<GpuSurface>>,
+    pub(crate) card_glow_page: std::cell::Cell<Option<usize>>,
+    /// Whether the composed tree is showing yet. For the first moments
+    /// after the window appears it is not, and only the live previews
+    /// are: see `OverviewInstance::reveal_at`.
+    pub(crate) revealed: std::cell::Cell<bool>,
     pub(crate) cards: Vec<CardVisual>,
     /// One visual per window preview, parented to the *root* rather than
     /// to its card: `update_transforms` applies the card's own affine to
@@ -313,6 +328,11 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
     }
     Some(OverviewGpuState {
         root,
+        desktop: gpu::create_child_surface(width.max(1), height.max(1)),
+        desktop_generation: std::cell::Cell::new(None),
+        card_glow: std::cell::RefCell::new(None),
+        card_glow_page: std::cell::Cell::new(None),
+        revealed: std::cell::Cell::new(false),
         cards: Vec::new(),
         thumbs: Vec::new(),
         chrome,
@@ -327,46 +347,30 @@ pub(crate) fn create(hwnd: HWND, width: i32, height: i32) -> Option<OverviewGpuS
     })
 }
 
-/// Rebuilds `state.cards` to have exactly one entry per `cards`,
-/// reusing each existing card visual's surface when a page's rect size
-/// hasn't changed (avoids a needless surface recreation on every
-/// `build_carousel_pages` call when only window contents changed, not
-/// layout). Cards are recreated in `cards`' order, matching how
-/// `on_animation_tick`'s per-tick transform pass below will iterate
-/// them.
+/// Rebuilds `state.cards` to have exactly one entry per `cards`, reusing
+/// the visuals of pages that still exist.
 pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     let mut old_cards = std::mem::take(&mut state.cards);
     let mut rebuilt = Vec::with_capacity(cards.len());
-    for card in cards {
-        let (w, h) = (card.rect.right - card.rect.left, card.rect.bottom - card.rect.top);
-        let reused = take_reusable(
-            &mut old_cards,
-            |cv| cv.page == card.page,
-            |cv| cv.surface.width() == w && cv.surface.height() == h,
-        );
-        let card_visual = match reused {
-            Some(cv) => cv,
-            None => match gpu::create_child_surface(w.max(1), h.max(1)) {
-                Some(surface) => CardVisual {
-                    page: card.page,
-                    natural: to_rect_f(card.rect),
-                    surface,
+    if let Some(desktop) = state.desktop.as_ref() {
+        let natural = RectF::new(0.0, 0.0, desktop.width() as f64, desktop.height() as f64);
+        for card in cards {
+            let reused = take_reusable(&mut old_cards, |cv| cv.page == card.page, |_| true);
+            let card_visual = match reused {
+                Some(cv) => cv,
+                None => match gpu::create_alias_surface(desktop) {
+                    Some(surface) => CardVisual { page: card.page, natural, surface },
+                    None => continue,
                 },
-                None => continue,
-            },
-        };
-        rebuilt.push(card_visual);
+            };
+            rebuilt.push(card_visual);
+        }
     }
-    // Anything left in `old_cards` here is a page that no longer
-    // exists, or one whose surface size changed and so got rejected by
-    // the `filter` above — either way it's about to be dropped. Dropping
-    // the Rust wrapper only releases *our* COM reference; `state.root`'s
-    // visual still holds its own separate reference from the `AddVisual`
-    // call below (a previous invocation of this same function), so
-    // without an explicit `RemoveVisual` the now-orphaned child visual
-    // would never leave the composition tree — it'd leak for the rest of
-    // this monitor's overview lifetime and keep rendering stale, frozen
-    // content that no longer tracks the carousel.
+    // Anything left in `old_cards` is a page that no longer exists.
+    // Dropping the Rust wrapper only releases *our* COM reference;
+    // `state.root`'s visual still holds its own from `AddVisual`, so
+    // without an explicit `RemoveVisual` the orphan would stay in the
+    // composition tree, compositing where it was last put.
     for stale in &old_cards {
         // SAFETY: `stale.surface.visual()` was attached to
         // `state.root.visual()` by an earlier call to this function (or
@@ -378,6 +382,54 @@ pub(crate) fn rebuild_cards(state: &mut OverviewGpuState, cards: &[CardAnim]) {
     }
     state.cards = rebuilt;
     restack(state);
+}
+
+/// Points the whole-card outline at `page`, or hides it. Painted once at
+/// the picker card's size; `update_transforms` keeps it on its card.
+pub(crate) fn set_card_glow(state: &OverviewGpuState, monitor: &str, page: Option<usize>, intensity: f64) {
+    let mut slot = state.card_glow.borrow_mut();
+    let Some(page) = page else {
+        if let Some(glow) = slot.as_ref() {
+            gpu::set_opacity(glow, 0.0);
+        }
+        state.card_glow_page.set(None);
+        return;
+    };
+    let (card, _) = super::overview::card_layout(monitor);
+    let (w, h) = ((card.right - card.left).max(1), (card.bottom - card.top).max(1));
+    if !slot.as_ref().is_some_and(|g| g.width() == w && g.height() == h) {
+        if let Some(old) = slot.as_ref() {
+            // SAFETY: attached below by an earlier call; a no-op otherwise.
+            unsafe {
+                let _ = state.root.visual().RemoveVisual(old.visual());
+            }
+        }
+        *slot = gpu::create_child_surface(w, h);
+        let Some(glow) = slot.as_ref() else { return };
+        let dpi = reference_dpi();
+        let stroke = 2.0f32;
+        let full = D2D_RECT_F {
+            left: stroke / 2.0,
+            top: stroke / 2.0,
+            right: w as f32 - stroke / 2.0,
+            bottom: h as f32 - stroke / 2.0,
+        };
+        let radius = scaled(20, dpi) as f32; // the card's radius at rest
+        gpu::redraw(glow, |ctx: &ID2D1DeviceContext| {
+            gpu::clear_transparent(ctx);
+            gpu::stroke_rounded_rect(ctx, full, radius, super::design::color::accent(), 1.0, stroke);
+        });
+        // `restack` puts it in its place, just above the cards, on the
+        // next rebuild; until then it sits under the chrome.
+        // SAFETY: same device and lifetime as `root`.
+        unsafe {
+            raise_child(state.root.visual(), glow.visual());
+            raise_child(state.root.visual(), state.chrome.visual());
+        }
+    }
+    let Some(glow) = slot.as_ref() else { return };
+    state.card_glow_page.set(Some(page));
+    gpu::set_opacity(glow, intensity.clamp(0.0, 1.0) as f32);
 }
 
 /// Width of the hover ring, in 96-DPI units.
@@ -475,6 +527,9 @@ fn restack(state: &OverviewGpuState) {
     unsafe {
         for card in &state.cards {
             raise_child(state.root.visual(), card.surface.visual());
+        }
+        if let Some(glow) = state.card_glow.borrow().as_ref() {
+            raise_child(state.root.visual(), glow.visual());
         }
         for thumb in &state.thumbs {
             raise_child(state.root.visual(), thumb.surface.visual());
@@ -814,10 +869,15 @@ pub(crate) fn update_transforms(
         return;
     };
     let layout = layout_for_progress(progress, &input);
+    let picker_card = super::overview_layout::layout_for_state(
+        super::overview_layout::ControlsState::WindowPicker,
+        &input,
+    )
+    .card;
     // Live previews ride on the same rects the snapshots are transformed
     // into, so a preview tracks the flight frame for frame. Collected
     // here and handed to DWM once at the end.
-    let mut live: Vec<(HWND, RECT)> = Vec::new();
+    let mut live: Vec<(HWND, RECT, Option<RECT>)> = Vec::new();
 
     for card_visual in &gpu_state.cards {
         let dx = (card_visual.page as f64 - carousel_offset) * layout.pitch;
@@ -846,13 +906,41 @@ pub(crate) fn update_transforms(
             )
         };
 
+        let card_target = apply(layout.card);
         // SAFETY: the visual outlives `gpu_state`; `SetTransform2` takes
         // a matrix pointer valid for this synchronous call.
         unsafe {
             let _ = card_visual
                 .surface
                 .visual()
-                .SetTransform2(&surface_transform(card_visual.natural, apply(layout.card)));
+                .SetTransform2(&surface_transform(card_visual.natural, card_target));
+        }
+        // Corners round off as the card shrinks. The clip is in the
+        // visual's own coordinates and scales with it, so the radius is
+        // divided back out.
+        let card_scale = if card_visual.natural.width() > 0.0 {
+            card_target.width() / card_visual.natural.width()
+        } else {
+            1.0
+        };
+        gpu::set_rounded_clip(
+            &card_visual.surface,
+            D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: card_visual.natural.width() as f32,
+                bottom: card_visual.natural.height() as f32,
+            },
+            (layout.card_radius / card_scale.max(1e-6)) as f32,
+        );
+        if gpu_state.card_glow_page.get() == Some(card_visual.page) {
+            if let Some(glow) = gpu_state.card_glow.borrow().as_ref() {
+                let natural = RectF::new(0.0, 0.0, glow.width() as f64, glow.height() as f64);
+                // SAFETY: as above.
+                unsafe {
+                    let _ = glow.visual().SetTransform2(&surface_transform(natural, card_target));
+                }
+            }
         }
 
         for th in thumbs.iter().filter(|t| t.page == card_visual.page) {
@@ -869,7 +957,11 @@ pub(crate) fn update_transforms(
             // `overview_layout` are one system now, so hit-testing and
             // rendering cannot disagree.
             let home = th.home.map(to_rect_f);
-            let flown = thumb_rect(home, to_rect_f(th.rect), progress);
+            let flown = match home {
+                Some(_) => thumb_rect(home, to_rect_f(th.rect), progress),
+                // Nowhere to fly from: it stays on the card and fades in.
+                None => ride_card(to_rect_f(th.rect), picker_card, layout.card),
+            };
             // A dragged window is held by the cursor, not laid out in
             // the grid, so it skips the carousel/zoom mapping that puts
             // previews on their card — the ghost rect is already in
@@ -886,7 +978,7 @@ pub(crate) fn update_transforms(
                     .visual()
                     .SetTransform2(&surface_transform(visual.natural, tgt));
             }
-            gpu::set_opacity(&visual.surface, thumb_alpha(home, progress) as f32);
+            gpu::set_opacity_uncommitted(&visual.surface, thumb_alpha(home, progress) as f32);
 
             if super::thumbnails::can_preview(th.hwnd) {
                 // Inset by the hover ring's width. DWM composites a live
@@ -895,7 +987,11 @@ pub(crate) fn update_transforms(
                 // by it — which is why the hover ring never appeared on
                 // any window that was not minimized. Leaving this margin
                 // is what gives the ring somewhere to show.
-                let inset = scaled(HOVER_RING_DP, input.dpi) as f64;
+                //
+                // The margin grows with progress: on the desktop the
+                // preview has to cover its window exactly.
+                let at_rest = scaled(HOVER_RING_DP, input.dpi) as f64;
+                let inset = if dragged.is_some() { at_rest } else { live_inset(at_rest, progress) };
                 live.push((
                     th.hwnd,
                     RECT {
@@ -904,6 +1000,7 @@ pub(crate) fn update_transforms(
                         right: (tgt.right - inset).round() as i32,
                         bottom: (tgt.bottom - inset).round() as i32,
                     },
+                    th.source,
                 ));
             }
         }
@@ -939,8 +1036,16 @@ pub(crate) fn update_transforms(
         unsafe {
             let _ = strip.visual().SetTransform2(&surface_transform(gpu_state.strip_natural, target));
         }
-        gpu::set_opacity(strip, layout.strip_alpha as f32);
+        gpu::set_opacity_uncommitted(strip, layout.strip_alpha as f32);
     }
+    // The search field and whatever else the chrome holds arrive with
+    // the rest of the furniture instead of standing over the desktop
+    // from the first frame.
+    gpu::set_opacity_uncommitted(&gpu_state.chrome, layout.search_alpha as f32);
+    // Opaque for as long as it is on screen, never faded. The one
+    // exception is the moment before it is revealed, when only the live
+    // previews show.
+    gpu::set_opacity_uncommitted(&gpu_state.root, if gpu_state.revealed.get() { 1.0 } else { 0.0 });
 
     // DWM composites these above this window's own content, so the
     // painted snapshot stays underneath as the base layer and shows
@@ -1051,68 +1156,44 @@ pub(crate) fn icon_to_hbitmap(icon: HICON, size: i32) -> Option<HBITMAP> {
     }
 }
 
-/// Which piece of hover-glow state (if any) `paint_card` should render
-/// on this call — a whole-card border (a real window drag hovering
-/// this card, matched by page) or a single-thumbnail border (plain
-/// browsing, matched by hwnd). Hover glow lives on card content, not
-/// root, per this task's design scoping — mutually exclusive in
-/// practice (starting a window drag clears `hover_thumb`, and
-/// `on_overview_hover` is a no-op while a drag is active).
-pub(crate) enum HoverTarget {
-    Card(usize),
-}
-
-/// Paints one card's frame (wallpaper-filled rounded rect, drop-shadow
-/// approximation), thumbnails (each clipped/rounded, WIC-bridged from
-/// the existing `PrintWindow` capture cache), icon badges, placeholder
-/// chips, and — when `hover` names this card or one of its thumbnails —
-/// the light-blue hover-glow outline. Mirrors the corresponding subset
-/// of `overview::paint_overview`'s GDI drawing, at the card's own
-/// natural (unscrolled) size. `thumbs` must already be filtered to this
-/// card's `page`.
-/// Paints one workspace card's surface: wallpaper, rounded frame, and
-/// the whole-card hover glow.
+/// Paints the picture every card shows: the desktop as it looks with no
+/// windows on it, wallpaper and icons, at the monitor's own size.
 ///
-/// It no longer draws the window previews. Each preview is its own
-/// composition visual now (see `rebuild_thumbs`), which is what lets a
-/// frame be transforms only — the card is painted once per session
-/// instead of whenever a preview moved.
-pub(crate) fn paint_card(
-    card_visual: &CardVisual,
-    card_rect: RECT,
-    monitor: &str,
-    hover: Option<(HoverTarget, f64)>,
-) {
-    let dpi = reference_dpi();
-    let card_radius = scaled(20, dpi) as f32; // CARD_CORNER_RADIUS
-    let (origin_x, origin_y) = (card_rect.left, card_rect.top);
-    let full = rect_to_d2d(card_rect, origin_x, origin_y);
-
-    gpu::redraw(&card_visual.surface, |ctx: &ID2D1DeviceContext| {
-        // The card is rounded, so its corners must start empty — with no
-        // redirection bitmap there is nothing opaque behind them.
-        gpu::clear_transparent(ctx);
-        // Flat fallback fill (shows through if the wallpaper bridge
-        // below fails), then the wallpaper itself.
-        gpu::fill_rounded_rect(ctx, full, card_radius, 0x00302010);
-        if let Some(wallpaper) = super::overview::wallpaper_hbitmap_for(monitor, card_rect) {
-            if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, wallpaper) {
-                gpu::draw_rounded_bitmap(ctx, full, card_radius, &bitmap);
+/// Uploaded only when the capture has changed (see `desktop_capture`). With no capture yet, the wallpaper
+/// stretched to the monitor stands in; that is not pixel-exact for every
+/// wallpaper fit, so the first frame can differ from the desktop until a
+/// capture arrives.
+pub(crate) fn paint_desktop_if_changed(gpu: &OverviewGpuState, monitor: &str) {
+    let Some(surface) = gpu.desktop.as_ref() else { return };
+    let (w, h) = (surface.width(), surface.height());
+    let newest = super::desktop_capture::generation();
+    let painted = gpu.desktop_generation.get();
+    if painted == Some(newest) {
+        return;
+    }
+    let pixels = super::desktop_capture::pixels(monitor, w, h);
+    if pixels.is_none() {
+        // Nothing to paint from: no capture yet, or this surface is
+        // newer than the last one (a monitor that has just appeared).
+        super::request_desktop_capture();
+        if painted.is_some() {
+            // Whatever it shows now is better than the stand-in.
+            return;
+        }
+    }
+    gpu.desktop_generation.set(Some(if pixels.is_some() { newest } else { 0 }));
+    let full = D2D_RECT_F { left: 0.0, top: 0.0, right: w as f32, bottom: h as f32 };
+    gpu::redraw(surface, |ctx: &ID2D1DeviceContext| {
+        gpu::fill_rect(ctx, full, 0x00302010);
+        if let Some(pixels) = pixels.as_ref() {
+            if let Some(bitmap) = gpu::bitmap_from_bgra_sized(ctx, pixels, w, h) {
+                gpu::draw_bitmap_stretched(ctx, full, &bitmap);
+                return;
             }
         }
-
-        // Whole-card hover glow: this card is the one a real window
-        // drag currently sits over.
-        if let Some((HoverTarget::Card(page), intensity)) = &hover {
-            if *page == card_visual.page && *intensity > 0.001 {
-                gpu::stroke_rounded_rect(
-                    ctx,
-                    full,
-                    card_radius,
-                    super::design::color::accent(),
-                    *intensity as f32,
-                    2.0,
-                );
+        if let Some(wallpaper) = super::overview::wallpaper_hbitmap_sized(w, h) {
+            if let Some(bitmap) = gpu::bitmap_from_hbitmap(ctx, wallpaper) {
+                gpu::draw_bitmap_stretched(ctx, full, &bitmap);
             }
         }
     });

@@ -11,6 +11,7 @@ mod calendar;
 /// binary already calls them by, so `super::design::color::text()` keeps
 /// resolving.
 pub(crate) use groveshell_ui_kit::design;
+mod desktop_capture;
 mod desktop_dock;
 mod dock;
 mod dock_pins;
@@ -658,6 +659,9 @@ pub fn main() -> Result<()> {
             .with(|s| s.borrow().as_ref().map(|st| st.config.input.touchpad_gestures))
             .unwrap_or(true);
         apply_touchpad_gestures(primary_bar_hwnd, touchpad_gestures);
+        // So the first Activities press already has the real desktop to
+        // show, not the stand-in.
+        request_desktop_capture();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -819,6 +823,17 @@ fn apply_touchpad_gestures(target: HWND, enabled: bool) {
 /// its travel in hundredths of a millimetre.
 #[cfg(debug_assertions)]
 pub(crate) const WM_APP_DEBUG_SWIPE: u32 = WM_APP + 3;
+
+/// A capture of the desktop has arrived from its worker thread;
+/// `lparam` owns it. See `desktop_capture`.
+pub(crate) const WM_APP_DESKTOP_CAPTURED: u32 = WM_APP + 4;
+
+/// Asks for a fresh picture of the desktop for the overview's cards.
+pub(crate) fn request_desktop_capture() {
+    if let Some(target) = state::primary_bar_hwnd() {
+        desktop_capture::request(target, WM_APP_DESKTOP_CAPTURED);
+    }
+}
 
 /// Sent by DWM to every top-level window when the user changes their
 /// Windows accent color. Not surfaced by the `windows` crate under a
@@ -1343,6 +1358,15 @@ unsafe extern "system" fn wndproc(
             // Raw input must still reach `DefWindowProc`, which frees it.
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_APP_DESKTOP_CAPTURED => {
+            if desktop_capture::on_captured(lparam) {
+                overview::repaint_desktops();
+                // Every overview has uploaded it; the copy here is tens
+                // of megabytes nobody will read again.
+                desktop_capture::release_pixels();
+            }
+            LRESULT(0)
+        }
         #[cfg(debug_assertions)]
         WM_APP_DEBUG_SWIPE => {
             use touchpad::{Axis, SwipeEvent};
@@ -1528,6 +1552,8 @@ unsafe extern "system" fn wndproc(
                 let hinstance = windows::Win32::Foundation::HINSTANCE(module.0);
                 let _ = hotplug::reconcile_monitors(hinstance);
             }
+            // The desktop is a different shape now.
+            request_desktop_capture();
             LRESULT(0)
         }
         WM_TIMER => {

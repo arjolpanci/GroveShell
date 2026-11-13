@@ -1,6 +1,4 @@
-//! DirectComposition/Direct2D rendering foundation (Phase 1 of the
-//! animation-fluidity work — see
-//! `docs/design/2026-07-29-directcomposition-rendering-foundation-design.md`).
+//! DirectComposition/Direct2D rendering foundation.
 //! Owns process-wide GPU device setup and per-window composition
 //! surfaces. If setup fails at any point, `is_enabled()` returns `false`
 //! for the rest of the process's life and every caller falls back to its
@@ -80,7 +78,10 @@ pub fn is_enabled() -> bool {
 }
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::DirectComposition::{IDCompositionSurface, IDCompositionTarget, IDCompositionVisual2, IDCompositionVisual3};
+use windows::Win32::Graphics::DirectComposition::{
+    IDCompositionRectangleClip, IDCompositionSurface, IDCompositionTarget, IDCompositionVisual2,
+    IDCompositionVisual3,
+};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM};
 
 /// One window's GPU-composited surface: a target bound to its `HWND`, a
@@ -98,6 +99,9 @@ pub struct GpuSurface {
     target: Option<IDCompositionTarget>,
     visual: IDCompositionVisual2,
     surface: IDCompositionSurface,
+    /// The visual's rounded clip, created the first time one is asked
+    /// for and then only updated (see [`set_rounded_clip`]).
+    clip: RefCell<Option<IDCompositionRectangleClip>>,
     width: i32,
     height: i32,
 }
@@ -143,7 +147,7 @@ fn try_create_surface(ctx: &GpuContext, hwnd: HWND, width: i32, height: i32) -> 
         let (visual, surface) = try_create_visual(ctx, width, height)?;
         target.SetRoot(&visual)?;
         ctx.dcomp_device.Commit()?;
-        Ok(GpuSurface { target: Some(target), visual, surface, width, height })
+        Ok(GpuSurface { target: Some(target), visual, surface, clip: RefCell::new(None), width, height })
     }
 }
 
@@ -182,7 +186,7 @@ pub fn create_child_surface(width: i32, height: i32) -> Option<GpuSurface> {
         // SAFETY: `ctx` is the process-wide device, alive for the process.
         match unsafe { try_create_visual(ctx, width, height) } {
             Ok((visual, surface)) => {
-                Some(GpuSurface { target: None, visual, surface, width, height })
+                Some(GpuSurface { target: None, visual, surface, clip: RefCell::new(None), width, height })
             }
             Err(e) => {
                 tracing::warn!(error = ?e, width, height, "child composition surface setup failed");
@@ -190,6 +194,84 @@ pub fn create_child_surface(width: i32, height: i32) -> Option<GpuSurface> {
             }
         }
     })
+}
+
+/// Creates a second visual showing the *same* pixels as `source`.
+///
+/// Drawing into either one changes both, and the pixels are stored
+/// once. The overview's workspace cards all show the same picture of the
+/// desktop at full monitor resolution; one copy per card would be tens
+/// of megabytes each, uploaded again on every open.
+///
+/// As with [`create_child_surface`], the caller attaches the visual.
+pub fn create_alias_surface(source: &GpuSurface) -> Option<GpuSurface> {
+    GPU.with(|g| {
+        let g = g.borrow();
+        let ctx = g.as_ref()?;
+        // SAFETY: `ctx` is the process-wide device; `source.surface` is
+        // alive, and the new visual takes its own reference to it.
+        unsafe {
+            let visual = ctx.dcomp_device.CreateVisual().ok()?;
+            visual.SetContent(&source.surface).ok()?;
+            Some(GpuSurface {
+                target: None,
+                visual,
+                surface: source.surface.clone(),
+                clip: RefCell::new(None),
+                width: source.width,
+                height: source.height,
+            })
+        }
+    })
+}
+
+/// Clips `surface`'s visual to a rounded rectangle, given in the
+/// visual's own coordinates: the clip is transformed with the visual, so
+/// a radius meant to be `r` on screen has to be passed as `r / scale`.
+///
+/// Does not commit; the caller is mid-frame and commits once.
+pub fn set_rounded_clip(surface: &GpuSurface, rect: D2D_RECT_F, radius: f32) {
+    GPU.with(|g| {
+        let g = g.borrow();
+        let Some(ctx) = g.as_ref() else { return };
+        let mut slot = surface.clip.borrow_mut();
+        // SAFETY: the clip and the visual belong to the process-wide
+        // device and live as long as `surface` does.
+        unsafe {
+            if slot.is_none() {
+                let Ok(clip) = ctx.dcomp_device.CreateRectangleClip() else { return };
+                if surface.visual.SetClip(&clip).is_err() {
+                    return;
+                }
+                *slot = Some(clip);
+            }
+            let Some(clip) = slot.as_ref() else { return };
+            let _ = clip.SetLeft2(rect.left);
+            let _ = clip.SetTop2(rect.top);
+            let _ = clip.SetRight2(rect.right);
+            let _ = clip.SetBottom2(rect.bottom);
+            let radius = radius.max(0.0);
+            let _ = clip.SetTopLeftRadiusX2(radius);
+            let _ = clip.SetTopLeftRadiusY2(radius);
+            let _ = clip.SetTopRightRadiusX2(radius);
+            let _ = clip.SetTopRightRadiusY2(radius);
+            let _ = clip.SetBottomLeftRadiusX2(radius);
+            let _ = clip.SetBottomLeftRadiusY2(radius);
+            let _ = clip.SetBottomRightRadiusX2(radius);
+            let _ = clip.SetBottomRightRadiusY2(radius);
+        }
+    });
+}
+
+/// Sets a visual's opacity without committing, for callers that set
+/// several things in one frame and commit once.
+pub fn set_opacity_uncommitted(surface: &GpuSurface, opacity: f32) {
+    // SAFETY: as in [`set_opacity`].
+    unsafe {
+        if let Ok(visual3) = surface.visual.cast::<IDCompositionVisual3>() {
+            let _ = visual3.SetOpacity2(opacity);
+        }
+    }
 }
 
 /// Sets `surface`'s root visual opacity (0.0–1.0) and commits. No-op if
@@ -565,9 +647,19 @@ pub fn bitmap_from_bgra(
     pixels: &[u8],
     size: i32,
 ) -> Option<ID2D1Bitmap> {
-    let size = size.max(1);
-    let stride = (size as u32).checked_mul(4)?;
-    if pixels.len() < (stride as usize) * (size as usize) {
+    bitmap_from_bgra_sized(ctx, pixels, size, size)
+}
+
+/// [`bitmap_from_bgra`] for a buffer that is not square.
+pub fn bitmap_from_bgra_sized(
+    ctx: &ID2D1DeviceContext,
+    pixels: &[u8],
+    width: i32,
+    height: i32,
+) -> Option<ID2D1Bitmap> {
+    let (width, height) = (width.max(1), height.max(1));
+    let stride = (width as u32).checked_mul(4)?;
+    if pixels.len() < (stride as usize) * (height as usize) {
         return None;
     }
     use windows::Win32::Graphics::Direct2D::Common::{
@@ -584,12 +676,12 @@ pub fn bitmap_from_bgra(
         dpiY: 96.0,
         ..Default::default()
     };
-    // SAFETY: `pixels` is at least `stride * size` bytes, which is what
-    // `CreateBitmap` reads for the given size and stride; the data is
-    // copied into the bitmap, so the borrow ends with this call.
+    // SAFETY: `pixels` is at least `stride * height` bytes, which is
+    // what `CreateBitmap` reads for the given size and stride; the data
+    // is copied into the bitmap, so the borrow ends with this call.
     unsafe {
         ctx.CreateBitmap(
-            D2D_SIZE_U { width: size as u32, height: size as u32 },
+            D2D_SIZE_U { width: width as u32, height: height as u32 },
             Some(pixels.as_ptr() as *const std::ffi::c_void),
             stride,
             &props,

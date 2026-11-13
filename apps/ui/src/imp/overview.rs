@@ -39,7 +39,7 @@ use super::bar::{raise_bars_topmost, refresh_bar_indicator};
 use super::calendar::hide_calendar;
 use groveshell_motion::{Adjustment, Easing};
 
-use super::gpu;
+
 use super::monitors::monitors_sorted_by_x;
 use super::quick_settings::hide_quick_settings;
 use super::state::{reference_dpi, scaled, STATE, ANIM_TIMER_ID, ANIM_TIMER_INTERVAL_MS};
@@ -147,6 +147,10 @@ pub(crate) struct ThumbAnim {
     /// minimized. Those just fade with the card instead, which is the
     /// honest thing to show for a window that is not actually anywhere.
     pub(crate) home: Option<RECT>,
+    /// The part of the window `home` shows, in the window's own
+    /// coordinates: its visible frame, without the invisible resize
+    /// border, cut off at the monitor's edge. `None` with `home`.
+    pub(crate) source: Option<RECT>,
 }
 
 /// One workspace's card background rect — fixed once built (`page`
@@ -212,6 +216,19 @@ pub(crate) struct OverviewInstance {
     /// discrete slot.
     pub(crate) dock_cursor_x: Option<i32>,
     pub(crate) search_query: String,
+    /// When the composed overview may show itself, after being opened.
+    ///
+    /// DWM takes a frame or two to start drawing a newly registered live
+    /// preview. Shown opaque straight away, the overview's first frames
+    /// had every window as a blank plate where its picture was about to
+    /// be. So the window is first shown with nothing of its own visible:
+    /// the previews come up exactly over the windows they are of, which
+    /// changes nothing on screen, and only then does the rest appear
+    /// behind them and the motion start.
+    pub(crate) reveal_at: Option<Instant>,
+    /// Whether revealing should also start the ease to the picker. Not
+    /// for a gesture, where the fingers own the value.
+    pub(crate) ease_on_reveal: bool,
     /// `None` if GPU rendering isn't available for this window (see
     /// `gpu::is_enabled`) or this specific window's DirectComposition
     /// setup failed — `paint_overview`/`repaint_overview`/
@@ -241,6 +258,8 @@ impl OverviewInstance {
             dock_hover: None,
             dock_cursor_x: None,
             search_query: String::new(),
+            reveal_at: None,
+            ease_on_reveal: false,
             gpu: super::overview_gpu::create(hwnd, width, height),
         }
     }
@@ -695,6 +714,7 @@ pub(crate) fn layout_input(monitor: &str) -> Option<super::overview_layout::Layo
     let width = (m.rect.right - m.rect.left) as f64;
     let height = (m.rect.bottom - m.rect.top) as f64;
     Some(super::overview_layout::LayoutInput {
+        monitor: groveshell_motion::RectF::new(0.0, 0.0, width, height),
         // Client coordinates: the overview window covers its monitor
         // exactly, so the monitor's top-left is the client origin.
         work_area: groveshell_motion::RectF::new(0.0, bar, width, height),
@@ -736,11 +756,11 @@ pub(crate) fn build_carousel_pages(monitor: &str) -> (Vec<CardAnim>, Vec<ThumbAn
     let (card_rect, _) = card_layout(monitor);
     // The overview window covers its monitor exactly, so the monitor's
     // top-left is the client origin that screen rects convert against.
-    let origin = super::monitors::monitors_sorted_by_x()
+    let monitor_rect = super::monitors::monitors_sorted_by_x()
         .iter()
         .find(|m| m.device_name == monitor)
-        .map(|m| (m.rect.left, m.rect.top))
-        .unwrap_or((0, 0));
+        .map(|m| m.rect)
+        .unwrap_or_default();
     let mut cards = Vec::new();
     let mut thumbs = Vec::new();
     // Every tracked window across every workspace, parked or not — the
@@ -796,6 +816,7 @@ pub(crate) fn build_carousel_pages(monitor: &str) -> (Vec<CardAnim>, Vec<ThumbAn
                 capture_window_snapshot(source);
             }
 
+            let placement = window_home_rect(source, monitor_rect);
             thumbs.push(ThumbAnim {
                 hwnd: source,
                 title: window.title,
@@ -803,24 +824,61 @@ pub(crate) fn build_carousel_pages(monitor: &str) -> (Vec<CardAnim>, Vec<ThumbAn
                 page,
                 rect: slot_rect,
                 icon_rect,
-                home: window_home_rect(source, origin),
+                home: placement.map(|(home, _)| home),
+                source: placement.map(|(_, part)| part),
             });
         }
     }
+
+    // Bottom window first. Previews are stacked in this order, and on
+    // the desktop end of the transition they overlap exactly as their
+    // windows do, so the order has to be the windows' own.
+    let stacking = z_order();
+    thumbs.sort_by_key(|t| {
+        std::cmp::Reverse(stacking.iter().position(|h| *h == t.hwnd.0 as isize).unwrap_or(usize::MAX))
+    });
 
     let dock_apps = super::dock::build_dock_apps(&all_windows);
     (cards, thumbs, current_pos, dock_apps)
 }
 
-/// A window's real on-screen rect, expressed in the overview window's
-/// client coordinates, or `None` if it has no meaningful one right now.
+/// Every top-level window, topmost first.
+fn z_order() -> Vec<isize> {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: `lparam` is the `Vec` passed below, alive for the
+        // whole synchronous enumeration.
+        let out = unsafe { &mut *(lparam.0 as *mut Vec<isize>) };
+        out.push(hwnd.0 as isize);
+        true.into()
+    }
+    let mut out: Vec<isize> = Vec::new();
+    // SAFETY: `out` outlives the call; `EnumWindows` reports top-level
+    // windows in z-order.
+    unsafe {
+        let _ = EnumWindows(Some(each), LPARAM(&mut out as *mut Vec<isize> as isize));
+    }
+    out
+}
+
+/// Where a window can be seen on `monitor_rect` right now, as
+/// `(home, part)`: the rect in overview-client coordinates, and the same
+/// rect in the window's own coordinates. `None` if it has no meaningful
+/// place there.
 ///
 /// Used as the start/end point of the fly-out/fly-in animation, so a
-/// preview appears to lift off the actual window and settle back onto it.
-/// A hidden window (parked on another workspace) is excluded: its last
+/// preview lifts off the actual window and settles back onto it. A
+/// hidden window (parked on another workspace) is excluded: its last
 /// rect is stale and flying a preview to an empty patch of desktop would
 /// be a lie.
-fn window_home_rect(source: HWND, origin: (i32, i32)) -> Option<RECT> {
+///
+/// The rect is the window's *visible* frame. `GetWindowRect` includes an
+/// invisible resize border on three sides, and a maximized window hangs
+/// over the monitor's edges by that much; a preview drawn at that rect
+/// starts out larger than the window it stands for.
+fn window_home_rect(source: HWND, monitor_rect: RECT) -> Option<(RECT, RECT)> {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::UI::WindowsAndMessaging::{IsIconic, IsWindowVisible};
     // SAFETY: plain queries; a stale handle fails rather than misbehaves.
     unsafe {
@@ -828,18 +886,91 @@ fn window_home_rect(source: HWND, origin: (i32, i32)) -> Option<RECT> {
             return None;
         }
     }
-    let mut r = RECT::default();
-    // SAFETY: as above; `r` is written only on success.
-    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(source, &mut r) }.is_err() {
+    let mut window = RECT::default();
+    // SAFETY: as above; `window` is written only on success.
+    if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(source, &mut window) }.is_err() {
         return None;
     }
-    Some(RECT {
-        left: r.left - origin.0,
-        top: r.top - origin.1,
-        right: r.right - origin.0,
-        bottom: r.bottom - origin.1,
-    })
+    let mut frame = RECT::default();
+    // SAFETY: `frame` is a live out-parameter of the size passed.
+    let framed = unsafe {
+        DwmGetWindowAttribute(
+            source,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut frame as *mut RECT as *mut c_void,
+            core::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .is_ok();
+    visible_placement(window, if framed { frame } else { window }, monitor_rect)
 }
+
+/// The arithmetic of [`window_home_rect`]: `frame` cut off at the
+/// monitor, expressed once against the monitor and once against the
+/// window.
+pub(crate) fn visible_placement(window: RECT, frame: RECT, monitor: RECT) -> Option<(RECT, RECT)> {
+    let seen = RECT {
+        left: frame.left.max(monitor.left),
+        top: frame.top.max(monitor.top),
+        right: frame.right.min(monitor.right),
+        bottom: frame.bottom.min(monitor.bottom),
+    };
+    if seen.right <= seen.left || seen.bottom <= seen.top {
+        return None;
+    }
+    let against = |origin: RECT| RECT {
+        left: seen.left - origin.left,
+        top: seen.top - origin.top,
+        right: seen.right - origin.left,
+        bottom: seen.bottom - origin.top,
+    };
+    Some((against(monitor), against(window)))
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    fn r(left: i32, top: i32, right: i32, bottom: i32) -> RECT {
+        RECT { left, top, right, bottom }
+    }
+
+    #[test]
+    fn the_invisible_border_is_left_out() {
+        let window = r(93, 100, 907, 607);
+        let frame = r(100, 100, 900, 600);
+        let (home, part) = visible_placement(window, frame, r(0, 0, 1920, 1080)).unwrap();
+        assert_eq!(home, frame);
+        assert_eq!(part, r(7, 0, 807, 500));
+    }
+
+    #[test]
+    fn a_maximized_window_is_cut_off_at_the_monitor() {
+        let window = r(-8, -8, 1928, 1088);
+        let (home, part) = visible_placement(window, window, r(0, 0, 1920, 1080)).unwrap();
+        assert_eq!(home, r(0, 0, 1920, 1080));
+        assert_eq!(part, r(8, 8, 1928, 1088));
+    }
+
+    #[test]
+    fn home_is_relative_to_a_monitor_left_of_the_primary() {
+        let monitor = r(-3072, -278, 0, 1642);
+        let frame = r(-3000, 0, -2000, 500);
+        let (home, part) = visible_placement(frame, frame, monitor).unwrap();
+        assert_eq!(home, r(72, 278, 1072, 778));
+        assert_eq!(part, r(0, 0, 1000, 500));
+    }
+
+    #[test]
+    fn a_window_on_another_monitor_has_no_place_on_this_one() {
+        let frame = r(2000, 0, 2500, 500);
+        assert_eq!(visible_placement(frame, frame, r(0, 0, 1920, 1080)), None);
+    }
+}
+
+/// How long the live previews are given to come up before the rest of
+/// the overview is shown behind them. See `OverviewInstance::reveal_at`.
+const REVEAL_DELAY: Duration = Duration::from_millis(40);
 
 /// Shows the overview and fades it in (see the module docs on why
 /// there's no per-window position animation anymore): builds every
@@ -891,12 +1022,9 @@ fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
                     // Static for the life of the window: painting it per
                     // rebuild cost 62ms each time, under the pointer.
                     super::overview_gpu::paint_backdrop_once(gpu);
+                    super::overview_gpu::paint_desktop_if_changed(gpu, monitor);
                     super::overview_gpu::rebuild_cards(gpu, &cards);
-                    for card_visual in &gpu.cards {
-                        if let Some(card) = cards.iter().find(|c| c.page == card_visual.page) {
-                            super::overview_gpu::paint_card(card_visual, card.rect, monitor, None);
-                        }
-                    }
+                    super::overview_gpu::set_card_glow(gpu, monitor, None, 0.0);
                     super::overview_gpu::rebuild_thumbs(gpu, &thumbs);
                 }
             }
@@ -924,10 +1052,20 @@ fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
                 // every preview sits exactly on its real window, so the
                 // first composed frame is a picture of the desktop and
                 // nothing flashes; see `overview_layout::thumb_rect`.
+                let composed = ov.gpu.is_some();
+                if let Some(gpu) = ov.gpu.as_ref() {
+                    gpu.revealed.set(false);
+                }
+                ov.reveal_at = composed.then(|| Instant::now() + REVEAL_DELAY);
+                ov.ease_on_reveal = false;
                 match park_at {
                     Some(p) => {
                         ov.adjustment.set_value(p);
                         ov.adjustment.set_gesture_in_progress(true);
+                    }
+                    None if composed => {
+                        ov.adjustment.set_value(0.0);
+                        ov.ease_on_reveal = true;
                     }
                     None => {
                         ov.adjustment.set_value(0.0);
@@ -943,16 +1081,36 @@ fn open_overview_inner(monitor: &str, park_at: Option<f64>) {
         }
     });
 
-    let gpu_root_opacity_set = STATE.with(|s| {
+    // Compose the first frame before the window is shown. Nothing fades
+    // in, so the frame the window appears with has to be complete, and
+    // at 0.0 it is a picture of the desktop: showing the window changes
+    // nothing on screen.
+    let composed = STATE.with(|s| {
         let state = s.borrow();
         let ov = state.as_ref()?.overviews.get(monitor)?;
         let gpu = ov.gpu.as_ref()?;
-        gpu::set_opacity(&gpu.root, 0.0);
+        super::overview_gpu::paint_root(gpu, monitor, ov);
+        super::overview_gpu::paint_dash(gpu, monitor, ov);
+        let (pages, current) = strip_pages(monitor);
+        super::overview_gpu::paint_strip_if_changed(gpu, monitor, pages, current);
+        let thumbs: &[ThumbAnim] = match &ov.mode {
+            OverviewMode::Live { thumbs, .. } => thumbs,
+            OverviewMode::Closed => &[],
+        };
+        super::overview_gpu::update_transforms(
+            ov.hwnd,
+            gpu,
+            monitor,
+            ov.carousel.value(),
+            ov.adjustment.value(),
+            thumbs,
+            ov.ghost(),
+        );
         Some(())
     });
     // SAFETY: `overview_hwnd` is a valid, process-lifetime window.
     unsafe {
-        if gpu_root_opacity_set.is_none() {
+        if composed.is_none() {
             let _ = SetLayeredWindowAttributes(overview_hwnd, COLORREF(0), 0, LWA_ALPHA);
         }
         let _ = ShowWindow(overview_hwnd, SW_SHOW);
@@ -1016,31 +1174,30 @@ pub(crate) fn rebuild_open_overview_pages(monitor: &str) {
         let mut state = s.borrow_mut();
         let ov = state.as_mut()?.overviews.get_mut(monitor)?;
         let carousel_offset = ov.carousel.value();
+        let progress = ov.adjustment.value();
         // Read before `ov.gpu` is borrowed mutably below.
         let ghost = ov.ghost();
         let gpu = ov.gpu.as_mut()?;
         super::overview_gpu::paint_backdrop_once(gpu);
+        super::overview_gpu::paint_desktop_if_changed(gpu, monitor);
         super::overview_gpu::rebuild_cards(gpu, &cards);
-        for card_visual in &gpu.cards {
-            if let Some(card) = cards.iter().find(|c| c.page == card_visual.page) {
-                super::overview_gpu::paint_card(card_visual, card.rect, monitor, None);
-            }
-        }
+        super::overview_gpu::set_card_glow(gpu, monitor, None, 0.0);
         super::overview_gpu::rebuild_thumbs(gpu, &thumbs);
-        // Newly created/repositioned card visuals sit at their default
+        // Newly created/repositioned visuals sit at their default
         // identity transform (top-left of the window) until something
         // calls `update_transforms` — this function can run while the
-        // overview is idly `Open` with `ANIM_TIMER` already stopped
+        // overview is idly open with `ANIM_TIMER` already stopped
         // (workspace add/remove, window dragged to another card), so it
-        // must apply the current carousel position itself rather than
-        // waiting for the next tick/mouse-move. Zoom is always `1.0`
-        // here since this only ever runs while fully open, so progress
-        // is 1.0 and every preview sits in its grid slot.
-        let thumbs: &[ThumbAnim] = match &ov.mode {
-            OverviewMode::Live { thumbs, .. } => thumbs,
-            OverviewMode::Closed => &[],
-        };
-        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, 1.0, thumbs, ghost);
+        // must place them itself rather than wait for the next tick.
+        //
+        // At the overview's *current* progress, and against the pages
+        // just built. This runs whenever any window in the system is
+        // shown, hidden or retitled, which is often in the middle of an
+        // open or a close. It used to place everything at progress 1.0
+        // against the previous pages: for one frame every preview was in
+        // its grid slot, then the next tick put it back in flight. That
+        // was the jump on a quick double tap of the Windows key.
+        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, carousel_offset, progress, &thumbs, ghost);
         Some(())
     });
 
@@ -1129,6 +1286,7 @@ pub(crate) fn close_overview(monitor: &str, focus_after: Option<HWND>) {
         // down when the adjustment reaches 0.0, in `on_animation_tick`'s
         // `Completion::Closed` arm.
         ov.close_after = focus_after;
+        ov.ease_on_reveal = false;
         ov.adjustment.ease_to_at(
             0.0,
             super::design::motion::effective_ms(super::design::motion::BASE_MS),
@@ -1580,26 +1738,10 @@ pub(crate) fn on_overview_drag_start(monitor: &str, x: i32, y: i32) {
 fn repaint_card_hover_diff(
     gpu: &super::overview_gpu::OverviewGpuState,
     monitor: &str,
-    card_rect: RECT,
-    old_page: Option<usize>,
     new_page: Option<usize>,
     intensity: f64,
 ) {
-    let mut pages = Vec::with_capacity(2);
-    if let Some(p) = old_page {
-        pages.push(p);
-    }
-    if let Some(p) = new_page {
-        if !pages.contains(&p) {
-            pages.push(p);
-        }
-    }
-    for page in pages {
-        let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) else { continue };
-        let hover = (Some(page) == new_page)
-            .then_some((super::overview_gpu::HoverTarget::Card(page), intensity));
-        super::overview_gpu::paint_card(card_visual, card_rect, monitor, hover);
-    }
+    super::overview_gpu::set_card_glow(gpu, monitor, new_page, intensity);
 }
 
 /// Repaints just the card(s) affected by a per-thumbnail hover-glow
@@ -1688,7 +1830,15 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs, ov.ghost());
+        super::overview_gpu::update_transforms(
+            ov.hwnd,
+            gpu,
+            monitor,
+            ov.carousel.value(),
+            ov.adjustment.value(),
+            thumbs,
+            ov.ghost(),
+        );
         match kind {
             MoveKind::Window { old_page } => {
                 // A real window drag: the ghost follows the cursor (root
@@ -1706,9 +1856,9 @@ pub(crate) fn on_overview_drag_move(monitor: &str, x: i32, y: i32) {
                 if let Some(drag) = ov.window_drag.as_ref() {
                     if drag.max_delta > CAROUSEL_DRAG_CLICK_THRESHOLD_PX {
                         if let OverviewMode::Live { .. } = &ov.mode {
-                            let (card_rect, _) = card_layout(monitor);
+                            let _ = old_page;
                             let intensity = ease_out(progress_dur(drag.hover_started, WINDOW_HOVER_GLOW_DURATION));
-                            repaint_card_hover_diff(gpu, monitor, card_rect, old_page, drag.hover_page, intensity);
+                            repaint_card_hover_diff(gpu, monitor, drag.hover_page, intensity);
                         }
                     }
                 }
@@ -1813,7 +1963,15 @@ pub(crate) fn on_overview_hover(monitor: &str, x: i32, y: i32) {
             OverviewMode::Live { thumbs, .. } => thumbs,
             OverviewMode::Closed => &[],
         };
-        super::overview_gpu::update_transforms(ov.hwnd, gpu, monitor, ov.carousel.value(), 1.0, thumbs, ov.ghost());
+        super::overview_gpu::update_transforms(
+            ov.hwnd,
+            gpu,
+            monitor,
+            ov.carousel.value(),
+            ov.adjustment.value(),
+            thumbs,
+            ov.ghost(),
+        );
         // Dock hover is root content — repaint the chrome surface.
         super::overview_gpu::paint_root(gpu, monitor, ov);
         super::overview_gpu::paint_dash(gpu, monitor, ov);
@@ -2782,8 +2940,8 @@ pub(crate) fn paint_overview(hwnd: HWND, monitor: &str) {
                 hwnd,
                 &snapshots
                     .iter()
-                    .map(|(rect, _, _, h)| (HWND(*h as *mut c_void), *rect))
-                    .filter(|(h, _)| super::thumbnails::can_preview(*h))
+                    .map(|(rect, _, _, h)| (HWND(*h as *mut c_void), *rect, None))
+                    .filter(|(h, _, _)| super::thumbnails::can_preview(*h))
                     .collect::<Vec<_>>(),
             );
 
@@ -3361,6 +3519,26 @@ pub(crate) fn wallpaper_hbitmap_for(monitor: &str, rect: RECT) -> Option<HBITMAP
     scaled_wallpaper(base_w, base_h).map(|h| HBITMAP(h as *mut c_void))
 }
 
+/// The wallpaper stretched to `width` by `height`: the stand-in for a
+/// card's picture until a capture of the real desktop arrives.
+pub(crate) fn wallpaper_hbitmap_sized(width: i32, height: i32) -> Option<HBITMAP> {
+    scaled_wallpaper(width, height).map(|h| HBITMAP(h as *mut c_void))
+}
+
+/// Repaints every overview's picture of the desktop from the newest
+/// capture.
+pub(crate) fn repaint_desktops() {
+    STATE.with(|s| {
+        let state = s.borrow();
+        let Some(st) = state.as_ref() else { return };
+        for (monitor, ov) in &st.overviews {
+            if let Some(gpu) = ov.gpu.as_ref() {
+                super::overview_gpu::paint_desktop_if_changed(gpu, monitor);
+            }
+        }
+    });
+}
+
 thread_local! {
     /// Per-window `PrintWindow` captures taken at park time, keyed by
     /// hwnd: `(width, height, HBITMAP)`. A parked window's snapshot is
@@ -3527,6 +3705,21 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         let ov = state.overviews.get_mut(monitor)?;
 
         let now = Instant::now();
+        if ov.reveal_at.is_some_and(|at| now >= at) {
+            ov.reveal_at = None;
+            if let Some(gpu) = ov.gpu.as_ref() {
+                gpu.revealed.set(true);
+            }
+            if std::mem::take(&mut ov.ease_on_reveal) {
+                ov.adjustment.ease_to_at(
+                    1.0,
+                    super::design::motion::effective_ms(super::design::motion::BASE_MS),
+                    Easing::OutSine,
+                    now,
+                );
+            }
+        }
+        let waiting_to_reveal = ov.reveal_at.is_some();
         let carousel_was_running = ov.carousel.is_transitioning();
         let carousel_running = ov.carousel.tick(now);
         let carousel_done = carousel_was_running && !carousel_running;
@@ -3549,7 +3742,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         let progress = ov.adjustment.value();
         let gesture = ov.adjustment.gesture_in_progress();
 
-        let completion = if live && !fade_running && !gesture {
+        let completion = if live && !fade_running && !gesture && !waiting_to_reveal {
             if progress <= f64::EPSILON {
                 ov.mode = OverviewMode::Closed;
                 Some(Completion::Closed { focus_after: ov.close_after.take() })
@@ -3582,6 +3775,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
             .is_some_and(|(_, started)| progress_dur(started, WINDOW_HOVER_GLOW_DURATION) < 1.0);
         let pop_active = ov.window_pop_anim.is_some();
         let keep_timer = fade_running
+            || waiting_to_reveal
             || carousel_running
             || ov.adjustment.gesture_in_progress()
             || pop_active
@@ -3621,14 +3815,15 @@ pub(crate) fn on_animation_tick(monitor: &str) {
     };
 
     if let Some(alpha) = fade_alpha {
-        let gpu_root_opacity_set = STATE.with(|s| {
-            let state = s.borrow();
-            let ov = state.as_ref()?.overviews.get(monitor)?;
-            let gpu = ov.gpu.as_ref()?;
-            gpu::set_opacity(&gpu.root, alpha as f32 / 255.0);
-            Some(())
+        // Only the GDI fallback fades as a whole. The composed overview
+        // is opaque throughout: fading it over the desktop showed two of
+        // everything at once, the real windows standing still under
+        // previews of themselves in flight, with the sharp wallpaper
+        // dissolving into the blurred one.
+        let composed = STATE.with(|s| {
+            s.borrow().as_ref().and_then(|st| st.overviews.get(monitor)).is_some_and(|ov| ov.gpu.is_some())
         });
-        if gpu_root_opacity_set.is_none() {
+        if !composed {
             // SAFETY: `overview_hwnd` is a valid, process-lifetime window
             // already created with `WS_EX_LAYERED`.
             unsafe {
@@ -3664,7 +3859,6 @@ pub(crate) fn on_animation_tick(monitor: &str) {
         }
         if card_hover_easing || thumb_hover_easing {
             if let OverviewMode::Live { .. } = &ov.mode {
-                let (card_rect, _) = card_layout(monitor);
                 if card_hover_easing {
                     if let Some(page) = ov.window_drag.as_ref().and_then(|d| d.hover_page) {
                         let intensity = ov
@@ -3672,11 +3866,7 @@ pub(crate) fn on_animation_tick(monitor: &str) {
                             .as_ref()
                             .map(|d| ease_out(progress_dur(d.hover_started, WINDOW_HOVER_GLOW_DURATION)))
                             .unwrap_or(0.0);
-                        if let Some(card_visual) = gpu.cards.iter().find(|cv| cv.page == page) {
-                            super::overview_gpu::paint_card(card_visual, card_rect, monitor,
-                                Some((super::overview_gpu::HoverTarget::Card(page), intensity)),
-                            );
-                        }
+                        super::overview_gpu::set_card_glow(gpu, monitor, Some(page), intensity);
                     }
                 }
             }
@@ -3757,6 +3947,9 @@ pub(crate) fn on_animation_tick(monitor: &str) {
                 unsafe {
                     let _ = ShowWindow(overview_hwnd, SW_HIDE);
                 }
+                // The moment nobody is looking at the card is the moment
+                // to take a fresh picture for it.
+                super::request_desktop_capture();
 
                 // Whatever we do next — refocus a specific window, hand
                 // focus to the desktop, or nothing at all — Windows can

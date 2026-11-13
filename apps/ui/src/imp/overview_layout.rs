@@ -50,6 +50,9 @@ pub(crate) enum ControlsState {
 /// Everything platform-shaped the layout needs, measured by the caller.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LayoutInput {
+    /// The whole monitor in overview-window client coordinates, top bar
+    /// included. This is what a card is a miniature of.
+    pub(crate) monitor: RectF,
     /// The usable area in overview-window client coordinates: the
     /// monitor's rect inset by the top bar.
     pub(crate) work_area: RectF,
@@ -110,12 +113,19 @@ pub(crate) fn layout_for_state(state: ControlsState, input: &LayoutInput) -> Ove
     match state {
         ControlsState::Hidden => {
             // The overview at rest is a picture of the desktop: the card
-            // *is* the work area, square-cornered and undimmed, with the
-            // furniture parked just off the edges it will slide in from.
+            // *is* the monitor, square-cornered, with the furniture
+            // parked just off the edges it will slide in from.
+            //
+            // The monitor and not the work area, as in GNOME, where the
+            // workspace runs under the panel. A card shows the desktop
+            // as it is on screen, wallpaper behind the bar included, so
+            // fitting that picture into the work area would squash it by
+            // the bar's height and the first frame would visibly jump.
+            let monitor = input.monitor;
             OverviewLayout {
-                workspace_box: work,
-                card: work,
-                pitch: (work.width() * (1.0 + CARD_GAP_RATIO)).max(1.0),
+                workspace_box: monitor,
+                card: monitor,
+                pitch: (monitor.width() * (1.0 + CARD_GAP_RATIO)).max(1.0),
                 strip: RectF::from_size(
                     work.left,
                     work.top - strip_height,
@@ -247,6 +257,24 @@ pub(crate) fn thumb_rect(home: Option<RectF>, slot: RectF, p: f64) -> RectF {
     }
 }
 
+/// Where a rect drawn on the card at rest in the picker (`picker_card`)
+/// is while the card is at `card`: the same place on the card, at the
+/// card's current size.
+///
+/// A preview with no window to fly from sits in its grid slot, and the
+/// slot is a place on the card. Left at its picker coordinates it hung
+/// still in the middle of the screen while the card shrank around it.
+pub(crate) fn ride_card(r: RectF, picker_card: RectF, card: RectF) -> RectF {
+    let sx = if picker_card.width() > 0.0 { card.width() / picker_card.width() } else { 1.0 };
+    let sy = if picker_card.height() > 0.0 { card.height() / picker_card.height() } else { 1.0 };
+    RectF::new(
+        card.left + (r.left - picker_card.left) * sx,
+        card.top + (r.top - picker_card.top) * sy,
+        card.left + (r.right - picker_card.left) * sx,
+        card.top + (r.bottom - picker_card.top) * sy,
+    )
+}
+
 /// A preview's opacity at progress `p`. One that flies is opaque the
 /// whole way — it is standing in for a real window that was already on
 /// screen. One with no home fades in with the card, which is the honest
@@ -256,6 +284,17 @@ pub(crate) fn thumb_alpha(home: Option<RectF>, p: f64) -> f64 {
         Some(_) => 1.0,
         None => p.clamp(0.0, 1.0),
     }
+}
+
+/// How far a live preview is inset from its rect at progress `p`, given
+/// the inset it has at rest in the grid.
+///
+/// The inset exists to leave room for the hover ring, which only matters
+/// in the grid. At `p = 0` the preview has to cover its window exactly,
+/// or the first frame shows every window a few pixels smaller than it
+/// was a moment ago.
+pub(crate) fn live_inset(at_rest: f64, p: f64) -> f64 {
+    at_rest * p.clamp(0.0, 1.0)
 }
 
 /// How much of its slot size a dragged window's ghost is drawn at.
@@ -286,6 +325,7 @@ mod tests {
 
     fn input() -> LayoutInput {
         LayoutInput {
+            monitor: RectF::new(0.0, 0.0, 1920.0, 1080.0),
             work_area: RectF::new(0.0, 24.0, 1920.0, 1080.0),
             dpi: 96,
             search_height: 40.0,
@@ -295,10 +335,10 @@ mod tests {
     }
 
     #[test]
-    fn hidden_fills_the_work_area_with_square_corners() {
+    fn hidden_fills_the_monitor_with_square_corners() {
         let l = layout_for_state(ControlsState::Hidden, &input());
-        assert_eq!(l.workspace_box, input().work_area);
-        assert_eq!(l.card, input().work_area);
+        assert_eq!(l.workspace_box, input().monitor);
+        assert_eq!(l.card, input().monitor, "under the bar too, like the desktop it stands for");
         assert_eq!(l.card_radius, 0.0);
         assert_eq!(l.backdrop_dim, 0.0);
         assert_eq!(l.strip_alpha, 0.0);
@@ -385,6 +425,7 @@ mod tests {
     #[test]
     fn a_work_area_too_short_for_its_furniture_still_yields_sane_boxes() {
         let i = LayoutInput {
+            monitor: RectF::new(0.0, 0.0, 400.0, 120.0),
             work_area: RectF::new(0.0, 0.0, 400.0, 120.0),
             dpi: 96,
             search_height: 40.0,
@@ -475,6 +516,27 @@ mod tests {
         assert_eq!(thumb_alpha(None, 0.0), 0.0);
         assert_eq!(thumb_alpha(None, 1.0), 1.0);
         assert!(thumb_alpha(None, 0.5) > 0.0 && thumb_alpha(None, 0.5) < 1.0);
+    }
+
+    #[test]
+    fn a_live_preview_covers_its_window_exactly_at_rest_on_the_desktop() {
+        assert_eq!(live_inset(6.0, 0.0), 0.0);
+        assert_eq!(live_inset(6.0, 1.0), 6.0);
+        assert_eq!(live_inset(6.0, 0.5), 3.0);
+        assert_eq!(live_inset(6.0, -3.0), 0.0);
+        assert_eq!(live_inset(6.0, 3.0), 6.0);
+    }
+
+    #[test]
+    fn a_slot_keeps_its_place_on_the_card_as_the_card_changes_size() {
+        let picker = RectF::new(100.0, 100.0, 500.0, 300.0);
+        let slot = RectF::new(200.0, 150.0, 300.0, 200.0);
+        assert_eq!(ride_card(slot, picker, picker), slot, "at rest it is where the grid put it");
+        let big = RectF::new(0.0, 0.0, 800.0, 400.0);
+        assert_eq!(ride_card(slot, picker, big), RectF::new(200.0, 100.0, 400.0, 200.0));
+        let nothing = RectF::new(0.0, 0.0, 0.0, 0.0);
+        let r = ride_card(slot, nothing, big);
+        assert!(r.left.is_finite() && r.right.is_finite());
     }
 
     #[test]
