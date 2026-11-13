@@ -32,10 +32,12 @@ windows into a workspace you can reach.
 
 ## Motion
 
-Opening and closing Activities is one continuous motion, not a fade on a
-fixed timer. Each window travels from where it sits on screen into its slot
-in the grid, the dock slides up from below, and the thumbnail strip drops in
-from above. You can stop the motion halfway and reverse it.
+Opening and closing Activities is one continuous motion, and nothing in it
+is a fade from one picture to another. The first frame is the desktop as it
+already is. From there the desktop shrinks into its card, each window
+travels from where it sits on screen into its slot in the grid, the dock
+slides up from below, and the thumbnail strip drops in from above. You can
+stop the motion halfway and reverse it.
 
 A three- or four-finger swipe on a precision touchpad drives it directly.
 Swipe up and the overview opens as far as your fingers have travelled; hold
@@ -46,9 +48,7 @@ and switches workspace when it is closed.
 
 A two-finger scroll or the mouse wheel over the desktop does the same with
 less precision. Every animated surface is computed from one progress value
-per monitor, which is why the pieces stay in step. The
-[motion design notes](docs/design/2026-10-13-gnome-motion-port-design.md)
-explain the approach.
+per monitor, which is why the pieces stay in step.
 
 Windows has its own three- and four-finger swipes (Task View and virtual
 desktops) and would run them at the same time, so GroveShell sets them to
@@ -98,15 +98,17 @@ goes to the application, a double click opens it where it expects one, and a
 right click opens its own menu.
 
 The bar shows the icons you have switched on under Windows Settings >
-Personalisation > Taskbar > Other system tray icons. The chevron opens
-Windows' hidden-icons flyout for the rest. Every icon message is also passed
-on to Explorer, so its tray is intact when GroveShell quits.
+Personalisation > Taskbar > Other system tray icons. The chevron opens a
+panel with the rest, where they take the same clicks. Every icon message is
+also passed on to Explorer, so its tray is intact when GroveShell quits.
 [ADR-011](docs/adr/0011-host-the-notification-area.md) has the details.
 
 ## Settings
 
 The gear in the top bar opens settings for bar height, dock placement and
-behavior, overview appearance, input, and accessibility. The dock can appear
+behavior, overview appearance, input, and accessibility. The Home page
+shows whether the shell's processes are running and has a Quit button,
+which stops the shell and brings back the Windows taskbar and Start menu. The dock can appear
 only in the overview, stay visible on the desktop, or auto-hide on the
 desktop. Appearance changes apply while GroveShell is running.
 
@@ -155,8 +157,13 @@ If the shell becomes unresponsive, run:
 ```
 
 The script stops GroveShell processes and makes sure Explorer is running. It
-does not depend on a working GroveShell binary. Starting GroveShell, or
-quitting it gracefully, also repairs a taskbar left hidden by a hard kill.
+does not depend on a working GroveShell binary.
+
+While GroveShell runs, the Windows taskbar is set to auto-hide and Windows'
+own touchpad swipes are switched off. Quitting puts both back. If the UI
+crashes or is killed, the watchdog puts them back within a few seconds. If
+the watchdog was killed too, starting GroveShell and quitting it, or
+running `groveshell-cli restore-taskbar`, does it.
 
 The host and watchdog monitor process health. Structured, rotating logs are
 written to `%LOCALAPPDATA%\GroveShell\logs\`. The CLI has `ping`,
@@ -174,8 +181,6 @@ written to `%LOCALAPPDATA%\GroveShell\logs\`. The CLI has `ping`,
 - Touchpad swipes need a precision touchpad. Whether Windows stops running
   its own swipes straight away or only after the next sign-in varies by
   build, and has not been confirmed on hardware.
-- If GroveShell is killed instead of quit, Windows' swipes stay off until
-  it next starts and quits, or until you run `scripts\recover.ps1`.
 - Wi-Fi enumeration can require Windows location permission. If it is
   denied, the panel still gives access to Windows' network UI.
 - Testing with Narrator, on mixed-monitor hardware, and over long sessions
