@@ -1,8 +1,15 @@
 # Rust build output
 /target/
 
-# Local assistant session state, never shared
+# AI assistant working files: session state, instructions, and the
+# plans and specs written along the way. Local only.
 .claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.mcp.json
+.superpowers/
+/docs/superpowers/
 
 # Editor / IDE
 .vscode/

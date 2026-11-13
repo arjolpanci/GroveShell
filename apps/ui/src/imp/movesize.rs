@@ -143,8 +143,7 @@ pub(crate) fn uninstall_move_size_hooks() {
 /// modifier," per `config.toml`'s `input.overview_modifier`. `"Super"`
 /// (the default) matches both Windows keys, matching this module's
 /// original hardcoded behavior. `"Alt"` matches both Alt keys. `"CtrlAlt"`
-/// is documented in `docs/design/2026-07-30-tray-settings-app-design.md`
-/// as a preset requiring both Ctrl and Alt; this hook's single-key-family
+/// is a preset requiring both Ctrl and Alt; this hook's single-key-family
 /// state machine (`WIN_HELD`/`WIN_USED`) only tracks one key family being
 /// pressed/released at a time, so as a scoped simplification "CtrlAlt"
 /// arms on Alt alone here (Alt is already one of the two keys), same as

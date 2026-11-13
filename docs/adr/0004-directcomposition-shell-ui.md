@@ -87,5 +87,3 @@ Windows 11 material work in 2026-10 found that this, not the language or
 the toolkit, was what kept them from looking native. The decision was
 widened rather than reversed.
 
-See `docs/design/2026-10-08-win11-native-shell.md`
-for the measurements behind this.

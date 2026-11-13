@@ -1,8 +1,6 @@
 //! Live monitor hotplug: reconciles `AppState`'s per-monitor bars,
 //! workspace trackers, and overview windows against the real, current
-//! monitor topology whenever Windows reports a `WM_DISPLAYCHANGE`. See
-//! `docs/design/2026-07-28-per-monitor-workspaces-design.md`
-//! §A/§F.
+//! monitor topology whenever Windows reports a `WM_DISPLAYCHANGE`.
 
 use windows::core::w;
 use windows::Win32::Foundation::{HINSTANCE, HWND};

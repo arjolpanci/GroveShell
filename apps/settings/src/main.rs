@@ -1,8 +1,7 @@
 //! `groveshell-settings`: the tray-resident launcher/settings app. Spawns
 //! and supervises `groveshell-watchdog`, `groveshell-host`, and
 //! `groveshell-ui`; shows their health; offers a one-click Explorer-restore
-//! toggle; hosts the dock/top-bar/overview/input settings window. See
-//! `docs/design/2026-07-30-tray-settings-app-design.md`.
+//! toggle; hosts the dock/top-bar/overview/input settings window.
 
 #[cfg(windows)]
 mod imp;

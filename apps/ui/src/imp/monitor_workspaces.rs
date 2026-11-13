@@ -6,9 +6,8 @@ use groveshell_window_model::workspace::WorkspaceTracker;
 /// keyed by that monitor's stable device name (see
 /// `monitors::MonitorInfo::device_name`). Each tracker is fully
 /// self-contained: its own pinned workspace, its own dynamic tail,
-/// unaffected by any other monitor's switching/growth/shrinkage — see
-/// `docs/design/2026-07-28-per-monitor-workspaces-design.md`
-/// §B for why the crate's `WorkspaceTracker` itself needed no changes.
+/// unaffected by any other monitor's switching/growth/shrinkage, which
+/// is why the crate's `WorkspaceTracker` itself needed no changes.
 #[derive(Default)]
 pub(crate) struct MonitorWorkspaces {
     trackers: HashMap<String, WorkspaceTracker>,
