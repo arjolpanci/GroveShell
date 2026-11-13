@@ -304,6 +304,13 @@ pub(crate) fn expand_known_folder(path: &str, mut folder: impl FnMut(&str) -> Op
     expanded.to_lowercase()
 }
 
+/// The two places an icon can be drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    Bar,
+    Overflow,
+}
+
 /// The icons applications have registered, oldest first.
 #[derive(Default)]
 pub(crate) struct IconStore {
@@ -385,6 +392,25 @@ impl IconStore {
     /// picture to draw.
     fn shown(&self) -> impl Iterator<Item = &Icon> {
         self.icons.iter().filter(|i| i.is_shown()).take(MAX_SHOWN)
+    }
+
+    /// Everything else that has a picture: the icons the user has not
+    /// switched on for the bar, and any that did not fit in it. These
+    /// are what the chevron's panel shows.
+    fn overflow(&self) -> Vec<&Icon> {
+        let in_bar: Vec<IconKey> = self.shown().map(|i| i.key).collect();
+        self.icons
+            .iter()
+            .filter(|i| !i.hidden && !i.pixels.is_empty() && !in_bar.contains(&i.key))
+            .collect()
+    }
+
+    /// Icon `index` of the bar, or of the chevron's panel.
+    fn pick(&self, place: Place, index: usize) -> Option<&Icon> {
+        match place {
+            Place::Bar => self.shown().nth(index),
+            Place::Overflow => self.overflow().get(index).copied(),
+        }
     }
 
     fn shown_mut(&mut self) -> impl Iterator<Item = &mut Icon> {
@@ -1024,8 +1050,35 @@ pub(crate) fn is_double_click(previous: Option<(u32, u32, u64)>, icon: (u32, u32
 /// and up, then the activation or context-menu notification that newer
 /// icons act on.
 pub(crate) fn invoke(index: usize, context: bool) {
+    invoke_in(Place::Bar, index, context);
+}
+
+/// How many icons the chevron's panel holds.
+pub(crate) fn overflow_count() -> usize {
+    HOST.with(|h| h.borrow().store.overflow().len())
+}
+
+/// The tooltip of icon `index` in the chevron's panel.
+pub(crate) fn overflow_name(index: usize) -> String {
+    HOST.with(|h| h.borrow().store.pick(Place::Overflow, index).map(|i| i.tip.clone()).unwrap_or_default())
+}
+
+/// [`invoke`] for an icon in the chevron's panel.
+pub(crate) fn overflow_invoke(index: usize, context: bool) {
+    invoke_in(Place::Overflow, index, context);
+}
+
+/// [`paint`] for an icon in the chevron's panel.
+///
+/// # Safety
+/// `hdc` must be a valid device context.
+pub(crate) unsafe fn overflow_paint(hdc: HDC, index: usize, rect: RECT) {
+    paint_in(Place::Overflow, hdc, index, rect);
+}
+
+fn invoke_in(place: Place, index: usize, context: bool) {
     let Some((hwnd, id, callback, version)) = HOST.with(|h| {
-        h.borrow().store.shown().nth(index).map(|i| (i.hwnd, i.id, i.callback, i.version))
+        h.borrow().store.pick(place, index).map(|i| (i.hwnd, i.id, i.callback, i.version))
     }) else {
         return;
     };
@@ -1095,9 +1148,13 @@ pub(crate) fn with_pixels<R>(index: usize, f: impl FnOnce(&[u8], i32) -> R) -> O
 /// # Safety
 /// `hdc` must be a valid device context.
 pub(crate) unsafe fn paint(hdc: HDC, index: usize, rect: RECT) {
+    paint_in(Place::Bar, hdc, index, rect);
+}
+
+unsafe fn paint_in(place: Place, hdc: HDC, index: usize, rect: RECT) {
     HOST.with(|h| {
         let h = h.borrow();
-        let Some(icon) = h.store.shown().nth(index) else { return };
+        let Some(icon) = h.store.pick(place, index) else { return };
         let Some((dc, bitmap, bits)) = dib(icon.size) else { return };
         std::ptr::copy_nonoverlapping(icon.pixels.as_ptr(), bits, icon.pixels.len());
         let blend = BLENDFUNCTION {
@@ -1300,6 +1357,40 @@ mod tests {
         store.apply(&again);
         assert_eq!(store.icons.len(), 1);
         assert_eq!(store.icons[0].hwnd, 99, "clicks go to the new window");
+    }
+
+    #[test]
+    fn what_is_not_in_the_bar_is_in_the_panel_and_nothing_is_in_both() {
+        let mut store = IconStore::default();
+        for id in 1..=3 {
+            store.apply(&message(0, 100, id, NIF_ICON, 7, ""));
+        }
+        for icon in &mut store.icons {
+            icon.pixels = vec![0; 4];
+            icon.size = 1;
+        }
+        store.icons[1].promoted = false;
+        store.icons[2].hidden = true;
+
+        let bar: Vec<u32> = store.shown().map(|i| i.id).collect();
+        let panel: Vec<u32> = store.overflow().iter().map(|i| i.id).collect();
+        assert_eq!(bar, vec![1]);
+        assert_eq!(panel, vec![2], "not promoted goes to the panel; hidden goes nowhere");
+        assert_eq!(store.pick(Place::Overflow, 0).map(|i| i.id), Some(2));
+        assert_eq!(store.pick(Place::Overflow, 1).map(|i| i.id), None);
+    }
+
+    #[test]
+    fn icons_that_do_not_fit_in_the_bar_spill_into_the_panel() {
+        let mut store = IconStore::default();
+        for id in 0..(MAX_SHOWN as u32 + 2) {
+            store.apply(&message(0, 100, id, NIF_ICON, 7, ""));
+        }
+        for icon in &mut store.icons {
+            icon.pixels = vec![0; 4];
+        }
+        assert_eq!(store.shown().count(), MAX_SHOWN);
+        assert_eq!(store.overflow().len(), 2);
     }
 
     #[test]

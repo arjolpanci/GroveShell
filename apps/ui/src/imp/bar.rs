@@ -669,8 +669,8 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
         Some(BarRegion::SessionButton) => super::session_menu::show(hwnd),
         Some(BarRegion::TrayIcon(index)) => super::tray_icons::invoke(index, false),
         Some(BarRegion::TrayChevron) => {
-            // Host the real Windows overflow window under the chevron. Needs
-            // the chevron's screen rect and this bar's monitor span, which
+            // The hidden-icons panel hangs from the chevron. It needs the
+            // chevron's screen rect and this bar's monitor span, which
             // the bar's own rect provides.
             let (pill, _) = qs_pill_layout(bar_width, dpi, bar_h);
             let settings_rect = settings_button_rect(pill, dpi, bar_h);
@@ -687,7 +687,7 @@ pub(crate) fn on_bar_click(hwnd: HWND, x: i32, is_primary: bool, monitor: &str) 
                     right: bar_left + chevron.right,
                     bottom: bar_bottom,
                 };
-                super::tray::toggle_overflow(screen, bar_left, bar_right);
+                super::tray_overflow::toggle(screen, bar_left, bar_right);
             }
         }
         None => {}

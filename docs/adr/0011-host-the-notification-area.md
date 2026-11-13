@@ -65,9 +65,12 @@ What remains outside this:
 - Which icons go in the bar is the user's existing Windows choice
   (Settings > Personalisation > Taskbar > Other system tray icons), read
   from `HKCU\Control Panel\NotifyIconSettings` and re-read every few
-  seconds. The rest are in Explorer's overflow flyout, which the chevron
-  still opens. That registry layout is not documented; if the key is
-  missing, every icon is shown. At most eight are drawn.
+  seconds. The rest are in a panel of the shell's own under the chevron
+  (`tray_overflow`). Explorer's overflow window cannot be borrowed for
+  this: on current builds it is the empty host of a XAML flyout that
+  Explorer only fills when its own chevron is pressed. That registry
+  layout is not documented; if the key is missing, every icon is shown.
+  At most eight are drawn in the bar.
 - Balloon notifications are left to Explorer, which receives them through
   the forward.
 - An application that looked up `Shell_TrayWnd` once at startup and

@@ -38,6 +38,7 @@ mod thumbnails;
 mod theme;
 mod tray;
 mod tray_icons;
+mod tray_overflow;
 mod tooltips;
 mod touchpad;
 mod util;
