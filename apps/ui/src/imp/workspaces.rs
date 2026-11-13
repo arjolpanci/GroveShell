@@ -402,6 +402,9 @@ pub(crate) fn suppress_foreground_follow(duration: Duration) {
 /// it there — its parked position would otherwise leave the user
 /// staring at a focused window they can't see.
 fn on_foreground_changed(hwnd: HWND) {
+    if super::gestures::on_foreground(hwnd) {
+        return;
+    }
     let suppressed =
         SUPPRESS_FOLLOW_UNTIL.with(|c| c.get().is_some_and(|until| Instant::now() < until));
     if suppressed {

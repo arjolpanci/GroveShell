@@ -74,6 +74,80 @@ enum Touch {
     Ignored,
 }
 
+thread_local! {
+    /// When the fingers last did anything, for [`on_foreground`].
+    static LAST_SWIPE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    /// Whether Windows' own switcher came up under the swipe in
+    /// progress and is still to be sent away when the fingers lift.
+    static SWITCHER_PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long after the fingers last moved a Windows switcher appearing
+/// is still put down to them.
+const SWIPE_BLAME_MS: u128 = 1500;
+
+/// Whether `class` is the window Windows shows for Task View. Alt+Tab
+/// and the snap picker share it, which is why [`on_foreground`] also
+/// wants a swipe to blame.
+pub(crate) fn is_windows_switcher(class: &str) -> bool {
+    matches!(class, "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame")
+}
+
+pub(crate) fn swipe_is_to_blame(since_last_swipe_ms: Option<u128>) -> bool {
+    since_last_swipe_ms.is_some_and(|ms| ms <= SWIPE_BLAME_MS)
+}
+
+/// A window from another process took the foreground. Returns whether
+/// it was Windows' own Task View answering a swipe that was meant for
+/// the shell, in which case it has been dealt with.
+///
+/// The swipes are switched off in Windows while the shell runs
+/// (`touchpad_gestures`), and that mostly holds. It has been seen not
+/// to: Task View still opens now and then, on top of Activities. Why is
+/// not known, and nothing documents when Explorer rereads the setting.
+/// So this is the net under it. The setting is written again, in case
+/// Explorer had lost it, and Task View is closed with the key that
+/// closes it.
+pub(crate) fn on_foreground(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::GetClassNameW;
+    let since = LAST_SWIPE.with(|l| l.get()).map(|at| at.elapsed().as_millis());
+    if !swipe_is_to_blame(since) {
+        return false;
+    }
+    let mut buf = [0u16; 128];
+    // SAFETY: a plain query into a live local buffer.
+    let n = unsafe { GetClassNameW(hwnd, &mut buf) };
+    let class = String::from_utf16_lossy(&buf[..n.max(0) as usize]);
+    if !is_windows_switcher(&class) {
+        return false;
+    }
+    tracing::warn!(
+        class,
+        since_swipe_ms = since.unwrap_or(0) as u64,
+        settings = ?groveshell_common::touchpad_gestures::current(),
+        "touchpad: Windows answered a swipe that was switched off; closing its switcher"
+    );
+    let _ = groveshell_common::touchpad_gestures::suppress();
+    if TOUCH.with(|t| t.borrow().is_some()) {
+        // Still following the fingers; Escape now would be ignored or
+        // undone by the next movement.
+        SWITCHER_PENDING.with(|p| p.set(true));
+    } else {
+        dismiss_switcher();
+    }
+    true
+}
+
+fn dismiss_switcher() {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP, VK_ESCAPE};
+    SWITCHER_PENDING.with(|p| p.set(false));
+    // SAFETY: synthesises one key press; no pointers involved.
+    unsafe {
+        keybd_event(VK_ESCAPE.0 as u8, 0, Default::default(), 0);
+        keybd_event(VK_ESCAPE.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
 fn touch_is_tracking() -> bool {
     TOUCH.with(|t| matches!(t.borrow().as_ref(), Some(Touch::Tracked { .. })))
 }
@@ -93,6 +167,7 @@ fn monitor_size_dp(monitor: &str) -> Option<(f64, f64)> {
 
 /// Handles one event from the touchpad recognizer.
 pub(crate) fn on_swipe(event: SwipeEvent) {
+    LAST_SWIPE.with(|l| l.set(Some(Instant::now())));
     match event {
         SwipeEvent::Begin { axis, delta_mm } => {
             begin_swipe(axis, delta_mm);
@@ -220,6 +295,9 @@ fn update_swipe(delta_mm: f64) {
 
 fn end_swipe() {
     let touch = TOUCH.with(|t| t.borrow_mut().take());
+    if SWITCHER_PENDING.with(|p| p.get()) {
+        dismiss_switcher();
+    }
     if let Some(Touch::Tracked { monitor, .. }) = touch {
         finish_gesture(&monitor);
     }
@@ -651,6 +729,22 @@ mod tests {
         assert!(!gesture_allowed(false, "Chrome_WidgetWin_1"));
         assert!(!gesture_allowed(false, "CabinetWClass"));
         assert!(!gesture_allowed(false, "XLMAIN"));
+    }
+
+    #[test]
+    fn task_view_is_recognised_and_ordinary_windows_are_not() {
+        assert!(is_windows_switcher("XamlExplorerHostIslandWindow"));
+        assert!(is_windows_switcher("MultitaskingViewFrame"));
+        assert!(!is_windows_switcher("Chrome_WidgetWin_1"));
+        assert!(!is_windows_switcher(""));
+    }
+
+    #[test]
+    fn a_switcher_is_only_blamed_on_a_swipe_that_just_happened() {
+        assert!(swipe_is_to_blame(Some(0)));
+        assert!(swipe_is_to_blame(Some(1500)));
+        assert!(!swipe_is_to_blame(Some(1501)), "that long after, it was Alt+Tab");
+        assert!(!swipe_is_to_blame(None), "no swipe at all this session");
     }
 
     #[test]
